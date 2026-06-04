@@ -1,0 +1,65 @@
+# API & Endpoints
+
+HTTP surface for playback and the admin sidecar, plus the Prometheus metrics
+exposed for operating a deployment.
+
+## Playback (`:8888`)
+
+```
+GET /channel/<id>/stream.m3u8      HLS playlist
+GET /channel/<id>/now              What's on (JSON)
+GET /healthz                       Liveness
+GET /readyz                        Readiness (503 until packages are ready)
+GET /status                        Per-channel packaged playback state
+GET /metrics                       Prometheus metrics
+```
+
+## Admin (`:8890`)
+
+The admin API is broad; the routes below are the commonly used read and
+control endpoints. The full set is registered in `internal/admin/routes.go`.
+
+```
+GET    /api/now                          Verbose grid for the UI
+GET    /api/playing                      Per-channel current item
+GET    /api/queue-depth                  Schedule coverage + cache lookahead
+GET    /api/channels                     Channel list
+POST   /api/channels/{id}/disable        Disable a channel
+POST   /api/channels/{id}/enable         Enable a channel
+
+GET    /api/admin/plex/status            Current admin Plex connection status
+PUT    /api/admin/plex/config            Set/test the admin Plex connection
+DELETE /api/admin/plex/config            Clear the admin Plex connection
+GET    /api/admin/plex/libraries         List Plex libraries
+POST   /api/admin/plex/scan              Scan a Plex library into the DB
+
+GET    /api/schedule-builder/shows       Media-group browse for the builder
+GET    /api/schedule-builder/package-candidates
+POST   /api/schedule-builder/channels    Create a channel from the builder
+```
+
+Jellyfin mirrors the Plex `status`/`config`/`libraries`/`scan` shape under
+`/api/admin/jellyfin/*`.
+
+## Observability
+
+`GET /metrics` (on `:8888`) exposes Prometheus metrics for the packaged-only
+runtime. The important questions are:
+
+- Is package work backing up? Use `linearcast_package_queue_depth` by
+  `rendition_profile` and `status`.
+- Are package jobs slow or failing? Use
+  `linearcast_package_job_duration_seconds` and
+  `linearcast_package_state_transitions_total`.
+- Is playback runway healthy? Use `linearcast_schedule_runway_seconds`,
+  `linearcast_schedule_runway_by_channel_seconds`, and
+  `linearcast_schedule_gap_active`.
+- Are manifests fast and populated? Use
+  `linearcast_manifest_generation_duration_seconds` and
+  `linearcast_manifest_segments_listed`.
+- Are packaged files missing at request time? Use
+  `linearcast_packaged_artifact_not_found_total` and
+  `linearcast_package_repair_requeues_total`.
+
+Labels are intentionally bounded to profiles, package statuses, result classes,
+artifact types, and channel IDs for channel runway/coverage.

@@ -1,0 +1,4 @@
+# Shared media IDs for the encode smoke scripts.
+# These IDs must exist in the deployed test library.
+showname-s08e03-episode-name-1080p
+showname-s08e04-episode-name-1080p

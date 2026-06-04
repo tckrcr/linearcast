@@ -1,0 +1,394 @@
+import type {
+  ChannelCloneResponse,
+  ChannelFillerAssetList,
+  ChannelMediaList,
+  ChannelPolicy,
+  ChannelSchedule,
+  ChannelSchedulePreview,
+  GuideResponse,
+  ProfileReadiness,
+} from "../types";
+import { apiFetch, channelPath } from "./client";
+
+// getGuide fetches the viewer-safe EPG (all guide channels + a trimmed
+// schedule window) in a single request. Public-tier; see docs/proxy-auth-policy.md.
+export async function getGuide(fromMs: number, hours = 24, signal?: AbortSignal) {
+  return apiFetch<GuideResponse>("/api/guide", {
+    cache: "no-store",
+    signal,
+    query: { from: fromMs, hours },
+  });
+}
+
+export async function createChannel(req: {
+  displayName: string;
+  packageProfile: string;
+  mediaIds: string[];
+  ordering?: string;
+}) {
+  return apiFetch<{
+    channelID: string;
+    displayName: string;
+    created: boolean;
+    syncedMedia: number;
+    scheduleEntries: number;
+  }>("/api/channels", { method: "POST", json: req });
+}
+
+// createExternalChannel makes a live channel that proxies an upstream HLS
+// manifest. The server requires only displayName + upstreamHlsUrl for this
+// kind; no media or package profile is involved.
+export async function createExternalChannel(req: {
+  displayName: string;
+  upstreamHlsUrl: string;
+}) {
+  return apiFetch<{
+    channelID: string;
+    displayName: string;
+    created: boolean;
+  }>("/api/channels", { method: "POST", json: req });
+}
+
+export type UpstreamProbeResult = {
+  reachable: boolean;
+  status?: number;
+  contentType?: string;
+  looksLikeHls: boolean;
+  error?: string;
+};
+
+// probeUpstreamHLS asks the server to fetch the upstream once and report
+// reachability. It is advisory only — creating/saving a live channel never
+// requires the probe to pass.
+export async function probeUpstreamHLS(upstreamHlsUrl: string) {
+  return apiFetch<UpstreamProbeResult>("/api/channels/probe-upstream", {
+    method: "POST",
+    json: { upstreamHlsUrl },
+  });
+}
+
+// describeProbeResult turns a raw probe into a short message and an ok flag.
+// ok=false is an advisory warning (reachability/format), not a hard failure.
+export function describeProbeResult(r: UpstreamProbeResult): { ok: boolean; text: string } {
+  if (!r.reachable) {
+    return { ok: false, text: `Not reachable${r.error ? `: ${r.error}` : ""}` };
+  }
+  const status = r.status ?? 200;
+  if (status < 200 || status >= 400) {
+    return { ok: false, text: `Reachable but returned HTTP ${status}` };
+  }
+  if (!r.looksLikeHls) {
+    return { ok: false, text: `Reachable (HTTP ${status}) but does not look like an HLS playlist` };
+  }
+  return { ok: true, text: `Reachable — looks like HLS (HTTP ${status})` };
+}
+
+export async function extendChannel(channelID: string, hours?: number) {
+  return apiFetch<{
+    channelID: string;
+    inserted: number;
+    lastEndMs?: number;
+    skippedLowWater?: boolean;
+    note?: string;
+  }>(channelPath(channelID, "/extend"), {
+    method: "POST",
+    json: hours ? { hours } : undefined,
+  });
+}
+
+export async function clearChannelSchedule(channelID: string, afterMs?: number) {
+  return apiFetch<{ channelID: string; cleared: number }>(
+    channelPath(channelID, "/schedule"),
+    { method: "DELETE", query: { after: afterMs } },
+  );
+}
+
+export async function restartChannelPlayback(channelID: string) {
+  return apiFetch<{
+    channelID: string;
+    cleared: number;
+    inserted: number;
+    lastEndMs?: number;
+    warning?: string;
+  }>(channelPath(channelID, "/restart-playback"), { method: "POST" });
+}
+
+export async function setChannelEnabled(channelID: string, enabled: boolean) {
+  const verb = enabled ? "enable" : "disable";
+  return apiFetch(channelPath(channelID, `/${verb}`), { method: "POST" });
+}
+
+export async function setChannelHiddenFromGuide(channelID: string, hidden: boolean) {
+  const verb = hidden ? "hide-from-guide" : "show-in-guide";
+  return apiFetch<{
+    channelID: string;
+    hiddenFromGuide: boolean;
+    wasHiddenFromGuide: boolean;
+    note?: string;
+  }>(channelPath(channelID, `/${verb}`), { method: "POST" });
+}
+
+export async function deleteChannel(channelID: string) {
+  return apiFetch<{ channelID: string; deleted: boolean; note?: string }>(
+    channelPath(channelID),
+    { method: "DELETE" },
+  );
+}
+
+export async function cloneChannel(channelID: string) {
+  return apiFetch<ChannelCloneResponse>(channelPath(channelID, "/clone"), {
+    method: "POST",
+  });
+}
+
+export async function getChannelPolicy(channelID: string) {
+  return apiFetch<ChannelPolicy>(channelPath(channelID, "/policy"), {
+    cache: "no-store",
+  });
+}
+
+export async function updateChannelPolicy(
+  channelID: string,
+  policy: Pick<ChannelPolicy, "requiredPackageProfile" | "packagePrefillMs" | "mediaKind"> & { force?: boolean },
+) {
+  return apiFetch<ChannelPolicy>(channelPath(channelID, "/policy"), {
+    method: "PUT",
+    json: policy,
+  });
+}
+
+export async function getChannelProfileMigrationStatus(channelID: string, profile: string) {
+  return apiFetch<ProfileReadiness>(channelPath(channelID, "/profile-migration"), {
+    query: { profile },
+    cache: "no-store",
+  });
+}
+
+export async function queueChannelProfileMigration(channelID: string, profile: string) {
+  return apiFetch<ProfileReadiness & { queued: number }>(
+    channelPath(channelID, "/profile-migration"),
+    { method: "POST", json: { profile } },
+  );
+}
+
+export async function getChannelArtwork(channelID: string) {
+  return apiFetch<{ channelId: string; artworkUrl?: string }>(
+    channelPath(channelID, "/artwork"),
+    { cache: "no-store" },
+  );
+}
+
+export async function updateChannelArtwork(channelID: string, artworkUrl: string) {
+  return apiFetch<{ channelId: string; artworkUrl?: string }>(
+    channelPath(channelID, "/artwork"),
+    { method: "PUT", json: { artworkUrl } },
+  );
+}
+
+export async function updateChannelUpstreamHLS(channelID: string, upstreamHlsUrl: string) {
+  return apiFetch<void>(channelPath(channelID, "/upstream-hls"), {
+    method: "PUT",
+    json: { upstreamHlsUrl },
+  });
+}
+
+export async function resetChannelArtwork(channelID: string) {
+  return apiFetch<{ channelId: string; artworkUrl?: string }>(
+    channelPath(channelID, "/artwork"),
+    { method: "DELETE" },
+  );
+}
+
+export async function getChannelSchedule(channelID: string, fromMs: number, hours = 24, signal?: AbortSignal) {
+  return apiFetch<ChannelSchedule>(channelPath(channelID, "/schedule"), {
+    cache: "no-store",
+    signal,
+    query: { from: fromMs, hours },
+  });
+}
+
+export async function getChannelSchedulePreview(channelID: string, fromMs: number, hours = 24) {
+  return apiFetch<ChannelSchedulePreview>(channelPath(channelID, "/schedule/preview"), {
+    cache: "no-store",
+    query: { from: fromMs, hours },
+  });
+}
+
+export async function getChannelMedia(channelID: string) {
+  return apiFetch<ChannelMediaList>(channelPath(channelID, "/media"), {
+    cache: "no-store",
+  });
+}
+
+export async function getChannelFillerAssets(channelID: string) {
+  return apiFetch<ChannelFillerAssetList>(channelPath(channelID, "/filler-assets"), {
+    cache: "no-store",
+  });
+}
+
+export async function upsertScheduleEntry(
+  channelID: string,
+  mediaId: string,
+  startMs: number,
+) {
+  return apiFetch<{
+    channelID: string;
+    startMs: number;
+    mediaId: string;
+    durationMs: number;
+    cleared: number;
+    inserted: number;
+    lastEndMs?: number;
+    note?: string;
+  }>(channelPath(channelID, "/schedule/entries"), {
+    method: "POST",
+    json: { mediaId, startMs },
+  });
+}
+
+export async function insertScheduleEntryAfter(
+  channelID: string,
+  entryId: string,
+  mediaId: string,
+) {
+  return apiFetch<{
+    channelID: string;
+    entryId: string;
+    afterEntryId: string;
+    mediaId: string;
+    startMs: number;
+    durationMs: number;
+    inserted: number;
+  }>(channelPath(channelID, `/schedule/entries/${encodeURIComponent(entryId)}/after`), {
+    method: "POST",
+    json: { mediaId },
+  });
+}
+
+export async function insertScheduleEntryBefore(
+  channelID: string,
+  entryId: string,
+  mediaId: string,
+) {
+  return apiFetch<{
+    channelID: string;
+    entryId: string;
+    beforeEntryId: string;
+    mediaId: string;
+    startMs: number;
+    durationMs: number;
+    inserted: number;
+  }>(channelPath(channelID, `/schedule/entries/${encodeURIComponent(entryId)}/before`), {
+    method: "POST",
+    json: { mediaId },
+  });
+}
+
+export async function deleteScheduleEntry(channelID: string, entryId: string) {
+  return apiFetch<{ channelID: string; entryId: string; inserted: number }>(
+    channelPath(channelID, `/schedule/entries/${entryId}`),
+    { method: "DELETE", cache: "no-store", query: { rebuild: false } },
+  );
+}
+
+export async function deleteScheduleRange(channelID: string, fromMs: number, toMs: number) {
+  return apiFetch<{
+    channelID: string;
+    fromMs: number;
+    toMs: number;
+    rebuildStartMs?: number;
+    deleted: number;
+    inserted: number;
+    lastEndMs?: number;
+    note?: string;
+  }>(channelPath(channelID, "/schedule/range"), {
+    method: "DELETE",
+    cache: "no-store",
+    query: { from: fromMs, to: toMs, rebuild: false },
+  });
+}
+
+export async function saveScheduleWindowOrdered(
+  channelID: string,
+  req: {
+    fromMs: number;
+    toMs: number;
+    tailMode: "preserve" | "jump";
+    extendTail?: boolean;
+    entries: Array<{ mediaId: string }>;
+  },
+) {
+  return apiFetch<{
+    channelID: string;
+    fromMs: number;
+    toMs: number;
+    tailMode: "preserve" | "jump";
+    extendTail: boolean;
+    cleared: number;
+    inserted: number;
+    lastEndMs?: number;
+    resumeAfterMedia?: string;
+    note?: string;
+  }>(channelPath(channelID, "/schedule/window/order"), {
+    method: "PUT",
+    json: req,
+  });
+}
+
+export async function addChannelMedia(
+  channelID: string,
+  mediaId: string,
+) {
+  return apiFetch<{
+    channelID: string;
+    mediaId: string;
+    added: boolean;
+    note?: string;
+  }>(channelPath(channelID, "/media"), {
+    method: "POST",
+    json: { mediaId },
+  });
+}
+
+export async function removeChannelMedia(
+  channelID: string,
+  mediaId: string,
+  pruneSchedule = true,
+) {
+  return apiFetch<{
+    channelID: string;
+    mediaId: string;
+    removed: boolean;
+    prunedSchedule: number;
+    inserted: number;
+    note?: string;
+  }>(channelPath(channelID, `/media/${encodeURIComponent(mediaId)}`), {
+    method: "DELETE",
+    query: pruneSchedule ? undefined : { pruneSchedule: "false" },
+  });
+}
+
+export async function reorderChannelMedia(channelID: string, order: string[]) {
+  return apiFetch<{ channelID: string; count: number; note?: string }>(
+    channelPath(channelID, "/media/order"),
+    { method: "PUT", json: { order } },
+  );
+}
+
+// moveChannelMedia repositions a single item in the channel's linked-list
+// order. Pass afterMediaId === "" to move to the head.
+export async function moveChannelMedia(
+  channelID: string,
+  mediaId: string,
+  afterMediaId: string,
+) {
+  return apiFetch<{
+    channelID: string;
+    mediaId: string;
+    afterMediaId: string;
+    note?: string;
+  }>(channelPath(channelID, `/media/${encodeURIComponent(mediaId)}/move`), {
+    method: "POST",
+    json: { afterMediaId },
+  });
+}

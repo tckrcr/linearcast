@@ -1,0 +1,122 @@
+/* Shared media-picker rail (used by Schedule Builder and Schedule Editor). */
+.mp-rail {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 0 0 14px;
+  background: var(--bg-elev);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mp-rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mp-rail-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mp-rail-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.mp-rail-tab {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.mp-rail-tab.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: rgba(90, 169, 255, 0.4);
+}
+
+.mp-rail-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mp-rail-input {
+  flex: 1;
+  min-width: 180px;
+  font-size: 13px;
+}
+
+.mp-rail-status {
+  margin: 0;
+  font-size: 12px;
+}
+
+.mp-rail-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 4px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.mp-rail-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.mp-rail-row-main {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.mp-rail-row-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-rail-row-meta {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-rail-row-dur {
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.mp-rail-row-add {
+  min-width: 56px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.mp-rail-empty {
+  margin: 0;
+  font-size: 12px;
+}
+
+.mp-rail-footer {
+  font-size: 12px;
+}
+

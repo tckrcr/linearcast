@@ -1,0 +1,382 @@
+// Package db is the linearcast SQLite access layer.
+//
+// linearcast opens the database read-only. Writes (schema bootstrap, ingest,
+// scheduling) live in cmd/ingest and other tools.
+package db
+
+import (
+	"github.com/tckrcr/linearcast/internal/packageprofile"
+)
+
+const DefaultPackageProfile = packageprofile.DefaultName
+const MusicPackageProfile = packageprofile.MusicName
+
+// ScheduleGridMs is the wall-clock schedule grid. Schedule entry start_ms and
+// duration_ms values must be divisible by this duration.
+const ScheduleGridMs = int64(6000)
+
+type MediaKind string
+
+const (
+	MediaKindVideo MediaKind = "video"
+	MediaKindMusic MediaKind = "music"
+)
+
+// NormalizeMediaKind returns MediaKindMusic when kind is "music"; everything
+// else maps to MediaKindVideo. Delegates to packageprofile so the rule lives
+// in one place.
+func NormalizeMediaKind(kind MediaKind) MediaKind {
+	return MediaKind(packageprofile.NormalizeMediaKind(packageprofile.MediaKind(kind)))
+}
+
+func DefaultPackageProfileForMediaKind(kind MediaKind) string {
+	if NormalizeMediaKind(kind) == MediaKindMusic {
+		return MusicPackageProfile
+	}
+	return DefaultPackageProfile
+}
+
+type PlaybackMode string
+
+const (
+	PlaybackModeGenerated PlaybackMode = "generated"
+	PlaybackModePackaged  PlaybackMode = "packaged"
+)
+
+type PackageStatus string
+
+const (
+	PackageStatusPending    PackageStatus = "pending"
+	PackageStatusProcessing PackageStatus = "processing"
+	PackageStatusReady      PackageStatus = "ready"
+	PackageStatusFailed     PackageStatus = "failed"
+)
+
+type Channel struct {
+	ID                     string
+	DisplayName            string
+	SourceDirectory        string
+	Ordering               string
+	Enabled                bool
+	CreatedAtMs            int64
+	Description            string
+	HiddenFromGuide        bool
+	ArtworkURL             string
+	PlaybackMode           PlaybackMode
+	RequiredPackageProfile string
+	PackagePrefillMs       *int64
+	MediaKind              MediaKind
+	// UpstreamHLSURL is nil for a normal packaged channel; non-nil (the URL,
+	// possibly empty) marks an external/live channel. The nil/non-nil split is
+	// load-bearing — readers gate external-channel behavior on it.
+	UpstreamHLSURL *string
+}
+
+type Media struct {
+	ID               string
+	Path             string
+	Directory        string
+	Title            string
+	SchedulingGroup  string
+	UserPreference   *int64
+	DurationMs       int64
+	Container        string
+	VideoCodec       string
+	VideoHeight      int64
+	AudioCodec       string
+	CodecCheckPassed bool
+	CodecCheckReason string
+	IngestedAtMs     int64
+	MediaKind        MediaKind // "" = video; "music" = audio-only
+}
+
+type ChannelMediaRow struct {
+	ChannelID string
+	MediaID   string
+	AddedAtMs int64
+}
+
+type ChannelMediaPackageRow struct {
+	ChannelID          string
+	MediaID            string
+	AddedAtMs          int64
+	Path               string
+	Title              string
+	SchedulingGroup    string
+	DurationMs         int64
+	CodecCheckPassed   bool
+	CodecCheckReason   string
+	PackageID          *string
+	PackageStatus      *string
+	PackagedDurationMs *int64
+	PackageError       *string
+}
+
+type FillerAsset struct {
+	ID          string
+	MediaID     string
+	Label       string
+	Kind        string
+	Enabled     bool
+	CreatedAtMs int64
+}
+
+type ChannelFillerAsset struct {
+	FillerAsset
+	ChannelID          string
+	Weight             int64
+	ChannelEnabled     bool
+	Path               string
+	Title              string
+	SchedulingGroup    string
+	DurationMs         int64
+	PackageID          *string
+	PackageStatus      *string
+	PackagedDurationMs *int64
+	PackageError       *string
+}
+
+type ScheduleEntry struct {
+	ID                    string
+	ChannelID             string
+	StartMs               int64
+	MediaID               string
+	OffsetMs              int64
+	DurationMs            int64
+	AnchorScheduleEntryID *string
+	CreatedAtMs           int64
+}
+
+type PlayHistoryEntry struct {
+	ID              int64
+	ChannelID       string
+	ScheduleEntryID string
+	MediaID         string
+	StartedAtMs     int64
+	EndedAtMs       int64
+	DurationMs      int64
+	MediaTitle      string
+	MediaPath       string
+}
+
+type MediaPackage struct {
+	ID                 string
+	MediaID            string
+	RenditionProfile   string
+	Status             PackageStatus
+	PackageRoot        *string
+	InitSegmentPath    *string
+	SegmentBasePath    string
+	Container          string
+	VideoCodec         string
+	VideoProfile       string
+	VideoWidth         *int64
+	VideoHeight        *int64
+	AudioCodec         string
+	AudioProfile       string
+	Timescale          *int64
+	PackagedDurationMs *int64
+	Error              *string
+	LastAttemptError   *string
+	Attempts           int64
+	CreatedAtMs        int64
+	UpdatedAtMs        int64
+}
+
+type PackagedSegment struct {
+	PackageID       string
+	SegmentNumber   int64
+	MediaStartMs    int64
+	DurationMs      int64
+	Path            *string
+	ByteRangeStart  *int64
+	ByteRangeLength *int64
+}
+
+type PackageStatusSummary struct {
+	Status string
+	Count  int64
+}
+
+type PackageProfileSummary struct {
+	RenditionProfile string
+	Status           string
+	PackageCount     int64
+	ReadyDurationMs  int64
+	OldestUpdatedMs  *int64
+	NewestUpdatedMs  *int64
+}
+
+type PackageRoot struct {
+	RenditionProfile string
+	Status           string
+	PackageRoot      string
+}
+
+type MediaPackageFailure struct {
+	MediaID string
+	Code    string
+	Message string
+}
+
+type MediaPackageRequestResult struct {
+	Profile        string
+	Queued         []string
+	AlreadyPending []string
+	AlreadyReady   []string
+	Failed         []MediaPackageFailure
+}
+
+type MediaPackageCancelResult struct {
+	Profile            string
+	CanceledPending    int64
+	CanceledProcessing int64
+	SkippedReady       int64
+	SkippedFailed      int64
+	SkippedMissing     int64
+	SkippedUnsupported int64
+	AffectedMediaIDs   []string
+}
+
+type MediaPackageCandidate struct {
+	MediaID            string
+	Path               string
+	Title              string
+	SchedulingGroup    string
+	DurationMs         int64
+	PackageID          *string
+	RenditionProfile   string
+	PackageStatus      *string
+	PackageError       *string
+	PackagedDurationMs *int64
+	UpdatedAtMs        *int64
+}
+
+type ChannelPackageSummary struct {
+	ChannelID        string
+	DisplayName      string
+	RenditionProfile string
+	Status           string
+	PackageCount     int64
+	ReadyDurationMs  int64
+	OldestUpdatedMs  *int64
+	NewestUpdatedMs  *int64
+}
+
+type ChannelPackageNeedSummary struct {
+	ChannelID        string
+	DisplayName      string
+	RenditionProfile string
+	NeededCount      int64
+	ReadyCount       int64
+	ProcessingCount  int64
+	PendingCount     int64
+	FailedCount      int64
+	MissingCount     int64
+}
+
+type ChannelPackageRoot struct {
+	ChannelID        string
+	RenditionProfile string
+	Status           string
+	PackageRoot      string
+}
+
+// TrackSource identifies where a subtitle track came from.
+type TrackSource string
+
+const (
+	TrackSourceEmbedded       TrackSource = "embedded_text"
+	TrackSourceEmbeddedBitmap TrackSource = "embedded_bitmap"
+	TrackSourceOpenSubtitles  TrackSource = "opensubtitles"
+	TrackSourceManual         TrackSource = "manual"
+)
+
+// MediaTrack represents one subtitle or audio track. Embedded tracks have
+// StreamIndex >= 0 (the stream's index in the source file). API-sourced tracks
+// use StreamIndex = -1. A subtitle track with Source = opensubtitles and
+// Path == nil is a "no good match" sentinel (NULL path is load-bearing). A
+// Source = embedded_bitmap row is an inventory record for a non-text subtitle
+// stream (PGS/VOBSUB); it always has Path == nil and never reaches playback.
+type MediaTrack struct {
+	ID          int64
+	MediaID     string
+	Kind        string
+	StreamIndex int
+	Language    string
+	Codec       string
+	Source      TrackSource
+	DefaultFlag bool
+	// Forced marks a forced-display (foreign-dialogue) subtitle track.
+	Forced bool
+	Path   *string
+}
+
+type ChannelWrite struct {
+	ID                     string
+	DisplayName            string
+	SourceDirectory        string
+	Ordering               string
+	PlaybackMode           PlaybackMode
+	RequiredPackageProfile string
+	PackagePrefillMs       *int64
+	CreatedAtMs            int64
+	MediaKind              MediaKind
+	UpstreamHLSURL         *string
+}
+
+// ScheduleEntryEnriched is a ScheduleEntry joined with its media row.
+type ScheduleEntryEnriched struct {
+	ID              string
+	ChannelID       string
+	StartMs         int64
+	MediaID         string
+	OffsetMs        int64
+	DurationMs      int64
+	CreatedAtMs     int64
+	Path            string
+	Title           string
+	SchedulingGroup string
+}
+
+// GroupCursor is the per-scheduling_group cursor derived from a channel's
+// existing schedule_entries. LastMediaID is the most recently scheduled
+// media in this group (across past + future entries); LastEndMs is the
+// end_ms of that entry. Groups absent from the channel's schedule do not
+// appear in the map; treat their cursor as "start of group at -inf".
+type GroupCursor struct {
+	LastMediaID string
+	LastEndMs   int64
+}
+
+type InvalidProfilePackage struct {
+	ID               string
+	MediaID          string
+	RenditionProfile string
+	Status           string
+	PackageRoot      string
+}
+
+// ProfileReadiness summarises how much of a channel's media is packaged at a
+// given profile. Total counts only codec-check-passing media.
+type ProfileReadiness struct {
+	Profile    string
+	Total      int64
+	Ready      int64
+	Pending    int64
+	Processing int64
+	Failed     int64
+	Missing    int64
+}
+
+type PackageProfileRecord struct {
+	Profile   packageprofile.Profile
+	IsBuiltin bool
+	Disabled  bool
+}
+
+type PackageProfileReferences struct {
+	MediaPackages   int64 `json:"mediaPackages"`
+	Channels        int64 `json:"channels"`
+	ScheduleEntries int64 `json:"scheduleEntries"`
+}

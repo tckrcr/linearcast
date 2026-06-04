@@ -1,0 +1,548 @@
+/* Schedule view */
+
+.schedule-window-label {
+  margin: 0 0 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.schedule-nav {
+  display: flex;
+  gap: 6px;
+}
+
+.schedule-nav button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.schedule-nav button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.schedule-action-chooser {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 0 0 14px;
+  background: var(--bg-elev);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.schedule-action-chooser-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.schedule-action-chooser-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.schedule-view-toggle {
+  display: inline-flex;
+  gap: 0;
+  margin-left: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.schedule-view-tab {
+  padding: 4px 10px;
+  font-size: 12px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.schedule-view-tab + .schedule-view-tab {
+  border-left: 1px solid var(--border-strong);
+}
+
+.schedule-view-tab.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* EPG-style timeline view. */
+
+.schedule-timeline-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+
+.schedule-timeline {
+  position: relative;
+  height: 110px;
+  user-select: none;
+}
+
+.schedule-timeline-rail {
+  position: relative;
+  height: 26px;
+  border-bottom: 1px solid var(--border);
+}
+
+.schedule-timeline-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.schedule-timeline-tick-label {
+  position: absolute;
+  top: 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-muted);
+  padding-left: 6px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.schedule-timeline-track {
+  position: relative;
+  height: calc(110px - 26px);
+}
+
+.schedule-timeline-entry,
+.schedule-timeline-gap {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  text-align: left;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.schedule-timeline-entry {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+}
+
+.schedule-timeline-entry:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.schedule-timeline-entry.is-now {
+  border-color: var(--good);
+  background: var(--good-bg);
+}
+
+.schedule-timeline-entry-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.schedule-timeline-entry-meta {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-timeline-gap {
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  color: var(--text-muted);
+}
+
+.schedule-timeline-gap:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.schedule-timeline-gap.is-now {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.schedule-timeline-gap-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.schedule-timeline-entry.is-live {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.schedule-timeline-entry.is-live:hover {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.schedule-timeline-unscheduled {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--border) 30%, transparent);
+}
+
+.schedule-timeline-now {
+  position: absolute;
+  top: -26px;
+  bottom: 0;
+  width: 2px;
+  background: var(--good);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Multi-channel Guide (EPG-style overview). */
+
+.guide-window-toggle {
+  display: inline-flex;
+  margin-left: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.guide-window-tab {
+  padding: 4px 10px;
+  font-size: 12px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.guide-window-tab + .guide-window-tab {
+  border-left: 1px solid var(--border-strong);
+}
+
+.guide-window-tab.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.guide-scroll {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+
+.guide-grid {
+  display: grid;
+  position: relative;
+  user-select: none;
+}
+
+.guide-corner {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+}
+
+.guide-rail {
+  position: relative;
+  border-bottom: 1px solid var(--border);
+}
+
+.guide-channel-label {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: none;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text);
+  text-align: left;
+  border-radius: 0;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.guide-channel-label:hover {
+  background: var(--bg-elev-2);
+}
+
+.guide-channel-label-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guide-track {
+  position: relative;
+  border-bottom: 1px solid var(--border);
+}
+
+.guide-now {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--good);
+  pointer-events: none;
+  z-index: 4;
+}
+
+.schedule-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  margin: 0 0 12px;
+  flex-wrap: wrap;
+}
+
+.schedule-edit-bar button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.schedule-empty-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+}
+
+.schedule-empty-state p {
+  margin: 0;
+}
+
+.schedule-empty-state button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.schedule-preview {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 0 0 14px;
+  background: var(--bg-elev);
+}
+
+.schedule-preview-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+  margin-bottom: 10px;
+}
+
+.schedule-preview-head > div:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.schedule-preview-head .muted {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.schedule-preview-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.schedule-preview-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.schedule-preview-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.schedule-preview-stats span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.schedule-preview-warnings {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.schedule-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.schedule-entry {
+  display: grid;
+  grid-template-columns: 22px 130px minmax(0, 1fr) auto auto 20px;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.schedule-gap-row {
+  display: grid;
+  grid-template-columns: 22px 130px minmax(0, 1fr) auto auto 20px;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.schedule-gap-row .schedule-time {
+  grid-column: 2;
+}
+
+.schedule-gap-row button {
+  grid-column: 5;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.schedule-gap-row.is-now {
+  color: var(--warn);
+  border-left: 2px solid var(--warn);
+  padding-left: 8px;
+  margin-left: -10px;
+}
+
+.schedule-range-select {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.schedule-range-select input {
+  width: 14px;
+  height: 14px;
+}
+
+.schedule-drag-handle {
+  color: var(--text-muted);
+  cursor: grab;
+  font-family: var(--mono);
+  text-align: center;
+  user-select: none;
+}
+
+.schedule-entry-action {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.schedule-entry-move {
+  display: flex;
+  gap: 4px;
+}
+
+.schedule-entry-move button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  line-height: 1;
+}
+
+.schedule-entry-delete {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms, color 120ms;
+}
+.schedule-entry:hover .schedule-entry-delete {
+  opacity: 1;
+}
+.schedule-entry.is-editing .schedule-entry-delete {
+  opacity: 1;
+}
+.schedule-entry-delete:hover {
+  color: var(--danger);
+}
+.schedule-entry-delete:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.schedule-entry:last-child {
+  border-bottom: none;
+}
+
+.schedule-entry.is-now {
+  background: var(--accent-soft);
+  margin: 0 -28px;
+  padding: 7px 28px;
+}
+
+.schedule-entry.is-selected {
+  background: rgba(90, 169, 255, 0.12);
+}
+
+.schedule-time {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.schedule-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.schedule-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}

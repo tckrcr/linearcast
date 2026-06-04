@@ -1,0 +1,64 @@
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 340px;
+}
+.form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.form input {
+  font-family: var(--mono);
+  font-size: 12px;
+  width: 100%;
+}
+.hint {
+  font-size: 11px;
+  margin: 0;
+}
+.error {
+  color: var(--danger, #d33);
+  font-size: 12px;
+  margin: 0;
+}
+.testRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.testRow button {
+  white-space: nowrap;
+}
+.probeOk {
+  color: var(--ok, #3fb950);
+  font-size: 12px;
+  margin: 0;
+}
+.probeWarn {
+  color: var(--warn, #d29922);
+  font-size: 12px;
+  margin: 0;
+}
+.success {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 340px;
+  padding: 8px 0;
+}
+.successTitle {
+  color: var(--ok, #3fb950);
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+}
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}

@@ -1,0 +1,24 @@
+services:
+  linearcast:
+    image: ${LINEARCAST_IMAGE:?set LINEARCAST_IMAGE}
+    container_name: linearcast
+    pull_policy: always
+    env_file:
+      - path: ./.env
+        required: false
+    command: ["serve"]
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    volumes:
+      - ${LINEARCAST_DATA_DIR:-/data/linearcast}:${LINEARCAST_DATA_DIR:-/data/linearcast}
+      - ${LINEARCAST_CACHE_DIR:-/data/linearcast/cache}:${LINEARCAST_CACHE_DIR:-/data/linearcast/cache}
+      - ${LINEARCAST_MEDIA_ROOT:-/data/media}:${LINEARCAST_MEDIA_ROOT:-/data/media}:ro
+    ports:
+      - "${WEB_UI_PORT:-8080}:8080"
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

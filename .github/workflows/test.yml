@@ -1,0 +1,45 @@
+name: test
+
+# GitHub-hosted mirror of .gitea/workflows/test.yml. The Gitea copy runs on the
+# self-hosted `local-build` runner (Go + Node preinstalled via deploy/ci-image);
+# this one provisions the toolchain on GitHub-hosted runners so PRs and forks
+# get CI without that runner. Keep the two in sync when the test steps change.
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.1"
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go tests
+        run: go test ./...
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      - name: Web UI typecheck
+        run: |
+          cd web-ui
+          npm ci
+          npm run typecheck

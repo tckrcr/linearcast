@@ -1,0 +1,26 @@
+.dialog {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: inherit;
+  border-radius: 8px;
+  padding: 0;
+  max-width: 90vw;
+  min-width: 360px;
+}
+.dialog::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+.dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.dialog-header h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.dialog-body {
+  padding: 14px;
+}

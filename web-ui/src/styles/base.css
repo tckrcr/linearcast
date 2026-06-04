@@ -1,0 +1,135 @@
+:root {
+  --bg: #0d0f12;
+  --bg-elev: #14171c;
+  --bg-elev-2: #1b1f26;
+  --border: #262b33;
+  --border-strong: #353c47;
+  --text: #e7eaef;
+  --text-muted: #8b94a3;
+  --text-dim: #5c6573;
+  --accent: #5aa9ff;
+  --accent-soft: rgba(90, 169, 255, 0.18);
+  --good: #6fe09a;
+  --good-bg: rgba(111, 224, 154, 0.12);
+  --warn: #ffb066;
+  --warn-bg: rgba(255, 176, 102, 0.14);
+  --danger: #ff7a8a;
+  --danger-bg: rgba(255, 122, 138, 0.14);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --drawer-width: 420px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  background: var(--bg-elev-2);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 6px 12px;
+  transition: background 80ms ease, border-color 80ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--border);
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: rgba(90, 169, 255, 0.4);
+}
+
+button.danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: rgba(255, 122, 138, 0.35);
+}
+
+input,
+select {
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.error {
+  color: var(--danger);
+}
+
+.success {
+  color: var(--good);
+}
+
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.app-loading {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  color: var(--text-muted);
+}
+
+/* ---------- Global focus-visible ring ---------- */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

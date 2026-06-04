@@ -1,0 +1,310 @@
+/* 2-row media-server connection card (Plex, Jellyfin) */
+.media-server-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.media-server-help-link {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.media-server-connected-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.media-server-detail {
+  font-size: 12px;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-left: 34px;
+}
+
+.scan-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 0 4px 34px;
+}
+
+.scan-panel-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.scan-panel-form select {
+  font-size: 12px;
+}
+
+.scan-panel-form button[type="submit"] {
+  font-size: 12px;
+}
+
+.plex-logo {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  background: #e5a00d;
+  color: #111;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.jellyfin-logo {
+  background: #00a4dc;
+  color: #fff;
+}
+
+.plex-connected-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border-radius: 999px;
+  padding: 2px 10px;
+  background: #1f9d55;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.plex-account {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plex-token-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+
+.ingest-root-dirs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ingest-dir-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  max-width: 100%;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  text-align: left;
+}
+
+.ingest-dir-chip:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.ingest-dir-chip-name {
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ingest-dir-chip-path,
+.ingest-dir-chip-count {
+  overflow: hidden;
+  max-width: 260px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ingest-dir-chip-count {
+  color: var(--text-dim);
+}
+
+.ingest-path-row {
+  display: flex;
+  gap: 8px;
+}
+
+.ingest-path-input {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.ingest-log {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ingest-log-summary {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.ingest-failure-reasons {
+  margin: 0;
+  padding: 0 0 0 4px;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.scan-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border: 1.5px solid var(--text-muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: scan-spinner-rotate 0.9s linear infinite;
+}
+
+@keyframes scan-spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.scan-progress {
+  width: 140px;
+  height: 6px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+
+/* Modal dialog primitive */
+.dialog-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 320px;
+}
+.dialog-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.dialog-field-heading {
+  font-size: 12px;
+  font-weight: 700;
+}
+.dialog-form input,
+.dialog-form select {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+
+/* Add-source kind picker */
+.kind-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 280px;
+}
+.kind-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font-size: 13px;
+}
+.kind-option:hover:not(:disabled) {
+  background: var(--bg-elev-2);
+  border-color: var(--border-strong);
+}
+.kind-option:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.path-replacement-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.path-replacement-header,
+.path-replacement-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.path-replacement-header {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.path-replacement-add {
+  align-self: flex-start;
+}
+
+.filesystem-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.filesystem-suggestions p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.local-source-path-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.local-source-path-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
