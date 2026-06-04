@@ -4,9 +4,6 @@ Always-on HLS streaming for self-programmed channels. Point it at a media librar
 
 Channels run on a rolling schedule built from your media library. The packager pre-converts files to fMP4 segments ahead of time, so the server serves ready artifacts at request time with no live transcoding. An admin UI and JSON API let you manage channels, monitor playback state, and build schedules from a Plex or Jellyfin library.
 
-> `<screenshot: channel grid — all active channels with current program titles>`
-> `<screenshot: player — single channel fullscreen with playback controls>`
-
 ## How It Works
 
 `linearcast` is a single Go binary that reads channel and schedule state from SQLite, resolves pre-packaged fMP4 segments, and serves HLS over HTTP. A set of companion binaries handle the rest:
@@ -38,13 +35,12 @@ Then open `/admin` to ingest media and build your first channel — see [docs/us
 
 ## Documentation
 
-- [docs/deploy.md](docs/deploy.md) — deploy, registry images, and configuration reference
-- [docs/usage.md](docs/usage.md) — ingest, building channels, scheduling, and maintenance
 - [docs/api.md](docs/api.md) — playback and admin endpoints, plus Prometheus metrics
 - [docs/architecture.md](docs/architecture.md) — system design, scheduler principles, and invariants
 - [docs/database.md](docs/database.md) — schema and state machines
+- [docs/deploy.md](docs/deploy.md) — deploy, registry images, and configuration reference
+- [docs/usage.md](docs/usage.md) — ingest, building channels, scheduling, and maintenance
 - [docs/tests.md](docs/tests.md) — CI, smoke scripts, and release checks
-- [docs/ROADMAP.md](docs/ROADMAP.md) — active direction and near-term order
 
 ## License
 
