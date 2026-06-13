@@ -1,4 +1,5 @@
 import { ReactNode } from "react";
+import { MEDIA_DRAG_MIME } from "../constants";
 import { formatMs } from "../format";
 import mpStyles from "./MediaPickerRail.module.css";
 
@@ -38,6 +39,9 @@ export type MediaPickerRailProps = {
   emptyMessage?: string;
   footer?: ReactNode;
   defaultActionLabel?: string;
+  // When true, enabled rows can be dragged onto the schedule timeline. The drag
+  // payload is the item key under MEDIA_DRAG_MIME.
+  draggableItems?: boolean;
   // When set, the rail renders this slot below the tab bar and skips its own
   // filter input / list rendering. Used by tabs that want a custom body
   // (e.g. a poster grid).
@@ -70,6 +74,7 @@ export function MediaPickerRail(props: MediaPickerRailProps) {
     emptyMessage,
     footer,
     defaultActionLabel = "Add",
+    draggableItems,
     content,
   } = props;
 
@@ -132,8 +137,19 @@ export function MediaPickerRail(props: MediaPickerRailProps) {
       {!useCustomContent && !loading && !error && notice && <p className={`muted ${mpStyles["mp-rail-status"]}`}>{notice}</p>}
       {!useCustomContent && showList && items.length > 0 && (
         <ul className={mpStyles["mp-rail-list"]}>
-          {items.map((item) => (
-            <li key={item.key} className={mpStyles["mp-rail-row"]}>
+          {items.map((item) => {
+            const rowDraggable = !!draggableItems && !item.disabled && !itemActionBusy;
+            return (
+            <li
+              key={item.key}
+              className={`${mpStyles["mp-rail-row"]}${rowDraggable ? " is-draggable" : ""}`}
+              draggable={rowDraggable}
+              onDragStart={rowDraggable ? (e) => {
+                e.dataTransfer.effectAllowed = "copy";
+                e.dataTransfer.setData(MEDIA_DRAG_MIME, item.key);
+                e.dataTransfer.setData("text/plain", item.title);
+              } : undefined}
+            >
               <div className={mpStyles["mp-rail-row-main"]}>
                 <span className={mpStyles["mp-rail-row-title"]}>{item.title}</span>
                 {item.meta != null && (
@@ -154,7 +170,8 @@ export function MediaPickerRail(props: MediaPickerRailProps) {
                 {item.actionLabel ?? defaultActionLabel}
               </button>
             </li>
-          ))}
+            );
+          })}
         </ul>
       )}
       {!useCustomContent && showList && items.length === 0 && emptyMessage && (

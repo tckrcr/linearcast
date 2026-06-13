@@ -29,6 +29,10 @@ import type {
 import styles from "./EncodingPanel.module.css";
 
 const ALL_PROFILES = "all";
+
+function isABRProfile(profile: PackageProfile | undefined): boolean {
+  return (profile?.tags ?? []).includes("abr");
+}
 type EncoderPlatform = "darwin-arm64" | "darwin-amd64" | "windows-amd64" | "linux-amd64" | "linux-arm64";
 
 const ENCODER_PLATFORM_OPTIONS: Array<{ platform: EncoderPlatform; label: string }> = [
@@ -120,9 +124,11 @@ export function EncodingPanel() {
     getMediaPackageProfileList()
       .then((next) => {
         if (next.profiles.length === 0) return;
-        setProfiles(next.profiles);
-        setProfileDetails(Object.fromEntries(next.profileDetails.map((item) => [item.name, item])));
-        setProfile((current) => current === ALL_PROFILES || next.profiles.includes(current) ? current : next.defaultProfile || next.profiles[0]);
+        const details = Object.fromEntries(next.profileDetails.map((item) => [item.name, item]));
+        const visible = next.profiles.filter((p) => !isABRProfile(details[p]));
+        setProfiles(visible);
+        setProfileDetails(details);
+        setProfile((current) => current === ALL_PROFILES || visible.includes(current) ? current : next.defaultProfile || visible[0]);
       })
       .catch((err) => {
         setStatus(err instanceof Error ? err.message : String(err));

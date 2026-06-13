@@ -2,6 +2,8 @@ package packager
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -90,6 +92,41 @@ func TestDiscoverCandidatesForEnabledChannels(t *testing.T) {
 		if !seen {
 			t.Fatalf("missing candidate %s in %+v", id, got)
 		}
+	}
+}
+
+func TestDiscoverCandidatesIncludesConfiguredABRLadderRungs(t *testing.T) {
+	path := newWorkerTestDB(t)
+	seedPackagedChannel(t, path)
+
+	rw, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+	if _, err := rw.Exec(`UPDATE channels
+		SET abr_ladder_json = '["h264-copy-source","h264-main-1080p","h264-main-720p"]'
+		WHERE id = 'ch-pkg'`); err != nil {
+		t.Fatalf("set ladder: %v", err)
+	}
+
+	got, err := DiscoverCandidates(context.Background(), rw)
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, c := range got {
+		if c.MediaID == "m1" {
+			seen[c.Profile] = true
+		}
+	}
+	for _, profile := range []string{"h264-copy-source", "h264-main-1080p", "h264-main-720p"} {
+		if !seen[profile] {
+			t.Fatalf("missing m1 profile %s in candidates %+v", profile, got)
+		}
+	}
+	if seen["h264-main-480p"] {
+		t.Fatalf("unexpected unconfigured 480p rung in candidates %+v", got)
 	}
 }
 
@@ -436,5 +473,194 @@ func TestIntegrityLoopPeriodicallyResetsBrokenReadyPackage(t *testing.T) {
 			t.Fatalf("package was not reset, final status=%s", got.Status)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// TestRecoverOrphansRequeuesStrandedProcessing reproduces the redeploy-mid-encode
+// bug: a worker restart strands processing rows, and recoverOrphans must requeue
+// them at startup instead of leaving them wedged. It covers both a job leased by
+// this worker's own encoder (a crashed prior run) and a pre-lease leaseless row.
+func TestRecoverOrphansRequeuesStrandedProcessing(t *testing.T) {
+	path := newWorkerTestDB(t)
+	seedPackagedChannel(t, path)
+	ctx := context.Background()
+	rw, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	localID := db.GetLocalEncoderID(ctx, rw)
+	if localID == "" {
+		t.Fatal("local encoder id missing")
+	}
+	const profile = "h264-main-1080p"
+	m1Pkg := packageid.For("m1", profile)
+
+	// (1) Leased job stranded by this worker's previous run: claim m1 as the
+	// local encoder, then leave the lease behind (the "crash").
+	ok, err := db.ClaimPackage(ctx, rw, db.ClaimRequest{
+		MediaID: "m1", Profile: profile, PackageID: m1Pkg,
+		EncoderID: localID, Local: true, LeaseTTL: 60 * time.Second, NowMs: 1_000,
+	})
+	if err != nil || !ok {
+		t.Fatalf("claim m1: ok=%v err=%v", ok, err)
+	}
+	// (2) Pre-lease orphan: a processing row with no lease at all.
+	if _, err := rw.Exec(`INSERT INTO media_packages
+		(id, media_id, rendition_profile, status, attempts, created_at_ms, updated_at_ms)
+		VALUES ('pkg-m2', 'm2', ?, 'processing', 1, 0, 0)`, profile); err != nil {
+		t.Fatalf("seed leaseless orphan: %v", err)
+	}
+
+	w := &Worker{DB: rw, OutputRoot: t.TempDir(), EncoderID: localID}
+	if err := w.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if err := w.recoverOrphans(ctx); err != nil {
+		t.Fatalf("recoverOrphans: %v", err)
+	}
+
+	for _, id := range []string{m1Pkg, "pkg-m2"} {
+		var status string
+		if err := rw.QueryRow(`SELECT status FROM media_packages WHERE id=?`, id).Scan(&status); err != nil {
+			t.Fatalf("status %s: %v", id, err)
+		}
+		if db.PackageStatus(status) != db.PackageStatusPending {
+			t.Fatalf("package %s status=%s, want pending", id, status)
+		}
+	}
+	var leases int
+	rw.QueryRow(`SELECT COUNT(*) FROM encoder_jobs`).Scan(&leases)
+	if leases != 0 {
+		t.Fatalf("expected all leases cleared, %d remain", leases)
+	}
+}
+
+func TestLeaseLostClassifiesErrors(t *testing.T) {
+	for _, err := range []error{
+		errors.New("update lease: database is locked (5) (SQLITE_BUSY)"),
+		errors.New("sql: database is closed"),
+	} {
+		if leaseLost(err) {
+			t.Fatalf("%v is transient and must not abort an encode", err)
+		}
+	}
+	for _, err := range []error{
+		fmt.Errorf("%w for package p", db.ErrNoActiveLease),
+		fmt.Errorf("package p is %w enc2, not enc1", db.ErrPackageLeasedByOther),
+		fmt.Errorf("package p is ready, %w", db.ErrPackageNotProcessing),
+		fmt.Errorf("encoder e is %w", db.ErrEncoderRevoked),
+	} {
+		if !leaseLost(err) {
+			t.Fatalf("%v is a definitive lease loss", err)
+		}
+	}
+}
+
+func TestHeartbeatAbortsOnDefinitiveLeaseLoss(t *testing.T) {
+	path := newWorkerTestDB(t)
+	seedPackagedChannel(t, path)
+
+	rw, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	ctx := context.Background()
+	encID := db.GetLocalEncoderID(ctx, rw)
+	w := &Worker{DB: rw, EncoderID: encID, LeaseTTL: 300 * time.Millisecond}
+	ok, err := w.tryClaim(ctx, "m1", "h264-main-1080p", time.Now().UTC().UnixMilli())
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+
+	// The sweeper (or an operator) reclaims the job out from under the worker.
+	if _, err := rw.Exec(`DELETE FROM encoder_jobs`); err != nil {
+		t.Fatalf("drop lease: %v", err)
+	}
+
+	lost := make(chan struct{})
+	go w.heartbeat(ctx, packageid.For("m1", "h264-main-1080p"), func() { close(lost) })
+	select {
+	case <-lost:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat did not abort after the lease row vanished")
+	}
+}
+
+func TestHeartbeatToleratesTransientDBErrors(t *testing.T) {
+	path := newWorkerTestDB(t)
+	seedPackagedChannel(t, path)
+
+	rw, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	ctx := context.Background()
+	encID := db.GetLocalEncoderID(ctx, rw)
+	w := &Worker{DB: rw, EncoderID: encID, LeaseTTL: 300 * time.Millisecond}
+	ok, err := w.tryClaim(ctx, "m1", "h264-main-1080p", time.Now().UTC().UnixMilli())
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+
+	// A closed handle makes every heartbeat write fail with a transient error
+	// (the lease row itself is intact). The heartbeat must ride out
+	// heartbeatMaxMisses-1 failures before giving up, not abort on the first.
+	broken, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open broken: %v", err)
+	}
+	broken.Close()
+	wBroken := &Worker{DB: broken, EncoderID: encID, LeaseTTL: w.LeaseTTL}
+
+	interval := w.LeaseTTL / 3
+	start := time.Now()
+	lost := make(chan struct{})
+	go wBroken.heartbeat(ctx, packageid.For("m1", "h264-main-1080p"), func() { close(lost) })
+	select {
+	case <-lost:
+		if elapsed := time.Since(start); elapsed < time.Duration(heartbeatMaxMisses)*interval-50*time.Millisecond {
+			t.Fatalf("heartbeat aborted after %s; must tolerate %d misses (~%s)",
+				elapsed, heartbeatMaxMisses, time.Duration(heartbeatMaxMisses)*interval)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat never gave up after exhausting transient misses")
+	}
+}
+
+// TestRecordFailureLandsAfterContextCancel covers the wedge that stranded
+// on-demand encodes: the heartbeat aborts an encode by cancelling its context,
+// and the failure transition must still be written or the row stays
+// 'processing' with no lease, invisible to the sweeper until a restart.
+func TestRecordFailureLandsAfterContextCancel(t *testing.T) {
+	path := newWorkerTestDB(t)
+	seedPackagedChannel(t, path)
+
+	rw, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	if _, err := rw.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, attempts, created_at_ms, updated_at_ms)
+		VALUES ('p-m1', 'm1', 'h264-main-1080p', 'processing', 1, 0, 0)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recordFailure(ctx, rw, db.MediaPackage{ID: "p-m1"}, 1000, errors.New("ffmpeg: signal: killed"), "transient", 5)
+
+	pkg, err := db.MediaPackageByID(context.Background(), rw, "p-m1")
+	if err != nil || pkg == nil {
+		t.Fatalf("lookup: pkg=%v err=%v", pkg, err)
+	}
+	if pkg.Status != db.PackageStatusPending {
+		t.Fatalf("status = %q, want pending (transient failure under the attempts cap requeues)", pkg.Status)
 	}
 }

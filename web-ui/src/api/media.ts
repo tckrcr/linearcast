@@ -192,7 +192,7 @@ export async function getLocalMediaSources(): Promise<LocalMediaSource[]> {
 export async function saveLocalMediaSource(input: {
   id?: string;
   name: string;
-  mediaKind: LocalMediaSource["mediaKind"] | "tv";
+  mediaKind: LocalMediaSource["mediaKind"] | "tv" | "filler";
   paths: string[];
 }): Promise<LocalMediaSource> {
   const path = input.id

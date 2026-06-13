@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	dbsql "database/sql"
+	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/ondemand"
+	"github.com/tckrcr/linearcast/internal/plexrelay"
 	"github.com/tckrcr/linearcast/internal/scheduler"
 )
 
@@ -18,6 +21,10 @@ type channelRuntime struct {
 	DisplayName            string
 	PlaybackMode           db.PlaybackMode
 	RequiredPackageProfile string
+	ABRLadder              []string
+	// PrefillMode is "eager" or "on_demand". On-demand channels use ephemeral
+	// live sessions for schedule entries without ready packages.
+	PrefillMode string
 }
 
 type app struct {
@@ -25,6 +32,8 @@ type app struct {
 	addr            string
 	httpClient      *http.Client
 	externalHLS     *externalHLSProxyState
+	sessions        *ondemand.Manager
+	plexRelay       *plexrelay.Manager
 	packagedProfile string
 	startedAt       time.Time
 
@@ -70,6 +79,8 @@ func (a *app) refreshChannels(ctx context.Context) error {
 			existing.DisplayName = ch.DisplayName
 			existing.PlaybackMode = ch.PlaybackMode
 			existing.RequiredPackageProfile = profile
+			existing.ABRLadder = packagedLadderForChannel(ch, profile)
+			existing.PrefillMode = ch.PrefillMode
 			continue
 		}
 		a.channels[ch.ID] = &channelRuntime{
@@ -77,6 +88,13 @@ func (a *app) refreshChannels(ctx context.Context) error {
 			DisplayName:            ch.DisplayName,
 			PlaybackMode:           ch.PlaybackMode,
 			RequiredPackageProfile: profile,
+			ABRLadder:              packagedLadderForChannel(ch, profile),
+			PrefillMode:            ch.PrefillMode,
+		}
+		if ch.PlaybackMode == db.PlaybackModePlexRelay {
+			log.Printf("channel loaded id=%s display=%q playback_mode=%s",
+				ch.ID, ch.DisplayName, ch.PlaybackMode)
+			continue
 		}
 		if ch.PlaybackMode != db.PlaybackModePackaged {
 			log.Printf("channel loaded id=%s display=%q playback_mode=%s unsupported_by_playback=true profile=%s",
@@ -100,6 +118,11 @@ func packagedProfileForChannel(ch db.Channel, fallback string) string {
 		return strings.TrimSpace(ch.RequiredPackageProfile)
 	}
 	return fallback
+}
+
+func packagedLadderForChannel(ch db.Channel, requiredProfile string) []string {
+	b, _ := json.Marshal(ch.ABRLadder)
+	return db.NormalizeABRLadder(requiredProfile, string(b))
 }
 
 func (a *app) channelRefreshLoop(ctx context.Context) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -145,6 +146,63 @@ func TestHandleScheduleBuilderCreateChannelValid(t *testing.T) {
 	}
 }
 
+func TestHandleScheduleBuilderCreateChannelAdaptiveBitrateWritesLadder(t *testing.T) {
+	app, conn := testAdminApp(t)
+	insertMedia(t, conn, "show1", 1800000)
+	insertReadyPackage(t, conn, "show1", 1800000)
+
+	body := bytes.NewBufferString(`{
+		"displayName": "ABR Channel",
+		"mediaIds": ["show1"],
+		"packageProfile": "h264-main-1080p",
+		"adaptiveBitrate": "cpu"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/schedule-builder/channels", body)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+
+	app.handleScheduleBuilderCreateChannel(res, req)
+
+	if res.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	ch, err := db.ChannelByID(context.Background(), conn, "abr-channel")
+	if err != nil || ch == nil {
+		t.Fatalf("lookup channel: ch=%v err=%v", ch, err)
+	}
+	want := []string{"h264-copy-source", "h264-main-1080p", "h264-main-720p", "h264-main-480p"}
+	if got := fmt.Sprint(ch.ABRLadder); got != fmt.Sprint(want) {
+		t.Fatalf("ladder=%v, want %v", ch.ABRLadder, want)
+	}
+}
+
+func TestHandleScheduleBuilderCreateChannelAdaptiveBitrateRejectsMusic(t *testing.T) {
+	app, _ := testAdminApp(t)
+
+	body := bytes.NewBufferString(`{
+		"displayName": "Music ABR",
+		"mediaIds": ["song1"],
+		"packageProfile": "music-aac-720p",
+		"adaptiveBitrate": "cpu"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/schedule-builder/channels", body)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+
+	app.handleScheduleBuilderCreateChannel(res, req)
+
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", res.Code, res.Body.String())
+	}
+	var errBody map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&errBody); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errBody["error"] != "invalid_abr_media_kind" {
+		t.Fatalf("error=%q, want invalid_abr_media_kind", errBody["error"])
+	}
+}
+
 func TestHandleScheduleBuilderCreateChannelEmptyDisplayName(t *testing.T) {
 	app, _ := testAdminApp(t)
 
@@ -224,5 +282,51 @@ func TestHandleScheduleBuilderCreateChannelQueuedAndAlreadyReady(t *testing.T) {
 	}
 	if len(resp.Queued)+len(resp.AlreadyPending) < 1 {
 		t.Fatal("expected at least one queued or already-pending item for media without package")
+	}
+}
+
+func TestHandleScheduleBuilderCreatePlexRelayChannel(t *testing.T) {
+	app, conn := testAdminApp(t)
+	insertMedia(t, conn, "plex1", 12000)
+	insertMedia(t, conn, "plex2", 18000)
+	if err := db.SetMediaSourceRef(context.Background(), conn, "/tmp/plex1.mkv", "plex://101"); err != nil {
+		t.Fatalf("set plex1 source_ref: %v", err)
+	}
+	if err := db.SetMediaSourceRef(context.Background(), conn, "/tmp/plex2.mkv", "plex://102"); err != nil {
+		t.Fatalf("set plex2 source_ref: %v", err)
+	}
+
+	body := bytes.NewBufferString(`{
+		"displayName": "Plex Relay",
+		"playbackMode": "plex_relay",
+		"mediaIds": ["plex1", "plex2"],
+		"packageProfile": "h264-main-1080p"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/schedule-builder/channels", body)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+
+	app.handleScheduleBuilderCreateChannel(res, req)
+
+	if res.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	var resp scheduleBuilderCreateChannelResponse
+	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.ChannelID != "plex-relay" || resp.SyncedMedia != 2 {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if len(resp.Queued) != 0 || len(resp.AlreadyPending) != 0 || len(resp.AlreadyReady) != 0 || len(resp.Failed) != 0 {
+		t.Fatalf("plex relay should not request packages: %+v", resp)
+	}
+	assertCount(t, conn, `SELECT COUNT(*) FROM channel_media WHERE channel_id = 'plex-relay'`, 2)
+	var scheduleCount int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM schedule_entries WHERE channel_id = 'plex-relay'`).Scan(&scheduleCount); err != nil {
+		t.Fatalf("count schedule entries: %v", err)
+	}
+	if scheduleCount == 0 {
+		t.Fatal("expected plex relay schedule entries")
 	}
 }

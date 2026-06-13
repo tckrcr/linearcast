@@ -12,34 +12,164 @@ import (
 	"github.com/tckrcr/linearcast/internal/db"
 )
 
-// CheckReadyPackageIntegrity verifies ready package filesystem outputs and
-// moves broken rows back to pending so the normal worker claim path re-encodes.
-func CheckReadyPackageIntegrity(ctx context.Context, conn *sql.DB) (int64, error) {
+// IntegrityResult tallies what a ready-package sweep requeued, split by failure
+// mode so the two are separable in metrics and logs.
+type IntegrityResult struct {
+	// FileReset counts ready packages requeued for missing/broken files.
+	FileReset int64
+	// DurationReset counts ready packages requeued as truncated — packaged
+	// output materially short of the source media duration.
+	DurationReset int64
+	// DurationSkipped counts ready packages whose packaged or source duration
+	// was unknown, so the truncation comparison could not run. These are logged
+	// for visibility but left ready rather than requeued blindly.
+	DurationSkipped int64
+}
+
+// DurationShortfall describes a ready package flagged by the duration audit:
+// either its packaged output is materially short of the source (a likely
+// truncated encode), or its source/packaged duration is unknown so the
+// comparison could not be made (UnknownSource).
+type DurationShortfall struct {
+	PackageID     string
+	MediaID       string
+	Profile       string
+	PackagedMs    int64
+	SourceMs      int64
+	ShortfallMs   int64
+	ToleranceMs   int64
+	UnknownSource bool
+}
+
+// CheckReadyPackageIntegrity verifies ready packages — filesystem outputs and
+// packaged-vs-source duration — and moves broken or truncated rows back to
+// pending so the normal worker claim path re-encodes them. The duration check
+// shares PackagedDurationShortfall with the finalize guard so detection can
+// never drift from what finalize rejects.
+func CheckReadyPackageIntegrity(ctx context.Context, conn *sql.DB) (IntegrityResult, error) {
+	var res IntegrityResult
 	packages, err := db.ReadyMediaPackages(ctx, conn)
 	if err != nil {
-		return 0, fmt.Errorf("list ready packages: %w", err)
+		return res, fmt.Errorf("list ready packages: %w", err)
+	}
+	durations, err := sourceDurations(ctx, conn, packages)
+	if err != nil {
+		return res, err
 	}
 
-	var reset int64
 	nowMs := time.Now().UTC().UnixMilli()
 	for _, pkg := range packages {
 		if ctx.Err() != nil {
-			return reset, ctx.Err()
+			return res, ctx.Err()
 		}
+		// File integrity first: a package with missing files is requeued
+		// regardless of duration, so there is no point also probing its length.
 		if err := validateReadyPackageFiles(pkg); err != nil {
 			reason := fmt.Sprintf("package integrity check failed: %v", err)
 			changed, markErr := db.MarkReadyPackagePendingForReencode(ctx, conn, pkg.ID, nowMs, reason)
 			if markErr != nil {
-				return reset, fmt.Errorf("mark package %s pending: %w", pkg.ID, markErr)
+				return res, fmt.Errorf("mark package %s pending: %w", pkg.ID, markErr)
 			}
 			if changed {
-				reset++
+				res.FileReset++
 				log.Printf("package integrity reset id=%s media=%s profile=%s reason=%q",
 					pkg.ID, pkg.MediaID, pkg.RenditionProfile, reason)
 			}
+			continue
+		}
+
+		ds, flagged := evalPackageDuration(pkg, durations)
+		if !flagged {
+			continue
+		}
+		if ds.UnknownSource {
+			res.DurationSkipped++
+			log.Printf("package duration audit skipped id=%s media=%s profile=%s: unknown packaged/source duration",
+				pkg.ID, pkg.MediaID, pkg.RenditionProfile)
+			continue
+		}
+		reason := fmt.Sprintf("packaged duration %dms is %dms short of source %dms; encode likely truncated",
+			ds.PackagedMs, ds.ShortfallMs, ds.SourceMs)
+		changed, markErr := db.MarkReadyPackagePendingForReencode(ctx, conn, pkg.ID, nowMs, reason)
+		if markErr != nil {
+			return res, fmt.Errorf("mark package %s pending: %w", pkg.ID, markErr)
+		}
+		if changed {
+			res.DurationReset++
+			log.Printf("package duration reset id=%s media=%s profile=%s reason=%q",
+				pkg.ID, pkg.MediaID, pkg.RenditionProfile, reason)
 		}
 	}
-	return reset, nil
+	return res, nil
+}
+
+// AuditReadyPackageDurations reports every ready package whose packaged duration
+// falls materially short of its source (a likely truncated encode), plus any
+// whose packaged/source duration is unknown so the check could not run. It is
+// read-only: it reports, it does not requeue. The maint audit-duration command
+// uses it for listing; CheckReadyPackageIntegrity shares the same per-package
+// evaluation (evalPackageDuration) when it requeues.
+func AuditReadyPackageDurations(ctx context.Context, conn *sql.DB) ([]DurationShortfall, error) {
+	packages, err := db.ReadyMediaPackages(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("list ready packages: %w", err)
+	}
+	durations, err := sourceDurations(ctx, conn, packages)
+	if err != nil {
+		return nil, err
+	}
+	var out []DurationShortfall
+	for _, pkg := range packages {
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
+		if ds, flagged := evalPackageDuration(pkg, durations); flagged {
+			out = append(out, ds)
+		}
+	}
+	return out, nil
+}
+
+// evalPackageDuration compares one ready package against its source duration.
+// flagged is true when the package should be surfaced — either truncated, or
+// unknown (DurationShortfall.UnknownSource) because the packaged or source
+// duration is missing and the comparison cannot be made.
+func evalPackageDuration(pkg db.MediaPackage, sourceMs map[string]int64) (ds DurationShortfall, flagged bool) {
+	src := sourceMs[pkg.MediaID]
+	ds = DurationShortfall{
+		PackageID: pkg.ID,
+		MediaID:   pkg.MediaID,
+		Profile:   pkg.RenditionProfile,
+		SourceMs:  src,
+	}
+	if pkg.PackagedDurationMs == nil || src <= 0 {
+		ds.UnknownSource = true
+		return ds, true
+	}
+	ds.PackagedMs = *pkg.PackagedDurationMs
+	ds.ToleranceMs = durationShortfallTolerance(src)
+	shortfall, truncated := PackagedDurationShortfall(ds.PackagedMs, src)
+	ds.ShortfallMs = shortfall
+	return ds, truncated
+}
+
+// sourceDurations batch-loads source media durations for the supplied packages,
+// keyed by media ID. Media rows that no longer exist are simply absent (their
+// packages then read as UnknownSource).
+func sourceDurations(ctx context.Context, conn *sql.DB, packages []db.MediaPackage) (map[string]int64, error) {
+	ids := make([]string, 0, len(packages))
+	for _, p := range packages {
+		ids = append(ids, p.MediaID)
+	}
+	media, err := db.MediaByIDs(ctx, conn, ids)
+	if err != nil {
+		return nil, fmt.Errorf("load source durations: %w", err)
+	}
+	out := make(map[string]int64, len(media))
+	for id, m := range media {
+		out[id] = m.DurationMs
+	}
+	return out, nil
 }
 
 func validateReadyPackageFiles(pkg db.MediaPackage) error {
@@ -57,7 +187,7 @@ func validateReadyPackageFiles(pkg db.MediaPackage) error {
 	if err := requireRegularFile(playlist); err != nil {
 		return fmt.Errorf("manifest %s: %w", playlist, err)
 	}
-	segments, err := parseHLSManifest(playlist)
+	segments, err := ParseHLSManifest(playlist)
 	if err != nil {
 		return fmt.Errorf("parse manifest %s: %w", playlist, err)
 	}

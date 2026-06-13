@@ -224,21 +224,24 @@ func (a *App) handleEncoderList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "list_jobs_failed", err.Error())
 		return
 	}
-	localJobs, err := db.ListLocalWorkerJobs(r.Context(), a.dbConn)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "list_local_jobs_failed", err.Error())
-		return
-	}
 	jobMap := make(map[string]db.EncoderJobSummary, len(jobs))
-	for _, j := range jobs {
-		jobMap[j.EncoderID] = j
-	}
 
 	nowMs := a.now().UTC().UnixMilli()
 
-	// If the packager-worker has self-registered, pull its row out of the encoder
-	// list and use it for the localWorker card so capabilities reflect live data.
+	// The packager-worker self-registers as an encoder; pull its row out of the
+	// encoder list and render it as the localWorker card so capabilities reflect
+	// live data. Its in-flight jobs are ordinary encoder_jobs leases now, so peel
+	// those off the summaries here — with the row removed below, they would
+	// otherwise render nowhere.
 	localEncoderID := db.GetLocalEncoderID(r.Context(), a.dbConn)
+	var localLeasedJobs []db.EncoderJobSummary
+	for _, j := range jobs {
+		if localEncoderID != "" && j.EncoderID == localEncoderID {
+			localLeasedJobs = append(localLeasedJobs, j)
+			continue
+		}
+		jobMap[j.EncoderID] = j
+	}
 	var localEncoderRow *db.Encoder
 	filtered := rows[:0]
 	for i := range rows {
@@ -301,7 +304,7 @@ func (a *App) handleEncoderList(w http.ResponseWriter, r *http.Request) {
 		localCreatedAtMs = localEncoderRow.CreatedAtMs
 		localConcurrency = localEncoderRow.Concurrency
 		localStatus = string(localEncoderRow.Status)
-		if localEncoderRow.Concurrency == 0 && len(localJobs) == 0 {
+		if localEncoderRow.Concurrency == 0 && len(localLeasedJobs) == 0 {
 			localStatus = string(db.EncoderStatusOffline)
 		}
 	} else {
@@ -322,14 +325,22 @@ func (a *App) handleEncoderList(w http.ResponseWriter, r *http.Request) {
 		Enabled:      localConcurrency > 0,
 		Concurrency:  localConcurrency,
 	}
-	for _, j := range localJobs {
-		localItem.Jobs = append(localItem.Jobs, encoderCurrentJob{
-			PackageID:   j.PackageID,
-			MediaID:     j.MediaID,
-			MediaTitle:  j.MediaTitle,
-			Profile:     j.Profile,
-			ClaimedAtMs: j.ClaimedAtMs,
-		})
+	// Local jobs are ordinary leases now, so mirror the remote rendering above
+	// (progress + lease expiry included) rather than the old lease-free shape.
+	for _, j := range localLeasedJobs {
+		cj := encoderCurrentJob{
+			PackageID:      j.PackageID,
+			MediaID:        j.MediaID,
+			MediaTitle:     j.MediaTitle,
+			Profile:        j.Profile,
+			LeaseExpiresMs: j.LeaseExpiresMs,
+			ClaimedAtMs:    j.ClaimedAtMs,
+		}
+		if j.ProgressPct != nil {
+			v := int(*j.ProgressPct)
+			cj.ProgressPct = &v
+		}
+		localItem.Jobs = append(localItem.Jobs, cj)
 	}
 	out.LocalWorker = &localItem
 

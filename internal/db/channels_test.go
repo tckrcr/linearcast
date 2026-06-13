@@ -95,7 +95,7 @@ func TestChannelPlaybackPolicy(t *testing.T) {
 
 	prefill := int64(86400000)
 	updated, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModePackaged,
-		"h264-main-1080p", &prefill, MediaKindVideo)
+		"h264-main-1080p", nil, &prefill, MediaKindVideo)
 	if err != nil || !updated {
 		t.Fatalf("update packaged policy updated=%v err=%v", updated, err)
 	}
@@ -109,10 +109,10 @@ func TestChannelPlaybackPolicy(t *testing.T) {
 		t.Fatalf("unexpected packaged policy: %+v", ch)
 	}
 
-	if _, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModePackaged, "", nil, MediaKindVideo); err != nil {
+	if _, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModePackaged, "", nil, nil, MediaKindVideo); err != nil {
 		t.Fatalf("expected packaged policy without profile to default successfully: %v", err)
 	}
-	if _, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModeGenerated, "", nil, MediaKindVideo); err == nil {
+	if _, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModeGenerated, "", nil, nil, MediaKindVideo); err == nil {
 		t.Fatalf("expected generated policy to fail")
 	}
 }
@@ -245,5 +245,49 @@ func TestCloneChannelMissingReturnsNoRows(t *testing.T) {
 	_, err = CloneChannel(context.Background(), rw, "missing", 0)
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("err=%v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestNormalizeChannelsToPackagedPreservesPlexRelay(t *testing.T) {
+	path := newTestDB(t)
+	rw, err := OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	if err := ApplySchema(context.Background(), rw); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode)
+		VALUES ('relay', 'Relay', '', 'alphabetical', 1, 0, 'plex_relay')`); err != nil {
+		t.Fatalf("insert relay: %v", err)
+	}
+	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode)
+		VALUES ('legacy', 'Legacy', '/tmp', 'alphabetical', 1, 0, 'generated')`); err != nil {
+		t.Fatalf("insert legacy: %v", err)
+	}
+
+	n, err := NormalizeChannelsToPackaged(context.Background(), rw, "h264-main-1080p")
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("normalized=%d, want 1", n)
+	}
+
+	relay, err := ChannelByID(context.Background(), rw, "relay")
+	if err != nil {
+		t.Fatalf("relay lookup: %v", err)
+	}
+	if relay == nil || relay.PlaybackMode != PlaybackModePlexRelay || relay.RequiredPackageProfile != "" {
+		t.Fatalf("relay mutated: %+v", relay)
+	}
+	legacy, err := ChannelByID(context.Background(), rw, "legacy")
+	if err != nil {
+		t.Fatalf("legacy lookup: %v", err)
+	}
+	if legacy == nil || legacy.PlaybackMode != PlaybackModePackaged || legacy.RequiredPackageProfile != "h264-main-1080p" {
+		t.Fatalf("legacy not normalized: %+v", legacy)
 	}
 }

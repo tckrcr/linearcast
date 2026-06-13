@@ -7,6 +7,8 @@ type UsePlayerKeyboardShortcutsOptions = {
   setActiveChannelID: (id: string | null) => void;
   muted: boolean;
   setMuted: (muted: boolean) => void;
+  abrMode: "best" | "saver";
+  setAbrMode: (mode: "best" | "saver") => void;
   debugOpen: boolean;
   setDebugOpen: (open: boolean) => void;
   channelsOpen: boolean;
@@ -19,6 +21,8 @@ export function usePlayerKeyboardShortcuts({
   setActiveChannelID,
   muted,
   setMuted,
+  abrMode,
+  setAbrMode,
   debugOpen,
   setDebugOpen,
   channelsOpen,
@@ -69,6 +73,10 @@ export function usePlayerKeyboardShortcuts({
         case "M":
           setMuted(!muted);
           break;
+        case "q":
+        case "Q":
+          setAbrMode(abrMode === "best" ? "saver" : "best");
+          break;
         case "f":
         case "F":
           toggleFullscreen();
@@ -84,9 +92,11 @@ export function usePlayerKeyboardShortcuts({
     return () => window.removeEventListener("keydown", onKey);
   }, [
     activeChannelID,
+    abrMode,
     channelsOpen,
     debugOpen,
     muted,
+    setAbrMode,
     setActiveChannelID,
     setChannelsOpen,
     setDebugOpen,

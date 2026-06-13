@@ -12,8 +12,14 @@ import (
 type Probe struct {
 	Container   string
 	VideoCodec  string
+	VideoWidth  int64
 	VideoHeight int64
-	AudioCodec  string
+	// ColorTransfer and ColorPrimaries are ffprobe's color_transfer /
+	// color_primaries stream fields (e.g. "smpte2084", "bt2020"). Recorded for
+	// HDR detection; not part of the v1 allowlist check.
+	ColorTransfer  string
+	ColorPrimaries string
+	AudioCodec     string
 }
 
 var (
@@ -24,8 +30,13 @@ var (
 	allowedAudio = map[string]bool{"aac": true, "ac3": true, "eac3": true, "dts": true, "dts-hd-ma": true, "dts-hd-hra": true, "truehd": true, "flac": true, "opus": true, "mp3": true, "pcm_s16le": true, "pcm_s24le": true}
 )
 
-// Check returns ("", true) when p satisfies the v1 allowlist. Otherwise it
+// Check returns ("", true) when p satisfies the allowlist. Otherwise it
 // returns a structured reason string and false.
+//
+// HDR sources (PQ/HLG transfer characteristic) are allowed through even if
+// the video codec is HEVC and the height exceeds 1080. This gate relies on
+// the presence of an HDR10 base layer; DV P5 (no HDR10 fallback) is not
+// separately detected here.
 func Check(p Probe) (reason string, ok bool) {
 	var fails []string
 	c := strings.ToLower(p.Container)
@@ -33,10 +44,14 @@ func Check(p Probe) (reason string, ok bool) {
 		fails = append(fails, fmt.Sprintf("container=%s", p.Container))
 	}
 	v := strings.ToLower(p.VideoCodec)
-	if !allowedVideo[v] {
+	isHDR := IsHDRTransfer(p.ColorTransfer)
+	if v == "hevc" && isHDR {
+		// HEVC with HDR transfer characteristic: allow through for the
+		// hevc-copy-source ABR rung.
+	} else if !allowedVideo[v] {
 		fails = append(fails, fmt.Sprintf("video_codec=%s", p.VideoCodec))
 	}
-	if p.VideoHeight > 1080 {
+	if !isHDR && p.VideoHeight > 1080 {
 		fails = append(fails, fmt.Sprintf("video_height=%d", p.VideoHeight))
 	}
 	a := NormalizeAudio(p.AudioCodec)
@@ -53,4 +68,17 @@ func Check(p Probe) (reason string, ok bool) {
 // allowlist tokens. e.g. "dts" + profile "DTS-HD MA" -> "dts-hd-ma".
 func NormalizeAudio(name string) string {
 	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// IsHDRTransfer reports whether transfer (ffprobe color_transfer) is an HDR
+// transfer characteristic: smpte2084 (PQ — HDR10, HDR10+, Dolby Vision) or
+// arib-std-b67 (HLG). Transfer alone is the reliable HDR signal; bt2020
+// primaries also appear on SDR-in-BT.2020 content, so they are deliberately
+// not consulted here.
+func IsHDRTransfer(transfer string) bool {
+	switch strings.ToLower(strings.TrimSpace(transfer)) {
+	case "smpte2084", "arib-std-b67":
+		return true
+	}
+	return false
 }

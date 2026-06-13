@@ -20,7 +20,10 @@ var (
 	errMediaNotInChannel   = errors.New("media does not belong to this channel")
 	errPackageNotReady     = errors.New("media does not have a ready package for this channel profile")
 	errInsideScheduleEntry = errors.New("time falls inside an existing schedule entry")
+	errNoScheduleGap       = errors.New("time is not the start of a fillable schedule gap")
+	errFillerTooShort      = errors.New("filler media is too short for the schedule gap")
 	errScheduleEntryLocked = errors.New("schedule entry is not editable")
+	errNotSlotGrid         = errors.New("channel is not in slot_grid schedule mode")
 )
 
 type restartResult struct {
@@ -57,12 +60,33 @@ type upsertEntryResult struct {
 	NoPackages     bool
 }
 
+type fillGapResult struct {
+	EntryID        string
+	StartMs        int64
+	EndMs          int64
+	DurationMs     int64
+	OffsetMs       int64
+	MediaID        string
+	PackageProfile string
+}
+
 type saveWindowResult struct {
 	Cleared            int64
 	Inserted           int64
 	LastEndMs          int64
 	ResumeAfterMediaID string
 	NoPackages         bool
+}
+
+type recomposeResult struct {
+	FromMs    int64
+	Cleared   int64
+	Inserted  int64
+	LastEndMs int64
+	// Gappy is true when the recomposed future still contains gaps — the
+	// gap-free fallback when the channel has no attached, ready filler. The
+	// rebuild still WARN-logs in scheduler.BuildEntriesSlotGridFilled.
+	Gappy bool
 }
 
 type insertRelativeResult struct {
@@ -390,6 +414,168 @@ func (s *scheduleService) UpsertEntry(ctx context.Context, channelID string, req
 	return res, nil
 }
 
+func (s *scheduleService) FillGap(ctx context.Context, channelID string, req scheduleGapFillRequest) (fillGapResult, error) {
+	ch, err := db.ChannelByID(ctx, s.db, channelID)
+	if err != nil {
+		return fillGapResult{}, err
+	}
+	if ch == nil {
+		return fillGapResult{}, errChannelNotFound
+	}
+	if req.StartMs%segmentMs != 0 || req.OffsetMs%segmentMs != 0 {
+		return fillGapResult{}, errNoScheduleGap
+	}
+	if req.OffsetMs < 0 {
+		return fillGapResult{}, errFillerTooShort
+	}
+
+	belongs, err := db.ChannelFillerAssetMediaExists(ctx, s.db, channelID, req.MediaID)
+	if err != nil {
+		return fillGapResult{}, err
+	}
+	if !belongs {
+		// Auto-attach: if the media is a registered filler asset that matches the
+		// channel's kind, attach it now rather than forcing a separate step.
+		asset, assetErr := db.FillerAssetByMediaID(ctx, s.db, req.MediaID)
+		if assetErr != nil {
+			if errors.Is(assetErr, sql.ErrNoRows) {
+				return fillGapResult{}, errMediaNotInChannel
+			}
+			return fillGapResult{}, assetErr
+		}
+		media, mediaErr := db.MediaByID(ctx, s.db, asset.MediaID)
+		if mediaErr != nil {
+			return fillGapResult{}, mediaErr
+		}
+		if media == nil || db.NormalizeMediaKind(media.MediaKind) != ch.MediaKind {
+			return fillGapResult{}, errMediaNotInChannel
+		}
+		if attachErr := db.AttachChannelFillerAsset(ctx, s.db, channelID, asset.ID, 1, true); attachErr != nil {
+			return fillGapResult{}, attachErr
+		}
+	}
+
+	prevEntry, err := db.LastScheduleEntryBefore(ctx, s.db, channelID, req.StartMs+1)
+	if err != nil {
+		return fillGapResult{}, err
+	}
+	if prevEntry != nil && prevEntry.StartMs < req.StartMs && req.StartMs < prevEntry.StartMs+prevEntry.DurationMs {
+		return fillGapResult{}, errInsideScheduleEntry
+	}
+	nextEntry, err := db.NextScheduleEntryAfter(ctx, s.db, channelID, req.StartMs)
+	if err != nil {
+		return fillGapResult{}, err
+	}
+	if nextEntry == nil || nextEntry.StartMs <= req.StartMs {
+		return fillGapResult{}, errNoScheduleGap
+	}
+	if prevEntry != nil && prevEntry.StartMs == req.StartMs {
+		return fillGapResult{}, errNoScheduleGap
+	}
+
+	durationMs := nextEntry.StartMs - req.StartMs
+	if durationMs <= 0 || durationMs%segmentMs != 0 {
+		return fillGapResult{}, errNoScheduleGap
+	}
+	if prevEntry != nil && req.StartMs < prevEntry.StartMs+prevEntry.DurationMs {
+		return fillGapResult{}, errInsideScheduleEntry
+	}
+
+	profile := requiredPackageProfile(*ch)
+	pkg, err := db.ReadyMediaPackage(ctx, s.db, req.MediaID, profile)
+	if err != nil {
+		return fillGapResult{}, err
+	}
+	if pkg == nil || pkg.PackagedDurationMs == nil {
+		return fillGapResult{}, errPackageNotReady
+	}
+	packagedDurationMs := scheduler.ClipTo6s(*pkg.PackagedDurationMs)
+	offsetMs, err := s.resolveFillerOffset(ctx, channelID, req, durationMs, packagedDurationMs)
+	if err != nil {
+		return fillGapResult{}, err
+	}
+	if offsetMs+durationMs > packagedDurationMs {
+		return fillGapResult{}, errFillerTooShort
+	}
+
+	entryID := uuid.NewString()
+	entry := db.ScheduleEntry{
+		ID:          entryID,
+		ChannelID:   channelID,
+		StartMs:     req.StartMs,
+		MediaID:     req.MediaID,
+		OffsetMs:    offsetMs,
+		DurationMs:  durationMs,
+		CreatedAtMs: s.now().UTC().UnixMilli(),
+		Kind:        "filler",
+	}
+	if prevEntry != nil {
+		entry.AnchorScheduleEntryID = &prevEntry.ID
+	}
+
+	if err := db.WithImmediateTx(ctx, s.db, func(tx db.Execer) error {
+		// Repoint the successor before inserting the filler row. The chain has a
+		// unique successor-per-anchor index, so inserting filler anchored to the
+		// previous row while the successor still uses that same anchor would violate
+		// idx_schedule_entries_anchor. There is no FK on anchor_schedule_entry_id,
+		// so this transient in-transaction forward reference is safe and rolls back
+		// with the insert if anything fails.
+		if _, err := tx.ExecContext(ctx, `UPDATE schedule_entries SET anchor_schedule_entry_id = ? WHERE channel_id = ? AND id = ?`, entryID, channelID, nextEntry.ID); err != nil {
+			return err
+		}
+		if _, err := db.InsertScheduleEntries(ctx, tx, []db.ScheduleEntry{entry}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return fillGapResult{}, err
+	}
+
+	return fillGapResult{
+		EntryID:        entryID,
+		StartMs:        req.StartMs,
+		EndMs:          req.StartMs + durationMs,
+		DurationMs:     durationMs,
+		OffsetMs:       offsetMs,
+		MediaID:        req.MediaID,
+		PackageProfile: profile,
+	}, nil
+}
+
+// resolveFillerOffset chooses the filler asset offset for a gap fill. The
+// default ("" / "zero") honors the client-provided OffsetMs. "sequential"
+// continues the rotation from where the previous placement of the same filler
+// asset on this channel left off, wrapping back to the asset start when
+// continuing would overrun its packaged duration. This stops a long filler
+// asset from replaying its opening seconds in every gap while staying
+// deterministic across schedule rebuilds.
+//
+// "previous placement" is the most recent filler entry for the same media
+// before this gap: db.LastEntryWithMediaBefore filters on entry_kind='filler',
+// so any incidental reuse of the same media as primary programming is ignored.
+func (s *scheduleService) resolveFillerOffset(ctx context.Context, channelID string, req scheduleGapFillRequest, durationMs, packagedDurationMs int64) (int64, error) {
+	if req.OffsetMode != "sequential" {
+		return req.OffsetMs, nil
+	}
+	if durationMs >= packagedDurationMs {
+		// The gap is at least as long as the whole asset; only offset 0 can fit,
+		// and the caller's fit check rejects it when even that overruns.
+		return 0, nil
+	}
+	prev, err := db.LastEntryWithMediaBefore(ctx, s.db, channelID, req.MediaID, req.StartMs)
+	if err != nil {
+		return 0, err
+	}
+	if prev == nil {
+		return 0, nil
+	}
+	cursor := (prev.OffsetMs + prev.DurationMs) % packagedDurationMs
+	if cursor+durationMs > packagedDurationMs {
+		cursor = 0
+	}
+	return cursor, nil
+}
+
 func (s *scheduleService) saveWindowByMediaIDs(ctx context.Context, channelID string, fromMs, toMs int64, tailMode string, extendTail bool, mediaIDs []string) (saveWindowResult, error) {
 	ch, err := db.ChannelByID(ctx, s.db, channelID)
 	if err != nil {
@@ -560,6 +746,73 @@ func (s *scheduleService) SaveWindowOrdered(ctx context.Context, channelID strin
 	}
 	extendTail := req.ExtendTail == nil || *req.ExtendTail
 	return s.saveWindowByMediaIDs(ctx, channelID, req.FromMs, req.ToMs, req.TailMode, extendTail, mediaIDs)
+}
+
+// RecomposeSlotGridFuture rebuilds a slot-grid channel's future schedule
+// gap-free in one atomic operation: it clears everything after the currently
+// in-progress entry (preserving live playback) and re-extends through the
+// scheduler's slot tiler, which lays primaries on slot boundaries and tiles
+// filler from the channel's attached filler pool. This is the existing-channel
+// edit-path equivalent of the gap-free create flow — it replaces the old
+// one-gap-at-a-time FillGap editing.
+//
+// If the channel has no eligible ready packages the whole operation rolls back
+// (the schedule is never wiped without a rebuild). When the channel has primary
+// media but no usable filler, the rebuild succeeds with gaps (the documented
+// fallback) and the result is marked Gappy.
+func (s *scheduleService) RecomposeSlotGridFuture(ctx context.Context, channelID string) (recomposeResult, error) {
+	ch, err := db.ChannelByID(ctx, s.db, channelID)
+	if err != nil {
+		return recomposeResult{}, err
+	}
+	if ch == nil {
+		return recomposeResult{}, errChannelNotFound
+	}
+	if ch.ScheduleMode != "slot_grid" {
+		return recomposeResult{}, errNotSlotGrid
+	}
+
+	nowMs := s.now().UTC().UnixMilli()
+	// Preserve the most recently started entry (the in-progress program) and
+	// clear everything after it; rebuild from there. When nothing is at/before
+	// now, clear from the current grid boundary and rebuild forward.
+	prev, err := db.LastScheduleEntryBefore(ctx, s.db, channelID, nowMs+1)
+	if err != nil {
+		return recomposeResult{}, err
+	}
+	fromMs := scheduler.Align6s(nowMs)
+	if prev != nil {
+		fromMs = prev.StartMs + prev.DurationMs
+	}
+
+	res := recomposeResult{FromMs: fromMs}
+	err = db.WithImmediateTx(ctx, s.db, func(tx db.Execer) error {
+		ext, e := scheduler.ExtendChannel(ctx, tx, channelID, scheduler.ServiceOptions{
+			HorizonHours:  24,
+			ClearAfterMs:  sql.NullInt64{Int64: fromMs, Valid: true},
+			NowMs:         nowMs,
+			InTransaction: true,
+		})
+		if e != nil {
+			// Roll back the clear too — never leave the channel with a wiped
+			// future and no rebuild (e.g. ErrNoReadyPackages).
+			return e
+		}
+		res.Cleared = ext.Cleared
+		res.Inserted = int64(ext.Inserted)
+		res.LastEndMs = ext.LastEndMs
+
+		gaps, gerr := db.ScheduleGaps(ctx, tx, channelID, fromMs, ext.LastEndMs)
+		if gerr != nil {
+			return gerr
+		}
+		res.Gappy = len(gaps) > 0
+		return nil
+	})
+	if err != nil {
+		return recomposeResult{}, err
+	}
+	return res, nil
 }
 
 // InsertEntryAfter inserts a new schedule entry directly after the target row

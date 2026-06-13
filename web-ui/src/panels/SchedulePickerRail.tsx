@@ -28,6 +28,7 @@ export type SchedulePickerRailTab = {
   emptyMessage?: string;
   footer?: ReactNode;
   defaultActionLabel?: string;
+  draggableItems?: boolean;
 };
 
 export type SchedulePickerRailProps = {
@@ -76,6 +77,7 @@ export function SchedulePickerRail({
       emptyMessage={active.emptyMessage}
       footer={active.footer}
       defaultActionLabel={active.defaultActionLabel}
+      draggableItems={active.draggableItems}
       content={active.content}
     />
   );

@@ -13,8 +13,11 @@ const fragRetry = {
   backoff: "exponential" as const,
 };
 
+// Playlist 503s are expected while an on-demand live session warms up (ffmpeg
+// spawn to first segment can take ~15s after an idle teardown), so the retry
+// window has to outlast that: 0.5+1+2+4+4+4 ≈ 15.5s.
 const playlistRetry = {
-  maxNumRetry: 4,
+  maxNumRetry: 6,
   retryDelayMs: 500,
   maxRetryDelayMs: 4_000,
   backoff: "exponential" as const,
@@ -26,15 +29,25 @@ const HLS_CONFIG = {
   startFragPrefetch: false,
   backBufferLength: 0,
   liveBackBufferLength: 0,
-  frontBufferFlushThreshold: 30,
-  maxBufferLength: 24,
-  maxMaxBufferLength: 30,
-  maxBufferSize: 60 * 1000 * 1000,
+  // Buffer budget is sized for copy-source profiles: -c:v copy preserves the
+  // source bitrate (a 1080p remux runs 25-30 Mbps, ~20 MB per 6s segment) and
+  // splits on the source's own keyframes, so segments run large and irregular.
+  // Chrome's SourceBuffer quota is ~150 MB; the byte cap must sit comfortably
+  // under it or appendBuffer throws QuotaExceededError (bufferFullError).
+  // Hitting maxBufferSize is benign backpressure — hls.js pauses fragment
+  // loading without flushing — so it, not the duration cap, is what bounds
+  // high-bitrate copy channels (~30s at 28 Mbps). Transcode channels stay
+  // under the byte cap and are bounded by duration instead. The larger hole
+  // tolerance nudges over keyframe-boundary gaps instead of stalling.
+  frontBufferFlushThreshold: 60,
+  maxBufferLength: 60,
+  maxMaxBufferLength: 120,
+  maxBufferSize: 96 * 1000 * 1000,
   liveSyncDurationCount: 6,
   liveMaxLatencyDurationCount: 12,
-  maxBufferHole: 0.5,
+  maxBufferHole: 1,
   nudgeOffset: 0.1,
-  nudgeMaxRetry: 5,
+  nudgeMaxRetry: 8,
   fragLoadPolicy: {
     default: {
       maxTimeToFirstByteMs: 10_000,
@@ -76,6 +89,7 @@ type UseHlsPlayerOptions = {
   enabled: boolean;
   autoPlay: boolean;
   muted: boolean;
+  abrMode: "best" | "saver";
   videoRef: React.RefObject<HTMLVideoElement | null>;
   hlsRef: React.RefObject<Hls | null>;
   initialStats: PlaybackStats;
@@ -87,6 +101,7 @@ export function useHlsPlayer({
   enabled,
   autoPlay,
   muted,
+  abrMode,
   videoRef,
   hlsRef,
   initialStats,
@@ -171,6 +186,11 @@ export function useHlsPlayer({
           hls.loadSource(source);
         });
         hls.on(Events.MANIFEST_PARSED, () => {
+          if (abrMode === "saver") {
+            hls.autoLevelCapping = Math.max(0, hls.levels.length - 2);
+          } else {
+            hls.autoLevelCapping = -1;
+          }
           requestPlayback(video, autoPlay);
         });
         hls.on(Events.FRAG_BUFFERED, (_event, data) => {
@@ -205,7 +225,15 @@ export function useHlsPlayer({
             hls.startLoad(video.currentTime);
             return;
           }
-          if (isMissingPackageArtifact(data)) {
+          if (isMissingMediaArtifact(data)) {
+            // Non-fatal means the frag load policy is still retrying the URL;
+            // let it run before declaring the stream unavailable.
+            if (!data.fatal) return;
+            // A 404 here is usually transient: on-demand session segments
+            // vanish when the server recycles a session (the replacement has
+            // new URLs the next playlist refresh picks up), and missing
+            // packaged artifacts are auto-requeued for re-encode server-side.
+            // Either way the right move is to back off and reload, not stop.
             setStats((prev) => ({
               ...prev,
               lastEvent: "stream unavailable",
@@ -213,6 +241,7 @@ export function useHlsPlayer({
               streamUnavailableReason: streamUnavailableReason(data),
             }));
             hls.stopLoad();
+            scheduleNetworkRetry();
             return;
           }
           if (data.fatal) {
@@ -247,16 +276,29 @@ export function useHlsPlayer({
       hlsRef.current = null;
     };
   }, [source, enabled, autoPlay, muted, videoRef, hlsRef, initialStats, setStats]);
+
+  useEffect(() => {
+    const hls = hlsRef.current;
+    if (hls) {
+      if (abrMode === "saver") {
+        hls.autoLevelCapping = Math.max(0, hls.levels.length - 2);
+      } else {
+        hls.autoLevelCapping = -1;
+      }
+    }
+  }, [abrMode, hlsRef]);
 }
 
 function streamUnavailableReason(data: ErrorData): string {
-  if (isMissingPackageArtifact(data)) {
-    return "Package segments are missing. Restart the packager worker to re-scan and rebuild this episode.";
+  if (!isMissingMediaArtifact(data)) return "";
+  const url = "frag" in data ? data.frag?.url ?? "" : "";
+  if (url.includes("/session/")) {
+    return "Live packaging session restarted; reconnecting automatically.";
   }
-  return "";
+  return "Packaged segments are missing; the server queues a rebuild on 404 and playback will retry automatically.";
 }
 
-function isMissingPackageArtifact(data: ErrorData): boolean {
+function isMissingMediaArtifact(data: ErrorData): boolean {
   if (data.details !== "fragLoadError") return false;
   const responseCode = "response" in data ? data.response?.code : undefined;
   return responseCode === 404;

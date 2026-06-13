@@ -1,4 +1,4 @@
--- linearcast schema v4.
+-- linearcast schema v5.
 -- See docs/database.md.
 
 PRAGMA journal_mode = WAL;
@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '5');
 
 -- ordering values are validated in Go (alphabetical, block). No CHECK here
 -- so v3-introduced values can land without a table rebuild.
@@ -25,16 +25,23 @@ CREATE TABLE IF NOT EXISTS channels (
     artwork_url      TEXT,
     playback_mode    TEXT NOT NULL DEFAULT 'packaged',
     required_package_profile TEXT,
+    abr_ladder_json TEXT,
     package_prefill_ms INTEGER,
     encoder_policy TEXT,
     media_kind TEXT NOT NULL DEFAULT 'video',
+    schedule_mode TEXT NOT NULL DEFAULT 'back_to_back',
+    slot_duration_ms INTEGER,
     upstream_hls_url TEXT,
+    prefill_mode TEXT NOT NULL DEFAULT 'eager',
     CHECK (enabled IN (0, 1)),
     CHECK (hidden_from_guide IN (0, 1)),
-    CHECK (playback_mode IN ('generated', 'packaged')),
+    CHECK (playback_mode IN ('generated', 'packaged', 'plex_relay')),
     CHECK (package_prefill_ms IS NULL OR package_prefill_ms > 0),
     CHECK (encoder_policy IS NULL OR encoder_policy IN ('any', 'remote_only', 'remote_preferred', 'local_only')),
-    CHECK (media_kind IN ('video', 'music'))
+    CHECK (media_kind IN ('video', 'music')),
+    CHECK (schedule_mode IN ('back_to_back', 'slot_grid')),
+    CHECK (slot_duration_ms IS NULL OR (slot_duration_ms > 0 AND slot_duration_ms % 6000 = 0)),
+    CHECK (prefill_mode IN ('eager', 'on_demand'))
 );
 
 -- user_preference is reserved for future continuity-ordering work
@@ -55,6 +62,10 @@ CREATE TABLE IF NOT EXISTS media (
     codec_check_reason  TEXT,
     ingested_at_ms      INTEGER NOT NULL,
     media_kind          TEXT,
+    source_ref          TEXT,
+    video_width         INTEGER,
+    color_transfer      TEXT,
+    color_primaries     TEXT,
     CHECK (codec_check_passed IN (0, 1)),
     CHECK (duration_ms > 0),
     CHECK (media_kind IS NULL OR media_kind IN ('video', 'music'))
@@ -295,11 +306,17 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
     ('encoder_mode',                 '"local"'),
     ('local_worker_concurrency',     '1'),
     ('default_packaged_profile',     '"h264-main-1080p"'),
-    ('scheduler_horizon_hours',      '48'),
-    ('scheduler_low_water_hours',    '24'),
+    ('scheduler_horizon_hours',      '24'),
+    ('scheduler_low_water_hours',    '23'),
     ('scheduler_tick_seconds',       '300'),
     ('encoder_sweep_interval_seconds', '30'),
-    ('encoder_max_attempts',           '5');
+    ('encoder_max_attempts',           '5'),
+    ('on_demand_grace_seconds',        '120'),
+    ('on_demand_max_concurrent',       '4'),
+    ('on_demand_evict_idle_seconds',   '10'),
+    ('on_demand_stall_timeout_seconds','45'),
+    ('on_demand_restart_budget',       '3'),
+    ('on_demand_keepalive_ceiling_sec','900');
 
 -- local media sources: persistent filesystem-backed media roots. These are
 -- intentionally separate from Plex/Jellyfin singleton settings.
@@ -309,7 +326,7 @@ CREATE TABLE IF NOT EXISTS local_media_sources (
     media_kind    TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
-    CHECK (media_kind IN ('movies', 'shows', 'music'))
+    CHECK (media_kind IN ('movies', 'shows', 'music', 'filler'))
 );
 
 CREATE TABLE IF NOT EXISTS local_media_source_paths (

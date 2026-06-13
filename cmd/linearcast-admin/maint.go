@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/packager"
 )
 
 func runMaint(args []string) {
@@ -19,6 +21,8 @@ func runMaint(args []string) {
 	switch args[0] {
 	case "delete-encode":
 		maintDeleteEncode(args[1:])
+	case "audit-duration":
+		maintAuditDuration(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown maint subcommand: %s\n\n", args[0])
 		maintUsage()
@@ -36,6 +40,96 @@ func maintUsage() {
 	fmt.Fprintln(os.Stderr, "    Removes media_packages + packaged_segments rows and the on-disk package_root.")
 	fmt.Fprintln(os.Stderr, "    Warns and aborts if the media has future schedule entries; --force overrides.")
 	fmt.Fprintln(os.Stderr, "    Requires --force to skip the confirmation prompt.")
+	fmt.Fprintln(os.Stderr, "  audit-duration [--fix]")
+	fmt.Fprintln(os.Stderr, "    List ready packages whose packaged duration is short of the source (truncated encode),")
+	fmt.Fprintln(os.Stderr, "    using the same tolerance as the finalize guard. Read-only by default.")
+	fmt.Fprintln(os.Stderr, "    --fix marks each offender pending in place so the worker re-encodes it immediately.")
+}
+
+func maintAuditDuration(args []string) {
+	fs := flag.NewFlagSet("audit-duration", flag.ExitOnError)
+	fix := fs.Bool("fix", false, "requeue truncated packages for re-encode (marks them pending in place)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: linearcast-admin maint audit-duration [--fix]")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if fs.NArg() != 0 {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	dbPath := os.Getenv("LINEARCAST_DB")
+	if dbPath == "" {
+		log.Fatal("LINEARCAST_DB is required")
+	}
+
+	open := db.OpenReadOnly
+	if *fix {
+		open = db.OpenReadWrite
+	}
+	conn, err := open(dbPath)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+
+	ctx := context.Background()
+	offenders, err := packager.AuditReadyPackageDurations(ctx, conn)
+	if err != nil {
+		log.Fatalf("audit: %v", err)
+	}
+	if len(offenders) == 0 {
+		fmt.Println("no truncated or unverifiable ready packages found")
+		return
+	}
+
+	const rowFmt = "%-40s  %-32s  %-22s  %12s  %12s  %12s  %12s\n"
+	fmt.Printf(rowFmt, "package", "media", "profile", "packaged_ms", "source_ms", "short_ms", "tol_ms")
+	var truncated, unknown int
+	for _, o := range offenders {
+		if o.UnknownSource {
+			unknown++
+			fmt.Printf(rowFmt, o.PackageID, o.MediaID, o.Profile, "?", "?", "?", "?")
+			continue
+		}
+		truncated++
+		fmt.Printf(rowFmt, o.PackageID, o.MediaID, o.Profile,
+			strconv.FormatInt(o.PackagedMs, 10), strconv.FormatInt(o.SourceMs, 10),
+			strconv.FormatInt(o.ShortfallMs, 10), strconv.FormatInt(o.ToleranceMs, 10))
+	}
+	fmt.Printf("\n%d truncated, %d unverifiable (unknown packaged/source duration)\n", truncated, unknown)
+
+	if !*fix {
+		if truncated > 0 {
+			fmt.Println("\nrun with --fix to requeue the truncated packages for re-encode")
+		}
+		return
+	}
+
+	nowMs := time.Now().UTC().UnixMilli()
+	var requeued int
+	for _, o := range offenders {
+		if o.UnknownSource {
+			continue // cannot verify against source; never blindly requeue
+		}
+		reason := fmt.Sprintf("audit-duration: packaged %dms is %dms short of source %dms; encode likely truncated",
+			o.PackagedMs, o.ShortfallMs, o.SourceMs)
+		changed, err := db.MarkReadyPackagePendingForReencode(ctx, conn, o.PackageID, nowMs, reason)
+		if err != nil {
+			log.Fatalf("requeue %s: %v", o.PackageID, err)
+		}
+		if changed {
+			requeued++
+			fmt.Printf("requeued: %s (media=%s profile=%s)\n", o.PackageID, o.MediaID, o.Profile)
+		}
+	}
+	fmt.Printf("\nrequeued %d package(s) for re-encode\n", requeued)
+	if unknown > 0 {
+		fmt.Printf("left %d unverifiable package(s) ready; re-check their media duration metadata\n", unknown)
+	}
 }
 
 func maintDeleteEncode(args []string) {

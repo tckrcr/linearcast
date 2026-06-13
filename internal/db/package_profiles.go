@@ -207,10 +207,23 @@ func PackageProfileReferencesForName(ctx context.Context, conn *sql.DB, name str
 		return refs, err
 	}
 	if err := conn.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM channels
-		WHERE upstream_hls_url IS NULL
-		  AND COALESCE(NULLIF(TRIM(required_package_profile), ''), ?) = ?`,
-		DefaultPackageProfile, name).Scan(&refs.Channels); err != nil {
+		SELECT COUNT(*)
+		FROM channels c
+		WHERE c.upstream_hls_url IS NULL
+		  AND (
+		  	COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?) = ?
+		  	OR EXISTS (
+		  		SELECT 1
+		  		FROM json_each(
+		  			CASE
+		  				WHEN json_valid(c.abr_ladder_json) AND json_type(c.abr_ladder_json) = 'array' THEN c.abr_ladder_json
+		  				ELSE json_array(COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?))
+		  			END
+		  		)
+		  		WHERE TRIM(json_each.value) = ?
+		  	)
+		  )`,
+		DefaultPackageProfile, name, DefaultPackageProfile, name).Scan(&refs.Channels); err != nil {
 		return refs, err
 	}
 	if err := conn.QueryRowContext(ctx, `
@@ -218,8 +231,20 @@ func PackageProfileReferencesForName(ctx context.Context, conn *sql.DB, name str
 		FROM schedule_entries se
 		JOIN channels c ON c.id = se.channel_id
 		WHERE c.upstream_hls_url IS NULL
-		  AND COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?) = ?`,
-		DefaultPackageProfile, name).Scan(&refs.ScheduleEntries); err != nil {
+		  AND (
+		  	COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?) = ?
+		  	OR EXISTS (
+		  		SELECT 1
+		  		FROM json_each(
+		  			CASE
+		  				WHEN json_valid(c.abr_ladder_json) AND json_type(c.abr_ladder_json) = 'array' THEN c.abr_ladder_json
+		  				ELSE json_array(COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?))
+		  			END
+		  		)
+		  		WHERE TRIM(json_each.value) = ?
+		  	)
+		  )`,
+		DefaultPackageProfile, name, DefaultPackageProfile, name).Scan(&refs.ScheduleEntries); err != nil {
 		return refs, err
 	}
 	return refs, nil

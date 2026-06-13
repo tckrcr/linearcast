@@ -1,22 +1,55 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/tckrcr/linearcast/internal/codec"
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/metrics"
+	"github.com/tckrcr/linearcast/internal/ondemand"
+	"github.com/tckrcr/linearcast/internal/packageprofile"
+	"github.com/tckrcr/linearcast/internal/scheduler"
 )
+
+func (a *app) handleKeepalive(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelID")
+	if a.lookupChannelOr404(r.Context(), w, channelID) == nil {
+		return
+	}
+	alive := true
+	if a.sessions != nil {
+		alive = a.sessions.KeepAlive(channelID)
+	}
+	if !alive {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "keepalive ceiling reached", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
 
 func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 	channelID := r.PathValue("channelID")
 	rt := a.lookupChannelOr404(r.Context(), w, channelID)
 	if rt == nil {
 		return
+	}
+	if rt.PlaybackMode == db.PlaybackModePlexRelay {
+		http.Redirect(w, r, "/channel/"+channelID+"/plexrelay.m3u8", http.StatusFound)
+		return
+	}
+	if a.sessions != nil {
+		a.sessions.Touch(rt.ID)
 	}
 	profile := rt.RequiredPackageProfile
 	nowMs := time.Now().UTC().UnixMilli()
@@ -32,25 +65,133 @@ func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 		currentEntry = &entries[0]
 	}
 
-	pkg, _ := db.ReadyMediaPackage(r.Context(), a.dbConn, currentEntry.MediaID, profile)
-	if pkg == nil {
-		// No package is ready; fall back to the segment playlist directly so
-		// the player sees the 503 "warming up" UX.
-		a.writePackagedManifest(w, r, channelID, profile)
-		return
-	}
-	bps := db.PeakSegmentBps(r.Context(), a.dbConn, pkg.ID)
-	if bps == 0 {
-		// Fallback: use the profile's declared max bitrate if segments can't be stat'd.
-		if p, err := db.GetPackageProfile(r.Context(), a.dbConn, profile); err == nil && p != nil && p.Video.VideoMaxBitrate != "" {
-			bps = parseBitrateString(p.Video.VideoMaxBitrate)
+	burnActive := a.sessions != nil && a.sessions.BurnSubtitleLanguage(channelID) != ""
+	variants := a.readyPackagedVariants(r.Context(), rt, currentEntry.MediaID)
+	var pkg *db.MediaPackage
+	for _, v := range variants {
+		if v.Profile == profile {
+			pkg = v.Package
+			break
 		}
 	}
-	codecs := "avc1.4d401f,mp4a.40.2" // safe default for H.264 Main
+	if burnActive {
+		pkg = nil
+		variants = nil
+	}
+	if pkg == nil {
+		if rt.PrefillMode != "on_demand" {
+			// No package is ready; fall back to the segment playlist directly so
+			// the player sees the 503 "warming up" UX.
+			a.writePackagedManifest(w, r, channelID, profile)
+			return
+		}
+		initPath, bps, err := a.ensureOnDemandMasterReady(r.Context(), channelID, profile, *currentEntry, nowMs)
+		if err != nil {
+			if errors.Is(err, ondemand.ErrAtCapacity) {
+				metrics.OnDemandAtCapacity503Total.Inc()
+				w.Header().Set("Retry-After", "2")
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			if strings.Contains(err.Error(), "warming") {
+				metrics.OnDemandWarming503Total.Inc()
+				w.Header().Set("Retry-After", "2")
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		codecs := a.codecStringForInit(initPath)
+		a.writeMasterManifest(r.Context(), w, channelID, []masterVariant{{
+			Profile: profile,
+			BPS:     bps,
+			Codecs:  codecs,
+		}}, entries)
+		return
+	}
+	a.writeMasterManifest(r.Context(), w, channelID, variants, entries)
+}
+
+type masterVariant struct {
+	Profile    string
+	Package    *db.MediaPackage
+	BPS        int64
+	Res        string
+	Codecs     string
+	VideoRange string // "" = SDR (default), "PQ" or "HLG" for HDR variants
+}
+
+func (a *app) readyPackagedVariants(ctx context.Context, rt *channelRuntime, mediaID string) []masterVariant {
+	ladder := rt.ABRLadder
+	if len(ladder) == 0 {
+		ladder = []string{rt.RequiredPackageProfile}
+	}
+	var variants []masterVariant
+	for _, profile := range ladder {
+		pkg, _ := db.ReadyMediaPackage(ctx, a.dbConn, mediaID, profile)
+		if pkg == nil {
+			continue
+		}
+		variants = append(variants, a.masterVariantForPackage(ctx, profile, pkg))
+	}
+	return variants
+}
+
+func (a *app) masterVariantForPackage(ctx context.Context, profile string, pkg *db.MediaPackage) masterVariant {
+	var profileBPS int64
+	if p, err := db.GetPackageProfile(ctx, a.dbConn, profile); err == nil && p != nil && p.Video.VideoMaxBitrate != "" {
+		profileBPS = parseBitrateString(p.Video.VideoMaxBitrate)
+	}
+	bps := db.PeakSegmentBps(ctx, a.dbConn, pkg.ID)
+	if bps == 0 {
+		bps = profileBPS
+	} else if pkg.VideoCodec == "hevc" && profileBPS > 0 && bps > profileBPS {
+		// Copy-profile segments inherit source keyframe spacing, which can
+		// produce irregular spikes. Cap at the profile's max bitrate so the
+		// BANDWIDTH attribute doesn't scare hls.js away from the HEVC variant.
+		bps = profileBPS
+	}
+	if bps == 0 {
+		bps = 8_000_000
+	}
+	codecs := "avc1.4d401f,mp4a.40.2"
 	if pkg.InitSegmentPath != nil {
 		codecs = a.codecStringForInit(*pkg.InitSegmentPath)
 	}
+	res := ""
+	if pkg.VideoWidth != nil && pkg.VideoHeight != nil {
+		res = fmt.Sprintf(",RESOLUTION=%dx%d", *pkg.VideoWidth, *pkg.VideoHeight)
+	}
+	videoRange := hdrVideoRange(ctx, a.dbConn, pkg.MediaID, profile)
+	return masterVariant{Profile: profile, Package: pkg, BPS: bps, Res: res, Codecs: codecs, VideoRange: videoRange}
+}
 
+// hdrVideoRange queries the source media's color_transfer to determine the HDR
+// video range. Returns "PQ", "HLG", or "" (SDR default).
+//
+// Only HEVC copy profiles preserve HDR metadata. SDR transcoded rungs must not
+// advertise VIDEO-RANGE even when the source is HDR.
+func hdrVideoRange(ctx context.Context, conn *sql.DB, mediaID string, profileName string) string {
+	if !strings.Contains(profileName, "hevc-copy") {
+		return ""
+	}
+	m, err := db.MediaByID(ctx, conn, mediaID)
+	if err != nil || m == nil {
+		return ""
+	}
+	if codec.IsHDRTransfer(m.ColorTransfer) {
+		switch strings.ToLower(strings.TrimSpace(m.ColorTransfer)) {
+		case "arib-std-b67":
+			return "HLG"
+		default:
+			return "PQ"
+		}
+	}
+	return ""
+}
+
+func (a *app) writeMasterManifest(ctx context.Context, w http.ResponseWriter, channelID string, variants []masterVariant, entries []db.ScheduleEntry) {
 	mediaIDs := make([]string, 0, len(entries))
 	seen := make(map[string]bool)
 	for _, e := range entries {
@@ -59,13 +200,13 @@ func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 			mediaIDs = append(mediaIDs, e.MediaID)
 		}
 	}
-	subtitleTracks, err := db.SubtitleTracksForMediaIDs(r.Context(), a.dbConn, mediaIDs)
+	subtitleTracks, err := db.SubtitleTracksForMediaIDs(ctx, a.dbConn, mediaIDs)
 	if err != nil {
 		subtitleTracks = nil
 	}
 
-	autoEnable, _ := db.GetSubtitleAutoEnable(r.Context(), a.dbConn)
-	langPrefs, _ := db.GetSubtitleLanguagePreference(r.Context(), a.dbConn)
+	autoEnable, _ := db.GetSubtitleAutoEnable(ctx, a.dbConn)
+	langPrefs, _ := db.GetSubtitleLanguagePreference(ctx, a.dbConn)
 	topLang := ""
 	if autoEnable && len(langPrefs) > 0 {
 		topLang = strings.ToLower(langPrefs[0])
@@ -97,24 +238,90 @@ func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 		subsAttr = ",SUBTITLES=\"subs\""
 	}
 
-	res := ""
-	if pkg.VideoWidth != nil && pkg.VideoHeight != nil {
-		res = fmt.Sprintf(",RESOLUTION=%dx%d", *pkg.VideoWidth, *pkg.VideoHeight)
+	for _, v := range variants {
+		extraAttr := subsAttr
+		if v.VideoRange != "" {
+			extraAttr += ",VIDEO-RANGE=" + v.VideoRange
+		}
+		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d%s,CODECS=%q%s\n",
+			v.BPS, v.Res, v.Codecs, extraAttr)
+		fmt.Fprintf(&b, "/channel/%s/%s/%s/stream.m3u8\n", channelID, packagedPath, v.Profile)
 	}
-	fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d%s,CODECS=%q%s\n",
-		bps, res, codecs, subsAttr)
-	fmt.Fprintf(&b, "/channel/%s/%s/%s/stream.m3u8\n", channelID, packagedPath, profile)
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write([]byte(b.String()))
 }
 
+func (a *app) ensureOnDemandMasterReady(ctx context.Context, channelID, profile string, entry db.ScheduleEntry, nowMs int64) (string, int64, error) {
+	if a.sessions == nil {
+		return "", 0, fmt.Errorf("on-demand sessions unavailable")
+	}
+	p, err := db.GetPackageProfile(ctx, a.dbConn, profile)
+	if err != nil {
+		return "", 0, fmt.Errorf("package profile %s: %w", profile, err)
+	}
+	if p == nil {
+		return "", 0, fmt.Errorf("package profile %s not found", profile)
+	}
+	media, err := db.MediaByID(ctx, a.dbConn, entry.MediaID)
+	if err != nil {
+		return "", 0, fmt.Errorf("media %s: %w", entry.MediaID, err)
+	}
+	if media == nil {
+		return "", 0, fmt.Errorf("media %s not found", entry.MediaID)
+	}
+	opts := ondemand.SessionOptions{BurnSubtitleStreamIndex: a.burnSubtitleStreamIndexForMedia(ctx, channelID, media.ID)}
+	if err := a.sessions.EnsureSessionWithOptions(ctx, channelID, entry, media.Path, *p, scheduler.TargetSegmentMs, opts); err != nil {
+		return "", 0, err
+	}
+	mediaPosMs := entry.OffsetMs + (nowMs - entry.StartMs)
+	segs := a.sessions.SegmentsFrom(channelID, entry.ID, mediaPosMs, 1)
+	if len(segs) == 0 {
+		return "", 0, fmt.Errorf("on-demand session warming media=%s profile=%s", entry.MediaID, profile)
+	}
+	bps := parseBitrateString(p.Video.VideoMaxBitrate)
+	if p.Video.Mode == packageprofile.VideoModeCopy {
+		// Copy mode preserves the source video bitrate, so the profile's
+		// transcode cap (or the 8 Mbps fallback) can understate BANDWIDTH by
+		// 3-4x for remux sources. hls.js sizes its buffer byte budget from
+		// BANDWIDTH; understating it makes players buffer far more bytes than
+		// intended and trip the browser's SourceBuffer quota.
+		if src := sourceAverageBps(media.Path, media.DurationMs); src > bps {
+			bps = src
+		}
+	}
+	if bps == 0 {
+		bps = 8_000_000
+	}
+	return segs[0].InitPath, bps, nil
+}
+
+// sourceAverageBps estimates stream bitrate from the source file's size and
+// duration. The whole-file average (video + source audio + container) slightly
+// overstates the copy-mode HLS output (audio is transcoded down to AAC), which
+// is the safe direction for a BANDWIDTH attribute.
+func sourceAverageBps(path string, durationMs int64) int64 {
+	if durationMs <= 0 {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return 0
+	}
+	return info.Size() * 8000 / durationMs
+}
+
 // handleRenditionManifest serves per-profile segment playlists at
 // /channel/{channelID}/packaged/{rendition}/stream.m3u8.
 func (a *app) handleRenditionManifest(w http.ResponseWriter, r *http.Request) {
 	channelID := r.PathValue("channelID")
-	if a.lookupChannelOr404(r.Context(), w, channelID) == nil {
+	rt := a.lookupChannelOr404(r.Context(), w, channelID)
+	if rt == nil {
+		return
+	}
+	if rt.PlaybackMode != db.PlaybackModePackaged {
+		http.NotFound(w, r)
 		return
 	}
 	rendition := r.PathValue("rendition")
@@ -162,8 +369,9 @@ func probeCodecString(initPath string) string {
 	}
 	var result struct {
 		Streams []struct {
-			Profile string `json:"profile"`
-			Level   int    `json:"level"`
+			CodecName string `json:"codec_name"`
+			Profile   string `json:"profile"`
+			Level     int    `json:"level"`
 		} `json:"streams"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil || len(result.Streams) == 0 {
@@ -173,7 +381,24 @@ func probeCodecString(initPath string) string {
 	if s.Profile == "" || s.Level <= 0 {
 		return "avc1.4d401f,mp4a.40.2"
 	}
-	// profile_idc, constraint_flags, level_idc per ISO 14496-15 §5.3.3.1
+
+	if strings.ToLower(s.CodecName) == "hevc" {
+		// hvc1 codec string per ISO 14496-15 Annex E.
+		// general_profile_compatibility_flags hex (bit 0 = profile 0, bit N = profile N):
+		//   Main:     0x01 → "1"
+		//   Main 10:  0x06 → "6" (Main + Main 10 bits both set)
+		compatHex := map[string]string{
+			"Main":    "1",
+			"Main 10": "6",
+		}
+		ch := compatHex[s.Profile]
+		if ch == "" {
+			ch = "6" // default to Main 10 for HDR content
+		}
+		return fmt.Sprintf("hvc1.1.%s.L%03d.B0,mp4a.40.2", ch, s.Level)
+	}
+
+	// avc1 codec string per ISO 14496-15 §5.3.3.1: profile_idc, constraint_flags, level_idc.
 	profileByte := map[string]string{
 		"Baseline":             "42",
 		"Constrained Baseline": "42",

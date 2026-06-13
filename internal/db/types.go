@@ -41,6 +41,7 @@ type PlaybackMode string
 const (
 	PlaybackModeGenerated PlaybackMode = "generated"
 	PlaybackModePackaged  PlaybackMode = "packaged"
+	PlaybackModePlexRelay PlaybackMode = "plex_relay"
 )
 
 type PackageStatus string
@@ -64,30 +65,44 @@ type Channel struct {
 	ArtworkURL             string
 	PlaybackMode           PlaybackMode
 	RequiredPackageProfile string
+	ABRLadder              []string
 	PackagePrefillMs       *int64
 	MediaKind              MediaKind
+	ScheduleMode           string
+	SlotDurationMs         *int64
 	// UpstreamHLSURL is nil for a normal packaged channel; non-nil (the URL,
 	// possibly empty) marks an external/live channel. The nil/non-nil split is
 	// load-bearing — readers gate external-channel behavior on it.
 	UpstreamHLSURL *string
+	// PrefillMode is "eager" (default — package the whole channel ahead) or
+	// "on_demand" (defer packaging until a viewer tunes in). On-demand channels
+	// schedule from codec-eligible media without requiring ready packages and are
+	// excluded from eager packager discovery.
+	PrefillMode string
 }
 
 type Media struct {
-	ID               string
-	Path             string
-	Directory        string
-	Title            string
-	SchedulingGroup  string
-	UserPreference   *int64
-	DurationMs       int64
-	Container        string
-	VideoCodec       string
-	VideoHeight      int64
+	ID              string
+	Path            string
+	Directory       string
+	Title           string
+	SchedulingGroup string
+	UserPreference  *int64
+	DurationMs      int64
+	Container       string
+	VideoCodec      string
+	VideoWidth      int64 // 0 = unknown (pre-v29 ingest or audio-only)
+	VideoHeight     int64
+	// ColorTransfer and ColorPrimaries are ffprobe color metadata recorded for
+	// HDR detection ("" = unknown). See codec.IsHDRTransfer.
+	ColorTransfer    string
+	ColorPrimaries   string
 	AudioCodec       string
 	CodecCheckPassed bool
 	CodecCheckReason string
 	IngestedAtMs     int64
 	MediaKind        MediaKind // "" = video; "music" = audio-only
+	SourceRef        string    // e.g. "plex://{ratingKey}" for media sourced from Plex
 }
 
 type ChannelMediaRow struct {
@@ -145,6 +160,10 @@ type ScheduleEntry struct {
 	DurationMs            int64
 	AnchorScheduleEntryID *string
 	CreatedAtMs           int64
+	// Kind is 'primary' or 'filler' (schedule_entries.entry_kind). An empty
+	// value is treated as 'primary' on insert. Full-row readers populate it;
+	// readers that don't select entry_kind leave it empty.
+	Kind string
 }
 
 type PlayHistoryEntry struct {
@@ -319,10 +338,14 @@ type ChannelWrite struct {
 	Ordering               string
 	PlaybackMode           PlaybackMode
 	RequiredPackageProfile string
+	ABRLadder              []string
 	PackagePrefillMs       *int64
 	CreatedAtMs            int64
 	MediaKind              MediaKind
+	ScheduleMode           string
+	SlotDurationMs         *int64
 	UpstreamHLSURL         *string
+	PrefillMode            string
 }
 
 // ScheduleEntryEnriched is a ScheduleEntry joined with its media row.

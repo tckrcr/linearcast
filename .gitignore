@@ -57,6 +57,7 @@ pnpm-debug.log*
 # -----------------------------
 /.claude/
 /experiments/
+/agents/
 
 # -----------------------------
 # Local runtime state / generated media artifacts

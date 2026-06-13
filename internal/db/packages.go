@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 )
 
@@ -82,6 +83,22 @@ func MediaPackageByID(ctx context.Context, conn *sql.DB, id string) (*MediaPacka
 // rendition_profile.
 func MediaPackagesForMedia(ctx context.Context, conn *sql.DB, mediaID string) ([]MediaPackage, error) {
 	return queryRows(ctx, conn, scanValue(scanMediaPackage), mediaPackageSelectSQL()+` WHERE media_id = ? ORDER BY rendition_profile`, mediaID)
+}
+
+// MediaPackageStatus returns the status of the package row for a media/profile
+// pair, or "" when no row exists.
+func MediaPackageStatus(ctx context.Context, conn Execer, mediaID, renditionProfile string) (PackageStatus, error) {
+	var status string
+	err := conn.QueryRowContext(ctx, `
+		SELECT status FROM media_packages
+		WHERE media_id = ? AND rendition_profile = ?`, mediaID, renditionProfile).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return PackageStatus(status), nil
 }
 
 // ReadyMediaPackage returns the ready package for a media/profile pair, or

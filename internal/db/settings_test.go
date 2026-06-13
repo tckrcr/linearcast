@@ -117,7 +117,7 @@ func TestSchedulerTunables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	want := SchedulerTunables{HorizonHours: 48, LowWaterHours: 24, TickSeconds: 300}
+	want := SchedulerTunables{HorizonHours: 24, LowWaterHours: 23, TickSeconds: 300}
 	if got != want {
 		t.Fatalf("defaults=%+v want=%+v", got, want)
 	}

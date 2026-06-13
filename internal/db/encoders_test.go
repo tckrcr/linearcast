@@ -848,85 +848,168 @@ func TestListEncoderJobSummaries(t *testing.T) {
 	}
 }
 
-func TestListLocalWorkerJobs(t *testing.T) {
+// The local worker now claims as its registered encoder so the sweeper can
+// supervise it, but it must still read as local for channel encoder_policy.
+func TestClaimPackage_LocalWorkerLeasedButPolicyLocal(t *testing.T) {
 	env := newEncoderTestEnv(t)
 	ctx := context.Background()
-
-	// No local jobs yet.
-	jobs, err := ListLocalWorkerJobs(ctx, env.conn)
-	if err != nil {
-		t.Fatalf("list empty: %v", err)
+	localID := GetLocalEncoderID(ctx, env.conn)
+	if localID == "" {
+		t.Fatal("local encoder not registered by test env")
 	}
-	if len(jobs) != 0 {
-		t.Fatalf("expected 0 jobs, got %d", len(jobs))
+	// A local_only channel must accept the local worker even though it now
+	// carries an encoder identity and holds a lease.
+	setChannelPolicy(t, env.conn, "ch1", EncoderPolicyLocalOnly)
+	mustClaim(t, env.conn, ClaimRequest{
+		MediaID: "m1", Profile: testProfile, PackageID: "pkg-m1",
+		EncoderID: localID, Local: true, LeaseTTL: 10 * time.Second, NowMs: 1_000,
+	})
+	var n int
+	if err := env.conn.QueryRow(
+		`SELECT COUNT(*) FROM encoder_jobs WHERE package_id = 'pkg-m1' AND encoder_id = ?`,
+		localID).Scan(&n); err != nil {
+		t.Fatalf("count lease: %v", err)
 	}
+	if n != 1 {
+		t.Fatalf("local claim should insert exactly one lease, got %d", n)
+	}
+}
 
-	// Claim a package locally (empty EncoderID) so it appears as a local job.
+func TestClaimPackage_LocalWorkerBlockedByRemoteOnly(t *testing.T) {
+	env := newEncoderTestEnv(t)
+	ctx := context.Background()
+	localID := GetLocalEncoderID(ctx, env.conn)
+	setChannelPolicy(t, env.conn, "ch1", EncoderPolicyRemoteOnly)
 	ok, err := ClaimPackage(ctx, env.conn, ClaimRequest{
 		MediaID: "m1", Profile: testProfile, PackageID: "pkg-m1",
-		NowMs: 1_000,
+		EncoderID: localID, Local: true, LeaseTTL: 10 * time.Second, NowMs: 1_000,
 	})
 	if err != nil {
-		t.Fatalf("local claim: %v", err)
+		t.Fatalf("claim err: %v", err)
 	}
-	if !ok {
-		t.Fatalf("local claim did not win")
+	if ok {
+		t.Fatal("remote_only channel must reject the local worker")
 	}
+	var n int
+	env.conn.QueryRow(`SELECT COUNT(*) FROM encoder_jobs`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("rejected claim left %d lease rows", n)
+	}
+}
 
-	jobs, err = ListLocalWorkerJobs(ctx, env.conn)
-	if err != nil {
-		t.Fatalf("list after local claim: %v", err)
-	}
-	if len(jobs) != 1 {
-		t.Fatalf("expected 1 job, got %d", len(jobs))
-	}
-	j := jobs[0]
-	if j.PackageID != "pkg-m1" {
-		t.Fatalf("packageID=%s, want pkg-m1", j.PackageID)
-	}
-	if j.MediaID != "m1" {
-		t.Fatalf("mediaID=%s, want m1", j.MediaID)
-	}
-	if j.Profile != testProfile {
-		t.Fatalf("profile=%s, want %s", j.Profile, testProfile)
-	}
-
-	// A remote claim on a different package should NOT show up here.
+// Local concurrency is now counted from leases (encoder_jobs), not from
+// lease-free processing rows.
+func TestClaimPackage_LocalConcurrencyCountsLeases(t *testing.T) {
+	env := newEncoderTestEnv(t)
+	ctx := context.Background()
+	localID := GetLocalEncoderID(ctx, env.conn)
+	// Default local concurrency is 1; the first claim holds the only slot.
+	mustClaim(t, env.conn, ClaimRequest{
+		MediaID: "m1", Profile: testProfile, PackageID: "pkg-m1",
+		EncoderID: localID, Local: true, LeaseTTL: 10 * time.Second, NowMs: 1_000,
+	})
 	if _, err := env.conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('m2', '/tmp/m2.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
 		t.Fatalf("seed m2: %v", err)
 	}
-	// Link m2 after m1 (anchor points to predecessor).
 	if _, err := env.conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
 		VALUES ('ch1', 'm2', 'm1', 0)`); err != nil {
-		t.Fatalf("insert channel_media: %v", err)
+		t.Fatalf("link m2: %v", err)
+	}
+	// Cap=1 and one lease is held, so the second claim must be refused.
+	ok, err := ClaimPackage(ctx, env.conn, ClaimRequest{
+		MediaID: "m2", Profile: testProfile, PackageID: "pkg-m2",
+		EncoderID: localID, Local: true, LeaseTTL: 10 * time.Second, NowMs: 2_000,
+	})
+	if err != nil {
+		t.Fatalf("claim err: %v", err)
+	}
+	if ok {
+		t.Fatal("second local claim should be blocked by concurrency=1")
+	}
+	// Raise the cap; the second claim now wins and adds a second lease.
+	if err := UpdateEncoderConcurrency(ctx, env.conn, localID, 2); err != nil {
+		t.Fatalf("bump concurrency: %v", err)
 	}
 	mustClaim(t, env.conn, ClaimRequest{
 		MediaID: "m2", Profile: testProfile, PackageID: "pkg-m2",
-		EncoderID: env.encoderID, LeaseTTL: 10 * time.Second, NowMs: 2_000,
+		EncoderID: localID, Local: true, LeaseTTL: 10 * time.Second, NowMs: 3_000,
 	})
+}
 
-	jobs, err = ListLocalWorkerJobs(ctx, env.conn)
+// RequeueEncoderJobs is the worker's startup self-recovery: it force-requeues
+// the encoder's own leftover leases without waiting for expiry, because a
+// freshly-started worker owns no live jobs.
+func TestRequeueEncoderJobs_RecoversOwnLeasesBeforeExpiry(t *testing.T) {
+	env := newEncoderTestEnv(t)
+	ctx := context.Background()
+	mustClaim(t, env.conn, ClaimRequest{
+		MediaID: "m1", Profile: testProfile, PackageID: "pkg-m1",
+		EncoderID: env.encoderID, LeaseTTL: 10 * time.Second, NowMs: 1_000,
+	})
+	// now=2_000 is well inside the 10s lease, yet the leftover lease is requeued.
+	results, err := RequeueEncoderJobs(ctx, env.conn, env.encoderID, 5, 2_000)
 	if err != nil {
-		t.Fatalf("list with remote job: %v", err)
+		t.Fatalf("requeue: %v", err)
 	}
-	if len(jobs) != 1 {
-		t.Fatalf("expected 1 local job, got %d", len(jobs))
+	if len(results) != 1 || results[0].NewStatus != PackageStatusPending {
+		t.Fatalf("want one pending requeue, got %+v", results)
 	}
-	if jobs[0].PackageID != "pkg-m1" {
-		t.Fatalf("expected pkg-m1, got %s", jobs[0].PackageID)
+	var status string
+	if err := env.conn.QueryRow(`SELECT status FROM media_packages WHERE id='pkg-m1'`).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
 	}
+	if PackageStatus(status) != PackageStatusPending {
+		t.Fatalf("status=%s, want pending", status)
+	}
+	var n int
+	env.conn.QueryRow(`SELECT COUNT(*) FROM encoder_jobs WHERE package_id='pkg-m1'`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("lease not cleared, %d remain", n)
+	}
+}
 
-	// Mark the local job ready — should disappear from local jobs.
-	if _, err := env.conn.Exec(`UPDATE media_packages SET status = 'ready', updated_at_ms = ? WHERE id = ?`, 3_000, "pkg-m1"); err != nil {
-		t.Fatalf("complete local job: %v", err)
+// RequeueLeaselessProcessing (transitional) drains pre-lease processing orphans
+// without touching leased rows.
+func TestRequeueLeaselessProcessing_OnlyLeaseFreeRows(t *testing.T) {
+	env := newEncoderTestEnv(t)
+	ctx := context.Background()
+	// Leased processing row — must be left alone.
+	mustClaim(t, env.conn, ClaimRequest{
+		MediaID: "m1", Profile: testProfile, PackageID: "pkg-m1",
+		EncoderID: env.encoderID, LeaseTTL: 10 * time.Second, NowMs: 1_000,
+	})
+	// Pre-lease orphan: a processing row with no encoder_jobs lease.
+	if _, err := env.conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m2', '/tmp/m2.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("seed m2: %v", err)
 	}
-	jobs, err = ListLocalWorkerJobs(ctx, env.conn)
+	if _, err := env.conn.Exec(`INSERT INTO media_packages
+		(id, media_id, rendition_profile, status, attempts, created_at_ms, updated_at_ms)
+		VALUES ('pkg-m2', 'm2', ?, 'processing', 1, 0, 0)`, testProfile); err != nil {
+		t.Fatalf("seed orphan: %v", err)
+	}
+	n, err := RequeueLeaselessProcessing(ctx, env.conn, 5, 2_000)
 	if err != nil {
-		t.Fatalf("list after complete: %v", err)
+		t.Fatalf("requeue leaseless: %v", err)
 	}
-	if len(jobs) != 0 {
-		t.Fatalf("expected 0 jobs after complete, got %d", len(jobs))
+	if n != 1 {
+		t.Fatalf("want 1 leaseless requeue, got %d", n)
+	}
+	var orphan, leased string
+	env.conn.QueryRow(`SELECT status FROM media_packages WHERE id='pkg-m2'`).Scan(&orphan)
+	env.conn.QueryRow(`SELECT status FROM media_packages WHERE id='pkg-m1'`).Scan(&leased)
+	if PackageStatus(orphan) != PackageStatusPending {
+		t.Fatalf("orphan status=%s, want pending", orphan)
+	}
+	if PackageStatus(leased) != PackageStatusProcessing {
+		t.Fatalf("leased status=%s, want processing", leased)
+	}
+	var nLease int
+	env.conn.QueryRow(`SELECT COUNT(*) FROM encoder_jobs WHERE package_id='pkg-m1'`).Scan(&nLease)
+	if nLease != 1 {
+		t.Fatalf("leased row lost its lease (%d remain)", nLease)
 	}
 }

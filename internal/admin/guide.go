@@ -26,6 +26,7 @@ type guideChannel struct {
 	ArtworkURL  string              `json:"artworkUrl,omitempty"`
 	Status      string              `json:"status"`
 	IsExternal  bool                `json:"isExternal,omitempty"`
+	PrefillMode string              `json:"prefillMode,omitempty"`
 	NowPlaying  *externalNowPlaying `json:"nowPlaying,omitempty"`
 	// ScheduleEndMs is the end of the channel's last scheduled entry. The guide
 	// uses it to stop paging past where a schedule has actually been built (so
@@ -123,6 +124,7 @@ func (a *App) handleGuide(w http.ResponseWriter, r *http.Request) {
 			DisplayName:   now.DisplayName,
 			ArtworkURL:    now.ArtworkURL,
 			Status:        now.Status,
+			PrefillMode:   now.PrefillMode,
 			ScheduleEndMs: now.ScheduleEndMs,
 			Entries:       entries,
 		})

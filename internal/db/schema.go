@@ -15,7 +15,7 @@ import (
 //go:embed schema.sql
 var SchemaSQL string
 
-const SchemaVersion = 21
+const SchemaVersion = 30
 
 // ApplySchema executes the embedded schema, runs version migrations, and
 // seeds reference data. Idempotent — writers may call it on every startup.
@@ -83,6 +83,33 @@ func ApplySchema(ctx context.Context, conn *sql.DB) error {
 	}
 	if err := migrateV20toV21(conn); err != nil {
 		return fmt.Errorf("migrate v20->v21: %w", err)
+	}
+	if err := migrateV21toV22(conn); err != nil {
+		return fmt.Errorf("migrate v21->v22: %w", err)
+	}
+	if err := migrateV22toV23(conn); err != nil {
+		return fmt.Errorf("migrate v22->v23: %w", err)
+	}
+	if err := migrateV23toV24(conn); err != nil {
+		return fmt.Errorf("migrate v23->v24: %w", err)
+	}
+	if err := migrateV24toV25(conn); err != nil {
+		return fmt.Errorf("migrate v24->v25: %w", err)
+	}
+	if err := migrateV25toV26(conn); err != nil {
+		return fmt.Errorf("migrate v25->v26: %w", err)
+	}
+	if err := migrateV26toV27(conn); err != nil {
+		return fmt.Errorf("migrate v26->v27: %w", err)
+	}
+	if err := migrateV27toV28(conn); err != nil {
+		return fmt.Errorf("migrate v27->v28: %w", err)
+	}
+	if err := migrateV28toV29(conn); err != nil {
+		return fmt.Errorf("migrate v28->v29: %w", err)
+	}
+	if err := migrateV29toV30(conn); err != nil {
+		return fmt.Errorf("migrate v29->v30: %w", err)
 	}
 	if err := ensurePackageProfileLifecycleColumns(ctx, conn); err != nil {
 		return fmt.Errorf("migrate package profile lifecycle: %w", err)

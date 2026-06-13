@@ -291,6 +291,13 @@ func (a *App) runPlexScan(job *ingestJob, items []plex.Item, mapper *plex.PathMa
 			acc.Failures = append(acc.Failures, fmt.Sprintf("%s: %v", mapped, err))
 			continue
 		}
+		// Store the Plex rating key as source_ref for plex_relay channel use.
+		if it.RatingKey != "" {
+			plexRef := "plex://" + it.RatingKey
+			if sErr := db.SetMediaSourceRef(ctx, a.dbConn, mapped, plexRef); sErr != nil {
+				job.Printf("warning: failed to set source_ref for %s: %v", mapped, sErr)
+			}
+		}
 		acc.Total += res.Total
 		acc.Passed += res.Passed
 		acc.Failed += res.Failed

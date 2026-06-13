@@ -36,7 +36,25 @@ POST   /api/admin/plex/scan              Scan a Plex library into the DB
 GET    /api/schedule-builder/shows       Media-group browse for the builder
 GET    /api/schedule-builder/package-candidates
 POST   /api/schedule-builder/channels    Create a channel from the builder
+
+POST   /api/channels/{id}/schedule/gaps/fill
+                                         Fill an existing schedule gap with an
+                                         attached ready filler asset slice
 ```
+
+`POST /api/channels` and `POST /api/schedule-builder/channels` accept optional
+`scheduleMode` (`back_to_back` or `slot_grid`) and `slotDurationMs` for opt-in
+slot-grid scheduling. They also accept `playbackMode: "plex_relay"` for
+scheduled Plex relay channels; relay channels require Plex-imported media and
+do not queue linearcast packages. `GET /api/channels` returns those fields for
+each channel.
+
+`POST /api/channels/{id}/schedule/gaps/fill` accepts `mediaId`, `startMs`, an
+optional `offsetMs`, and an optional `offsetMode`. `offsetMode` defaults to
+`zero` (start the filler at `offsetMs`); `sequential` continues the filler
+rotation from where the previous placement of the same asset on the channel
+ended, wrapping back to the asset start when continuing would overrun its
+packaged duration. The response echoes the resolved `offsetMs`.
 
 Jellyfin mirrors the Plex `status`/`config`/`libraries`/`scan` shape under
 `/api/admin/jellyfin/*`.

@@ -1,0 +1,13 @@
+services:
+  linearcast:
+    # The base compose pins container_name: linearcast, a GLOBAL name on the
+    # shared host daemon. Left in place, a CI run would recreate/remove a dev or
+    # prod container of the same name. Reset it so compose auto-names the CI
+    # container per-project (linearcast-ci-<run-id>-linearcast-1); the smoke test still
+    # reaches it via the service-name network alias `linearcast`.
+    container_name: !reset null
+    # The CI smoke test probes the stack over the compose network by service
+    # name (see .gitea/workflows/test.yml), so no host port publishing is
+    # needed. Reset the ports inherited from docker-compose.yml to avoid
+    # binding host ports — which would conflict across concurrent CI jobs.
+    ports: !reset []

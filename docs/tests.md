@@ -4,16 +4,23 @@ This page lists the checks that exist today and the commands that can actually b
 
 ## CI
 
-`.gitea/workflows/image.yml` runs on pushes to `main` and by manual dispatch.
+`.gitea/workflows/test.yml` runs on `develop` pushes, PRs targeting `develop` or
+`main`, and manual dispatch. It runs backend tests, frontend typecheck, builds
+`linearcast:local` through Docker Compose, then boots and probes that image with
+`scripts/ci-stack-smoke.sh`.
 
-The workflow currently runs tests, builds the frontend, and then publishes the
-single-container image:
+`.gitea/workflows/image.yml` runs on pushes to `main` and by manual dispatch. It
+repeats the same test/typecheck/compose-build/smoke path, then retags the proven
+`linearcast:local` artifact and pushes it to the Gitea registry as `:<sha>` and
+`:latest`.
 
 ```sh
 go test ./...
-cd web-ui && npm ci && npm run build
-docker build ...
-docker push ...
+cd web-ui && npm ci && npm run typecheck
+DOCKER_BUILDKIT=1 docker compose build
+scripts/ci-stack-smoke.sh --project <run-id>
+docker tag linearcast:local <registry>/tucker/linearcast:<sha>
+docker push <registry>/tucker/linearcast:<sha>
 ```
 
 Runner labels, secrets, and deployment details are Gitea/local-infra specific.
@@ -69,6 +76,19 @@ scripts/release-smoke.sh --web-base-url http://127.0.0.1:8080 \
 
 This smoke test proves the deployed services are reachable and exporting basic
 runtime state. It does not prove that a channel has playable media.
+
+## CI Stack Smoke
+
+`scripts/ci-stack-smoke.sh --project <name>` is the CI wrapper around the release
+smoke. It builds nothing — it expects `linearcast:local` to exist (run `docker
+compose build` first) — then boots the stack under an isolated, run-id-suffixed
+compose project (`container_name`/`ports` reset via
+`deploy/docker-compose.ci.yml`), joins the compose network, runs
+`release-smoke.sh` against the service by name, dumps `compose logs` on failure,
+and always tears down. Both `.gitea/workflows/test.yml` (develop pushes + PRs to
+`main`) and `.gitea/workflows/image.yml` (the `main` publish) call it on the same
+`linearcast:local` artifact, so the image published to the gitea registry is
+proven to boot before it is pushed.
 
 ## Encode Smoke
 

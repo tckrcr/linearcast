@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { SCHEDULE_BATCH_DRAG_MIME } from "../constants";
 import { formatMs } from "../format";
 import type { MusicAlbum, MusicArtist } from "../api/media";
 import styles from "./ScheduleBuilderPanel.module.css";
@@ -88,6 +89,12 @@ export function SchedulePickerMusicGrid({
                 className={styles["sb-show-card"]}
                 onClick={() => onSelectArtist(artist)}
                 aria-label={`Open ${displayName}`}
+                draggable
+                onDragStart={(e) => {
+                  e.dataTransfer.effectAllowed = "copy";
+                  e.dataTransfer.setData(SCHEDULE_BATCH_DRAG_MIME, JSON.stringify({ kind: "artist", artistName: artist.artistName }));
+                  e.dataTransfer.setData("text/plain", displayName);
+                }}
               >
                 <ArtistPosterPlaceholder name={displayName} />
                 <div className={styles["sb-show-card-meta"]}>
@@ -141,6 +148,12 @@ function ArtistDetail({
           type="button"
           className="primary"
           disabled={queuingArtist || albumBusy !== null}
+          draggable={!(queuingArtist || albumBusy !== null)}
+          onDragStart={(e) => {
+            e.dataTransfer.effectAllowed = "copy";
+            e.dataTransfer.setData(SCHEDULE_BATCH_DRAG_MIME, JSON.stringify({ kind: "artist", artistName: artist.artistName }));
+            e.dataTransfer.setData("text/plain", displayName);
+          }}
           onClick={() => queueArtist(artist)}
         >
           {queuingArtist ? "Queueing…" : "Queue all"}
@@ -174,7 +187,15 @@ function AlbumRow({
 }) {
   const busy = albumBusy === album.group;
   return (
-    <li className={styles["sb-show-season"]}>
+    <li
+      className={styles["sb-show-season"]}
+      draggable={!(busy || disabled || (albumBusy !== null && !busy))}
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData(SCHEDULE_BATCH_DRAG_MIME, JSON.stringify({ kind: "album", group: album.group }));
+        e.dataTransfer.setData("text/plain", album.albumName);
+      }}
+    >
       <div className={styles["sb-show-season-head"]}>
         <span className={styles["sb-show-season-label"]}>{album.albumName}</span>
         <span className="muted sb-show-season-sub">

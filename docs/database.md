@@ -69,9 +69,13 @@ Channel configuration and policy.
 | hidden_from_guide | INTEGER | 1 = omit from public guide/source listings; direct stream URLs still work |
 | playback_mode | TEXT | Always `packaged` |
 | required_package_profile | TEXT | Package profile (e.g., `h264-main-1080p`) |
+| abr_ladder_json | TEXT | Optional ordered JSON array of package profile names for adaptive bitrate variants |
 | package_prefill_ms | INTEGER | Package coverage horizon in ms |
+| schedule_mode | TEXT | `back_to_back` or opt-in `slot_grid` |
+| slot_duration_ms | INTEGER | Slot-grid interval in ms; 6s-aligned when set |
+| prefill_mode | TEXT | `eager` (default — package the whole channel ahead) or `on_demand` (serve unpackaged entries through ephemeral live sessions when a viewer tunes in) |
 
-**Key invariant**: `playback_mode` is always `packaged`. The system does not support generated playback.
+**Key invariant**: `playback_mode` is always `packaged`. The system does not support generated playback. `required_package_profile` is the single schedule gate; `abr_ladder_json` only adds package demand and HLS variants, and unready ladder rungs are omitted from the master playlist. The Schedule Builder create API accepts `adaptiveBitrate` for eager video channels; channel policy updates do not toggle ABR after creation. `back_to_back` remains the default schedule mode. `slot_grid` keeps primary entries at real packaged duration but advances each next primary start to the next `slot_duration_ms` wall-clock boundary, leaving explicit gaps for future filler/dead-air materialization. `prefill_mode` is `eager` by default; `on_demand` schedules from codec-eligible media without requiring ready packages, then uses in-process live sessions at tune-in for entries that do not already have ready packages.
 
 ### media
 
@@ -88,7 +92,10 @@ Ingested media items with codec validation metadata.
 | duration_ms | INTEGER | Source duration in milliseconds |
 | container | TEXT | File container (mkv, mp4, etc.) |
 | video_codec | TEXT | Video codec (h264, hevc) |
+| video_width | INTEGER | Video resolution width (NULL = not yet re-probed) |
 | video_height | INTEGER | Video resolution height |
+| color_transfer | TEXT | ffprobe color_transfer; smpte2084/arib-std-b67 mark HDR (NULL = unknown) |
+| color_primaries | TEXT | ffprobe color_primaries (e.g. bt709, bt2020; NULL = unknown) |
 | audio_codec | TEXT | Audio codec (aac, etc.) |
 | codec_check_passed | INTEGER | 1 = passed, 0 = rejected |
 | codec_check_reason | TEXT | Rejection reason if failed |
@@ -206,12 +213,15 @@ First-class profile definitions for packaging behavior. Built-in profiles are se
 |--------|------|-------------|
 | name | TEXT PK | Profile identifier (e.g., `h264-main-1080p`) |
 | is_builtin | INTEGER | 1 = built-in, 0 = custom |
-| profile_json | TEXT | Encoder configuration as JSON |
+| profile_json | TEXT | Encoder configuration as JSON, including optional `tags` such as `default` or `abr` |
 | created_at_ms | INTEGER | Creation timestamp |
 | updated_at_ms | INTEGER | Last update timestamp |
 
-The seeded video profile is `h264-main-1080p` (H.264 Main level 4.1, 1080p
-scale-down, 8 Mbps maxrate, AAC stereo). Profile
+The seeded compatibility video profile is `h264-main-1080p` (H.264 Main level
+4.1, 1080p scale-down, 8 Mbps maxrate, AAC stereo). ABR built-ins are tagged
+`abr` and grouped as one adaptive-bitrate unit in the admin UI, while remaining
+separate durable package profiles for the packager and HLS master playlist.
+Profile
 names are the durable package key and appear in
 `media_packages.rendition_profile`. All encode work, channel policy writes, and
 manual queue endpoints validate against the active registry allow-list.
@@ -238,7 +248,7 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 
 ## Key Invariants
 
-1. **Schedule only references ready packages.** The scheduler's `EligibleReadyPackagedChannelMedia` query joins `channel_media` → `media` → `media_packages` with `status = ready`. Unpackaged or in-progress media is not scheduled.
+1. **Eager channels schedule only ready packages.** For `prefill_mode = 'eager'` channels the scheduler's `EligibleReadyPackagedChannelMedia` query joins `channel_media` → `media` → `media_packages` with `status = ready`; unpackaged or in-progress media is not scheduled. On-demand channels (`prefill_mode = 'on_demand'`) instead schedule from `EligibleChannelMedia` (codec-eligible, package-agnostic) and serve unpackaged entries through ephemeral live sessions.
 
 2. **All schedule times are 6000ms-aligned.** The schema CHECK constraint rejects any `start_ms` or `duration_ms` not divisible by 6000.
 

@@ -143,10 +143,14 @@ func InsertScheduleEntries(ctx context.Context, conn Execer, entries []ScheduleE
 			p := prevID
 			anchor = &p
 		}
+		kind := e.Kind
+		if kind == "" {
+			kind = "primary"
+		}
 		if _, err := conn.ExecContext(ctx, `
-			INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, anchor_schedule_entry_id, created_at_ms)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, e.ChannelID, e.StartMs, e.MediaID, e.OffsetMs, e.DurationMs, anchor, e.CreatedAtMs); err != nil {
+			INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, anchor_schedule_entry_id, created_at_ms, entry_kind)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, e.ChannelID, e.StartMs, e.MediaID, e.OffsetMs, e.DurationMs, anchor, e.CreatedAtMs, kind); err != nil {
 			return 0, err
 		}
 		inserted++
@@ -384,6 +388,53 @@ func LastScheduleEntryBefore(ctx context.Context, conn *sql.DB, channelID string
 		}
 		return nil, err
 	}
+	return &e, nil
+}
+
+// LastEntryWithMediaBefore returns the most recent filler schedule entry for the
+// given media on a channel whose start is before beforeMs. It is used to
+// continue sequential filler rotation from where the previous placement of the
+// same asset left off, so it only considers entry_kind='filler' rows — any
+// incidental reuse of the same media as primary programming is ignored.
+// Returns (nil, nil) when the media has no earlier filler placement.
+func LastEntryWithMediaBefore(ctx context.Context, conn Execer, channelID, mediaID string, beforeMs int64) (*ScheduleEntry, error) {
+	row := conn.QueryRowContext(ctx, `
+        SELECT id, channel_id, start_ms, media_id, offset_ms, duration_ms, created_at_ms
+        FROM schedule_entries
+        WHERE channel_id = ? AND media_id = ? AND start_ms < ? AND entry_kind = 'filler'
+        ORDER BY start_ms DESC LIMIT 1`, channelID, mediaID, beforeMs)
+	var e ScheduleEntry
+	if err := row.Scan(&e.ID, &e.ChannelID, &e.StartMs, &e.MediaID, &e.OffsetMs, &e.DurationMs, &e.CreatedAtMs); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	e.Kind = "filler"
+	return &e, nil
+}
+
+// LastPrimaryScheduleEntry returns the latest primary (non-filler) schedule
+// entry, i.e. primary programming rather than attached filler. Extension uses
+// it to position the episode-rotation cursor: once filler persists at the
+// schedule tail, the plain tail entry's media would miss the primary list and
+// reset rotation to the top. entry_kind is authoritative — a filler asset
+// reused as primary programming is recorded as 'primary' on its entry.
+// Returns (nil, nil) when the channel has no primary entries.
+func LastPrimaryScheduleEntry(ctx context.Context, conn Execer, channelID string) (*ScheduleEntry, error) {
+	row := conn.QueryRowContext(ctx, `
+        SELECT id, channel_id, start_ms, media_id, offset_ms, duration_ms, created_at_ms
+        FROM schedule_entries
+        WHERE channel_id = ? AND entry_kind = 'primary'
+        ORDER BY start_ms DESC LIMIT 1`, channelID)
+	var e ScheduleEntry
+	if err := row.Scan(&e.ID, &e.ChannelID, &e.StartMs, &e.MediaID, &e.OffsetMs, &e.DurationMs, &e.CreatedAtMs); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	e.Kind = "primary"
 	return &e, nil
 }
 

@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { SCHEDULE_BATCH_DRAG_MIME } from "../constants";
 import { formatMs } from "../format";
 import type { MediaShow, MediaShowHalf, MediaShowSeason } from "../api/media";
 import styles from "./ScheduleBuilderPanel.module.css";
@@ -77,6 +78,12 @@ export function SchedulePickerShowsGrid({
               className={styles["sb-show-card"]}
               onClick={() => onSelectShow(show)}
               aria-label={`Open ${show.showName}`}
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.effectAllowed = "copy";
+                e.dataTransfer.setData(SCHEDULE_BATCH_DRAG_MIME, JSON.stringify({ kind: "show", showName: show.showName }));
+                e.dataTransfer.setData("text/plain", show.showName);
+              }}
             >
               <ShowPosterPlaceholder name={show.showName} />
               <div className={styles["sb-show-card-meta"]}>
@@ -127,6 +134,12 @@ function ShowDetail({
           type="button"
           className="primary"
           disabled={queueingShow || groupBusy !== null}
+          draggable={!(queueingShow || groupBusy !== null)}
+          onDragStart={(e) => {
+            e.dataTransfer.effectAllowed = "copy";
+            e.dataTransfer.setData(SCHEDULE_BATCH_DRAG_MIME, JSON.stringify({ kind: "show", showName: show.showName }));
+            e.dataTransfer.setData("text/plain", show.showName);
+          }}
           onClick={() => queueShow(show)}
         >
           {queueingShow ? "Queueing…" : "Queue entire show"}
@@ -194,7 +207,15 @@ function HalfRow({
 }) {
   const busy = groupBusy === half.group;
   return (
-    <li className={styles["sb-show-half"]}>
+    <li
+      className={styles["sb-show-half"]}
+      draggable={!(busy || disabled || (groupBusy !== null && !busy))}
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData(SCHEDULE_BATCH_DRAG_MIME, JSON.stringify({ kind: "group", group: half.group }));
+        e.dataTransfer.setData("text/plain", half.group);
+      }}
+    >
       <span className={styles["sb-show-half-label"]}>H{half.half}</span>
       <span className="muted sb-show-half-sub">
         {half.episodeCount} ep{half.episodeCount === 1 ? "" : "s"} · {formatMs(half.durationMs)}

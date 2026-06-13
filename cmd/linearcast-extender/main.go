@@ -85,7 +85,7 @@ func main() {
 
 // loadConfig assembles the runtime config from the DB. The settings table is
 // seeded by ApplySchema, so on a fresh install we get the package defaults
-// (48/24/300); operators change them from the admin UI. Changes only take
+// (24/23/300); operators change them from the admin UI. Changes only take
 // effect on the next process restart — the ticker is built once here.
 func loadConfig(conn *sql.DB, dbPath string) (config, error) {
 	tunables, err := db.GetSchedulerTunables(context.Background(), conn)

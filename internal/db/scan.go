@@ -12,8 +12,9 @@ func channelColumns(prefix string) string {
 	return prefix + "id, " + prefix + "display_name, " + prefix + "source_directory, " +
 		prefix + "ordering, " + prefix + "enabled, " + prefix + "created_at_ms, " +
 		prefix + "description, " + prefix + "hidden_from_guide, " + prefix + "artwork_url, " + prefix + "playback_mode, " +
-		prefix + "required_package_profile, " + prefix + "package_prefill_ms, " + prefix + "media_kind, " +
-		prefix + "upstream_hls_url"
+		prefix + "required_package_profile, " + prefix + "abr_ladder_json, " + prefix + "package_prefill_ms, " + prefix + "media_kind, " +
+		prefix + "schedule_mode, " + prefix + "slot_duration_ms, " + prefix + "upstream_hls_url, " +
+		prefix + "prefill_mode"
 }
 
 func channelSelectSQL() string {
@@ -24,11 +25,11 @@ func scanChannel(row scanner) (*Channel, error) {
 	var c Channel
 	var enabled int64
 	var hidden int64
-	var description, artworkURL, requiredProfile, upstreamURL sql.NullString
-	var prefillMs sql.NullInt64
+	var description, artworkURL, requiredProfile, abrLadderJSON, upstreamURL sql.NullString
+	var prefillMs, slotDurationMs sql.NullInt64
 	if err := row.Scan(&c.ID, &c.DisplayName, &c.SourceDirectory, &c.Ordering, &enabled,
 		&c.CreatedAtMs, &description, &hidden, &artworkURL, &c.PlaybackMode, &requiredProfile,
-		&prefillMs, &c.MediaKind, &upstreamURL); err != nil {
+		&abrLadderJSON, &prefillMs, &c.MediaKind, &c.ScheduleMode, &slotDurationMs, &upstreamURL, &c.PrefillMode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -39,9 +40,14 @@ func scanChannel(row scanner) (*Channel, error) {
 	c.Description = description.String
 	c.ArtworkURL = artworkURL.String
 	c.RequiredPackageProfile = requiredProfile.String
+	c.ABRLadder = NormalizeABRLadder(c.RequiredPackageProfile, abrLadderJSON.String)
 	if prefillMs.Valid {
 		v := prefillMs.Int64
 		c.PackagePrefillMs = &v
+	}
+	if slotDurationMs.Valid {
+		v := slotDurationMs.Int64
+		c.SlotDurationMs = &v
 	}
 	if upstreamURL.Valid {
 		v := upstreamURL.String
@@ -55,9 +61,10 @@ func scanChannel(row scanner) (*Channel, error) {
 func mediaColumns(prefix string) string {
 	return prefix + "id, " + prefix + "path, " + prefix + "directory, " + prefix + "title, " +
 		prefix + "scheduling_group, " + prefix + "user_preference, " + prefix + "duration_ms, " +
-		prefix + "container, " + prefix + "video_codec, " + prefix + "video_height, " +
+		prefix + "container, " + prefix + "video_codec, " + prefix + "video_width, " +
+		prefix + "video_height, " + prefix + "color_transfer, " + prefix + "color_primaries, " +
 		prefix + "audio_codec, " + prefix + "codec_check_passed, " + prefix + "codec_check_reason, " +
-		prefix + "ingested_at_ms, " + prefix + "media_kind"
+		prefix + "ingested_at_ms, " + prefix + "media_kind, " + prefix + "source_ref"
 }
 
 func mediaSelectSQL() string {
@@ -67,11 +74,12 @@ func mediaSelectSQL() string {
 func scanMedia(row scanner) (*Media, error) {
 	var m Media
 	var passed int64
-	var title, group, codecReason, mediaKind sql.NullString
-	var userPref sql.NullInt64
+	var title, group, colorTransfer, colorPrimaries, codecReason, mediaKind, sourceRef sql.NullString
+	var userPref, videoWidth sql.NullInt64
 	if err := row.Scan(&m.ID, &m.Path, &m.Directory, &title, &group,
-		&userPref, &m.DurationMs, &m.Container, &m.VideoCodec, &m.VideoHeight,
-		&m.AudioCodec, &passed, &codecReason, &m.IngestedAtMs, &mediaKind); err != nil {
+		&userPref, &m.DurationMs, &m.Container, &m.VideoCodec, &videoWidth,
+		&m.VideoHeight, &colorTransfer, &colorPrimaries,
+		&m.AudioCodec, &passed, &codecReason, &m.IngestedAtMs, &mediaKind, &sourceRef); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -80,8 +88,12 @@ func scanMedia(row scanner) (*Media, error) {
 	m.CodecCheckPassed = passed == 1
 	m.Title = title.String
 	m.SchedulingGroup = group.String
+	m.VideoWidth = videoWidth.Int64
+	m.ColorTransfer = colorTransfer.String
+	m.ColorPrimaries = colorPrimaries.String
 	m.CodecCheckReason = codecReason.String
 	m.MediaKind = MediaKind(mediaKind.String)
+	m.SourceRef = sourceRef.String
 	if userPref.Valid {
 		v := userPref.Int64
 		m.UserPreference = &v

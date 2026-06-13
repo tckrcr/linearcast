@@ -3,16 +3,21 @@ import {
   addChannelMedia as apiAddChannelMedia,
   createScheduleBuilderChannel as apiCreateScheduleBuilderChannel,
   deleteScheduleEntry as apiDeleteScheduleEntry,
+  fillScheduleGap as apiFillScheduleGap,
+  getChannelFillerAssets,
   getChannelMedia,
   getChannelSchedule,
   getChannelSchedulePreview,
   getMediaPackageCandidates,
   getScheduleBuilderCandidates,
+  getScheduleBuilderFillerCandidates,
   insertScheduleEntryAfter as apiInsertScheduleEntryAfter,
   insertScheduleEntryBefore as apiInsertScheduleEntryBefore,
+  recomposeSlotGridSchedule as apiRecomposeSlotGridSchedule,
   saveScheduleWindowOrdered as apiSaveScheduleWindowOrdered,
   upsertScheduleEntry as apiUpsertScheduleEntry,
 } from "../api";
+import type { ScheduleBuilderEntryInput } from "../api/scheduleBuilder";
 import { SCHEDULE_GRID_MS } from "../constants";
 import { formatDateTime } from "../format";
 import { usePolling } from "./usePolling";
@@ -70,6 +75,16 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
   const [rangeBusy, setRangeBusy] = useState(false);
   const [mediaData, setMediaData] = useState<ScheduleMediaPickerData | null>(null);
   const [channelMediaIds, setChannelMediaIds] = useState<Set<string>>(new Set());
+  // Media that are filler assets for this channel. They are intentionally
+  // exempt from picker de-duplication so the same filler clip can fill many
+  // gaps. See the slot-grid filler follow-ups in docs/ROADMAP.md.
+  const [fillerMediaIds, setFillerMediaIds] = useState<Set<string>>(new Set());
+  // How filler start offsets are chosen when filling a gap. "sequential"
+  // continues the rotation from the previous placement of the same asset so a
+  // long filler does not replay its opening seconds in every gap; "zero"
+  // always starts the filler from its beginning.
+  const [fillerOffsetMode, setFillerOffsetMode] = useState<"sequential" | "zero">("sequential");
+  const [lastGapFill, setLastGapFill] = useState<{ entryId: string; label: string } | null>(null);
   const [mediaLoading, setMediaLoading] = useState(false);
   const [mediaError, setMediaError] = useState("");
   const [editTarget, setEditTarget] = useState<ScheduleEditTarget | null>(null);
@@ -240,8 +255,8 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     }, 100);
   }
 
-  async function refreshScheduleAfterMutation(message?: string) {
-    if (!channel) return;
+  async function refreshScheduleAfterMutation(message?: string): Promise<ChannelSchedule | null> {
+    if (!channel) return null;
     setScheduleLoading(true);
     try {
       const data = await getChannelSchedule(channel.id, scheduleWindowStart, WINDOW_HOURS);
@@ -249,12 +264,30 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
       setSchedulePreview(null);
       setScheduleError("");
       setScheduleNotice(message || "");
+      return data;
     } catch (err) {
       setScheduleError(err instanceof Error ? err.message : String(err));
       setScheduleNotice("");
+      return null;
     } finally {
       setScheduleLoading(false);
     }
+  }
+
+  // Re-sync the slot-grid edit draft from a freshly fetched schedule. Gap fills
+  // mutate the server directly, but in slot-grid edit mode the timeline renders
+  // from scheduleDraft (a snapshot taken at beginScheduleEdit), so without this
+  // the just-filled gap keeps showing as open and re-dropping onto it returns a
+  // no_schedule_gap conflict.
+  function syncDraftAfterGapFill(data: ChannelSchedule) {
+    if (channel?.scheduleMode !== "slot_grid") return;
+    const fromMs = scheduleDraftWindow?.fromMs ?? data.entries[0]?.startMs ?? 0;
+    setScheduleDraft(
+      data.entries
+        .filter((entry) => entry.startMs >= fromMs)
+        .map((entry) => ({ ...entry, draftId: entry.entryId })),
+    );
+    setScheduleDraftUndo(null);
   }
 
   async function loadMedia(force = false) {
@@ -284,11 +317,15 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
         }
         setMediaData({ profile, count: byId.size, media: Array.from(byId.values()) });
       } else {
-        const [channelMedia, candidates] = await Promise.all([
+        const [channelMedia, channelFiller, candidates, fillerGlobal] = await Promise.all([
           getChannelMedia(channel!.id),
+          getChannelFillerAssets(channel!.id),
           getMediaPackageCandidates(channel!.packageProfile, undefined, "ready"),
+          getScheduleBuilderFillerCandidates(channel!.packageProfile),
         ]);
         const memberIds = new Set(channelMedia.media.map((media) => media.mediaId));
+        const fillerIds = new Set(channelFiller.assets.filter((asset) => asset.enabled && asset.channelEnabled).map((asset) => asset.mediaId));
+        setFillerMediaIds(fillerIds);
         const byId = new Map<string, ScheduleInsertItem>();
         for (const media of candidates.media) {
           if (media.packageStatus !== "ready" || media.packagedDurationMs == null) continue;
@@ -303,6 +340,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
             packagedDurationMs: durationMs,
             packageReady: true,
             channelMember: memberIds.has(media.mediaId),
+            fillerAsset: fillerIds.has(media.mediaId),
           });
         }
         for (const media of channelMedia.media) {
@@ -318,6 +356,26 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
             packagedDurationMs: durationMs,
             packageReady: true,
             channelMember: true,
+            fillerAsset: fillerIds.has(media.mediaId),
+          });
+        }
+        for (const filler of fillerGlobal.assets) {
+          if (!filler.packageReady || filler.packagedDurationMs == null) continue;
+          if (byId.has(filler.mediaId)) continue;
+          const durationMs = scheduleDurationMs(filler.packagedDurationMs);
+          if (durationMs <= 0) continue;
+          byId.set(filler.mediaId, {
+            mediaId: filler.mediaId,
+            title: filler.label,
+            path: "",
+            schedulingGroup: undefined,
+            durationMs,
+            packagedDurationMs: durationMs,
+            packageReady: true,
+            channelMember: false,
+            // The server's gap-fill path auto-attaches registered filler assets
+            // that match the channel kind, so global filler is valid here.
+            fillerAsset: true,
           });
         }
         setChannelMediaIds(memberIds);
@@ -444,17 +502,28 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
   async function insertMedia(media: ScheduleInsertItem) {
     if (!channel || !editTarget || !media.packageReady || insertBusy) return;
     if (editTarget.mode !== "jump" && editTarget.mode !== "fill") return;
+    if (editTarget.mode === "fill" && !media.fillerAsset) {
+      setScheduleError("choose a filler asset attached to this channel to fill a gap");
+      setScheduleNotice("");
+      return;
+    }
     setInsertBusy(true);
     setScheduleError("");
     setScheduleNotice("");
     try {
-      await ensureChannelMedia(media);
-      const res = await apiUpsertScheduleEntry(channel.id, media.mediaId, editTarget.startMs);
+      const wasFill = editTarget.mode === "fill";
+      const res = wasFill
+        ? await apiFillScheduleGap(channel.id, media.mediaId, editTarget.startMs, 0, fillerOffsetMode)
+        : await (async () => {
+            await ensureChannelMedia(media);
+            return apiUpsertScheduleEntry(channel.id, media.mediaId, editTarget.startMs);
+          })();
       setEditTarget(null);
       clearScheduleSelection();
-      await refreshScheduleAfterMutation(
-        `${editTarget.mode === "jump" ? "jumped to" : "filled"} ${formatDateTime(res.startMs)} with ${media.title || media.mediaId}`,
+      const data = await refreshScheduleAfterMutation(
+        `${wasFill ? "filled" : "jumped to"} ${formatDateTime(res.startMs)} with ${media.title || media.mediaId}`,
       );
+      if (wasFill && data) syncDraftAfterGapFill(data);
     } catch (err) {
       setScheduleError(err instanceof Error ? err.message : String(err));
       setScheduleNotice("");
@@ -560,6 +629,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     });
     setScheduleDraftUndo(null);
     setScheduleEditMode(true);
+    void loadMedia(false);
   }
 
   function beginPreviewEdit() {
@@ -583,6 +653,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     setSchedulePreview(null);
     setScheduleEditMode(true);
     setScheduleNotice("loaded preview into draft");
+    void loadMedia(false);
   }
 
   function cancelScheduleEdit() {
@@ -616,7 +687,85 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     applyScheduleDraftChange(() => []);
   }
 
-  function appendDraftEntry(media: ScheduleInsertItem) {
+  // Appends a media item to the draft, or inserts it at `index` (0-based) when
+  // provided — used when dropping a picker item at a position on the timeline.
+  async function fillGapWithMediaKey(mediaKey: string, startMs: number) {
+    if (!channel || insertBusy) return;
+    const media = mediaData?.media.find((item) => item.mediaId === mediaKey || item.path === mediaKey);
+    if (!media) {
+      setScheduleError("media is not loaded in the picker; refresh and retry");
+      setScheduleNotice("");
+      return;
+    }
+    if (!media.packageReady) {
+      setScheduleError("media is not ready for this channel profile");
+      setScheduleNotice("");
+      return;
+    }
+    if (!media.fillerAsset) {
+      setScheduleError("drop a filler asset attached to this channel onto schedule gaps");
+      setScheduleNotice("");
+      return;
+    }
+    setInsertBusy(true);
+    setScheduleError("");
+    setScheduleNotice("");
+    setLastGapFill(null);
+    try {
+      const res = await apiFillScheduleGap(channel.id, media.mediaId, startMs, 0, fillerOffsetMode);
+      const label = `${media.title || media.mediaId} at ${formatDateTime(res.startMs)}`;
+      setLastGapFill({ entryId: res.entryId, label });
+      const data = await refreshScheduleAfterMutation(`filled ${formatDateTime(res.startMs)} with ${media.title || media.mediaId}`);
+      if (data) syncDraftAfterGapFill(data);
+    } catch (err) {
+      setScheduleError(err instanceof Error ? err.message : String(err));
+      setScheduleNotice("");
+    } finally {
+      setInsertBusy(false);
+    }
+  }
+
+  async function undoLastGapFill() {
+    if (!channel || !lastGapFill || insertBusy) return;
+    setInsertBusy(true);
+    setScheduleError("");
+    setScheduleNotice("");
+    try {
+      await apiDeleteScheduleEntry(channel.id, lastGapFill.entryId);
+      setLastGapFill(null);
+      await refreshScheduleAfterMutation(`removed ${lastGapFill.label}`);
+    } catch (err) {
+      setScheduleError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInsertBusy(false);
+    }
+  }
+
+  // recomposeSlotGrid rebuilds the whole future schedule gap-free in one shot:
+  // the server clears everything after the in-progress entry and re-tiles
+  // primaries on slot boundaries with filler auto-tiled from the channel's
+  // attached filler pool. This replaces the per-gap fillGapWithMediaKey drag
+  // for existing slot-grid channels.
+  async function recomposeSlotGrid() {
+    if (!channel || insertBusy) return;
+    setInsertBusy(true);
+    setScheduleError("");
+    setScheduleNotice("");
+    setLastGapFill(null);
+    try {
+      const res = await apiRecomposeSlotGridSchedule(channel.id);
+      const summary = `recomposed gap-free · ${res.inserted} entries through ${formatDateTime(res.lastEndMs)}`;
+      await refreshScheduleAfterMutation(summary);
+      if (res.gappy && res.note) setScheduleError(res.note);
+    } catch (err) {
+      setScheduleError(err instanceof Error ? err.message : String(err));
+      setScheduleNotice("");
+    } finally {
+      setInsertBusy(false);
+    }
+  }
+
+  function appendDraftEntry(media: ScheduleInsertItem, index?: number) {
     const draftId = makeDraftInsertId(media.mediaId);
     const durationMs = scheduleDurationMs(media.packagedDurationMs ?? media.durationMs);
     if (durationMs <= 0) {
@@ -637,14 +786,15 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
       requiresChannelAttach: media.channelMember === false,
     };
     applyScheduleDraftChange((prev) => {
-      const next = [...prev, newEntry];
+      const at = index == null ? prev.length : Math.max(0, Math.min(index, prev.length));
+      const next = [...prev.slice(0, at), newEntry, ...prev.slice(at)];
       const label = media.title || media.mediaId;
-      setScheduleNotice(`added "${label}" at position ${next.length}`);
+      setScheduleNotice(`added "${label}" at position ${at + 1}`);
       return next;
     });
   }
 
-  function appendDraftEntries(items: ScheduleInsertItem[]): number {
+  function appendDraftEntries(items: ScheduleInsertItem[], index?: number): number {
     let addedCount = 0;
     applyScheduleDraftChange((prev) => {
       const existingKeys = new Set<string>(
@@ -674,8 +824,9 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
       }
       addedCount = toAdd.length;
       if (toAdd.length === 0) return prev;
-      setScheduleNotice(`added ${toAdd.length} entr${toAdd.length === 1 ? "y" : "ies"}`);
-      return [...prev, ...toAdd];
+      const at = index == null ? prev.length : Math.max(0, Math.min(index, prev.length));
+      setScheduleNotice(`added ${toAdd.length} entr${toAdd.length === 1 ? "y" : "ies"} at position ${at + 1}`);
+      return [...prev.slice(0, at), ...toAdd, ...prev.slice(at)];
     });
     return addedCount;
   }
@@ -816,24 +967,36 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     }
   }
 
-  async function importDraftChannel() {
+  async function importDraftChannel(explicit?: { entries: ScheduleBuilderEntryInput[]; fillerMediaIds: string[] }) {
     if (!isDraftMode || !draftConfig || scheduleDraft.length === 0 || saveBusy) return;
-    const { packageProfile, displayName, onImported } = draftConfig;
+    const { packageProfile, displayName, playbackMode, scheduleMode, slotDurationMs, prefillMode, adaptiveBitrate, onImported } = draftConfig;
     if (!displayName.trim()) {
       setScheduleError("display name is required");
       setScheduleNotice("");
       return;
     }
+    // mediaIds carries the primary media for channel_media membership + packaging.
+    // For slot-grid the explicit `entries` (primary + filler) own the layout so the
+    // server never builds — or persists — a schedule with gaps.
     const mediaIds = [...new Set(scheduleDraft.map((e) => e.mediaId))];
     setSaveBusy(true);
     setScheduleError("");
     setScheduleNotice("creating…");
     try {
-      const body = await apiCreateScheduleBuilderChannel({ displayName: displayName.trim(), packageProfile, mediaIds });
-      setScheduleNotice(
-        `created ${body.channelID}: ${body.scheduleEntries} entr${body.scheduleEntries === 1 ? "y" : "ies"}, queued ${body.queued.length}`,
-      );
-      onImported(body.channelID);
+      const body = await apiCreateScheduleBuilderChannel({
+        displayName: displayName.trim(),
+        packageProfile,
+        ...(playbackMode === "plex_relay" ? { playbackMode } : {}),
+        mediaIds,
+        ...(prefillMode === "on_demand" ? { prefillMode } : {}),
+        ...(adaptiveBitrate ? { adaptiveBitrate } : {}),
+        ...(scheduleMode === "slot_grid"
+          ? { scheduleMode, slotDurationMs, entries: explicit?.entries, fillerMediaIds: explicit?.fillerMediaIds }
+          : {}),
+      });
+      const queuedSuffix = playbackMode === "plex_relay" ? "" : `, queued ${body.queued.length}`;
+      setScheduleNotice(`created ${body.channelID}: ${body.scheduleEntries} entr${body.scheduleEntries === 1 ? "y" : "ies"}${queuedSuffix}`);
+      onImported(body.channelID, { scheduleMode });
     } catch (err) {
       setScheduleError(err instanceof Error ? err.message : String(err));
       setScheduleNotice("");
@@ -876,6 +1039,9 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     selectedRangeStarts,
     rangeBusy,
     mediaData,
+    fillerMediaIds,
+    fillerOffsetMode,
+    setFillerOffsetMode,
     mediaLoading,
     mediaError,
     editTarget,
@@ -911,6 +1077,10 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     clearScheduleDraft,
     appendDraftEntry,
     appendDraftEntries,
+    fillGapWithMediaKey,
+    recomposeSlotGrid,
+    lastGapFill,
+    undoLastGapFill,
     undoScheduleDraftChange,
     saveScheduleEdit,
     previewScheduleRebuild,

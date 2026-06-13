@@ -25,6 +25,33 @@ func makeAVProbe() sourceProbe {
 	return sourceProbe{Streams: []probeStream{video, audio}}
 }
 
+func TestPackagedDurationShortfall(t *testing.T) {
+	cases := []struct {
+		name      string
+		packaged  int64
+		source    int64
+		wantTrunc bool
+	}{
+		{"sub-frame slack ok", 1638626, 1638637, false},  // 11ms short (clean re-encode)
+		{"truncated by minutes", 1182215, 1638637, true}, // killed encode: ~7.5min short
+		{"exact", 1638637, 1638637, false},
+		{"packaged longer than source", 1638700, 1638637, false}, // never short
+		{"unknown source disables check", 1182215, 0, false},
+		{"under 0.5pct tolerance", 1638637 - 8000, 1638637, false},
+		{"over 0.5pct tolerance", 1638637 - 9000, 1638637, true},
+		{"short file under abs tolerance", 60000 - 1500, 60000, false},
+		{"short file over abs tolerance", 60000 - 3000, 60000, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, truncated := PackagedDurationShortfall(tc.packaged, tc.source); truncated != tc.wantTrunc {
+				t.Fatalf("PackagedDurationShortfall(%d, %d) truncated=%v, want %v",
+					tc.packaged, tc.source, truncated, tc.wantTrunc)
+			}
+		})
+	}
+}
+
 func TestParseHLSManifest(t *testing.T) {
 	dir := t.TempDir()
 	manifest := filepath.Join(dir, "stream.m3u8")
@@ -41,7 +68,7 @@ segments/seg000001.m4s
 		t.Fatalf("write manifest: %v", err)
 	}
 
-	got, err := parseHLSManifest(manifest)
+	got, err := ParseHLSManifest(manifest)
 	if err != nil {
 		t.Fatalf("parse manifest: %v", err)
 	}
@@ -85,7 +112,7 @@ func TestFFmpegArgsForTranscodeProfile(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing default profile")
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile)
+	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -145,7 +172,7 @@ func TestFFmpegArgsSelectsMainAudioTrack(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing default profile")
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", probe, profile)
+	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", probe, profile, nil, -1)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -168,7 +195,7 @@ func TestFFmpegArgsForCopyProfileCopiesVideo(t *testing.T) {
 			Bitrate: "192k",
 		},
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile)
+	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -207,7 +234,7 @@ func TestFFmpegArgsForVideoToolboxProfile(t *testing.T) {
 			SampleHz: 48000,
 		},
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile)
+	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -261,7 +288,7 @@ func TestFFmpegArgsForScaledBitrateProfiles(t *testing.T) {
 				SampleHz: 48000,
 			},
 		}
-		args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile)
+		args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
 		if err != nil {
 			t.Fatalf("%s ffmpeg args: %v", tc.name, err)
 		}

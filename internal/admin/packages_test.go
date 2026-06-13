@@ -349,14 +349,25 @@ func TestHandleMediaPackageProfilesExcludesTypoPackageRows(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	wantProfiles := db.DefaultPackageProfile + "," + packageprofile.MusicName
+	wantProfiles := strings.Join([]string{
+		db.DefaultPackageProfile,
+		packageprofile.H264CopySourceName,
+		packageprofile.HEVCCopySourceName,
+		packageprofile.H264Main720pName,
+		packageprofile.H264Main480pName,
+		packageprofile.MusicName,
+		packageprofile.H264NVENC1080pName,
+		packageprofile.H264NVENCCopySrcName,
+		packageprofile.H264NVENC720pName,
+		packageprofile.H264NVENC480pName,
+	}, ",")
 	if strings.Join(body.Profiles, ",") != wantProfiles {
 		t.Fatalf("profiles=%v, want seeded built-in profiles", body.Profiles)
 	}
 	if body.DefaultProfile != db.DefaultPackageProfile {
 		t.Fatalf("defaultProfile=%q, want seeded default when stored profile is unavailable", body.DefaultProfile)
 	}
-	if len(body.ProfileDetails) != 2 {
+	if len(body.ProfileDetails) != 10 {
 		t.Fatalf("profileDetails=%+v, want built-in profile details", body.ProfileDetails)
 	}
 	if body.ProfileDetails[0].Video.Mode == "" || body.ProfileDetails[0].Audio.Mode == "" {

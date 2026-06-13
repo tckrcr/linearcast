@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -51,6 +52,10 @@ type FinalizeOptions struct {
 	OutputRoot string
 	PackageID  string
 	NowMs      int64
+	// SourceDurationMs is the ingested source media duration. When > 0,
+	// FinalizePackage rejects output that falls materially short of it (a
+	// truncated or killed encode). Zero disables the check.
+	SourceDurationMs int64
 }
 
 type Result struct {
@@ -91,7 +96,9 @@ type sourceProbe struct {
 	Streams []probeStream `json:"streams"`
 }
 
-type hlsSegment struct {
+// HLSSegment is one segment entry parsed from an HLS media playlist: the
+// segment URI and its exact #EXTINF duration.
+type HLSSegment struct {
 	URI        string
 	DurationMs int64
 }
@@ -254,12 +261,13 @@ func PackageOne(ctx context.Context, conn *sql.DB, opts Options) (Result, error)
 	}
 
 	res, finalized, err := FinalizePackage(jobCtx, conn, FinalizeOptions{
-		MediaPath:  mediaPath,
-		MediaID:    media.ID,
-		Profile:    opts.Profile,
-		OutputRoot: opts.OutputRoot,
-		PackageID:  packageID,
-		NowMs:      opts.NowMs,
+		MediaPath:        mediaPath,
+		MediaID:          media.ID,
+		Profile:          opts.Profile,
+		OutputRoot:       opts.OutputRoot,
+		PackageID:        packageID,
+		NowMs:            opts.NowMs,
+		SourceDurationMs: media.DurationMs,
 	})
 	if err != nil {
 		recordFailureIfStillProcessing(ctx, conn, pkg, opts.NowMs, err, opts.FailKind, opts.MaxAttempts)
@@ -314,9 +322,53 @@ func EncodePackageOutput(ctx context.Context, mediaPath, packageRoot string, tar
 	return runFFmpeg(ctx, mediaPath, packageRoot, targetSegmentMs, preset, probe, profile)
 }
 
-// FinalizePackage validates encoded HLS output, writes packaged_segments,
-// extracts best-effort subtitle sidecars from the source media, and returns
-// the metadata needed to mark the media package ready.
+const (
+	// durationShortfallToleranceMs is the largest absolute gap between source
+	// and packaged duration tolerated before an encode is treated as truncated.
+	durationShortfallToleranceMs = 2000
+	// durationShortfallToleranceDenom expresses proportional slack (1/200 =
+	// 0.5% of source) tolerated on longer media, whichever bound is larger.
+	durationShortfallToleranceDenom = 200
+)
+
+// PackagedDurationShortfall reports how far a packaged duration falls short of
+// the source duration and whether that shortfall is large enough to treat the
+// encode as truncated. Encodes legitimately drop a sub-frame tail to land on a
+// GOP boundary, so a small absolute/proportional slack is tolerated; a larger
+// gap means output was cut off (e.g. the encoder was killed mid-run) and must
+// not be finalized as ready. A non-positive sourceMs disables the check.
+//
+// FinalizePackage uses this as a finalize guard; CheckReadyPackageIntegrity and
+// the maint audit-duration command reuse it so detection can never drift from
+// the guard.
+func PackagedDurationShortfall(packagedMs, sourceMs int64) (shortfallMs int64, truncated bool) {
+	if sourceMs <= 0 {
+		return 0, false
+	}
+	shortfallMs = sourceMs - packagedMs
+	if shortfallMs <= 0 {
+		return shortfallMs, false
+	}
+	return shortfallMs, shortfallMs > durationShortfallTolerance(sourceMs)
+}
+
+// durationShortfallTolerance is the largest shortfall (source minus packaged)
+// tolerated for sourceMs before an encode is treated as truncated: the larger of
+// a fixed absolute floor and a proportional bound. Shared by the finalize guard
+// and the audit so both report against the identical threshold.
+func durationShortfallTolerance(sourceMs int64) int64 {
+	tolerance := int64(durationShortfallToleranceMs)
+	if frac := sourceMs / durationShortfallToleranceDenom; frac > tolerance {
+		tolerance = frac
+	}
+	return tolerance
+}
+
+// FinalizePackage validates encoded HLS output — including a guard that the
+// packaged duration covers the source duration, so a truncated or killed encode
+// is rejected rather than silently finalized as ready — writes
+// packaged_segments, extracts best-effort subtitle sidecars from the source
+// media, and returns the metadata needed to mark the media package ready.
 func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (Result, db.FinalizedPackage, error) {
 	if opts.Profile == "" {
 		opts.Profile = DefaultProfile
@@ -335,7 +387,7 @@ func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (R
 	}
 	packageRoot := filepath.Join(opts.OutputRoot, opts.MediaID, opts.Profile)
 	playlist := filepath.Join(packageRoot, "stream.m3u8")
-	segments, err := parseHLSManifest(playlist)
+	segments, err := ParseHLSManifest(playlist)
 	if err != nil {
 		return Result{}, db.FinalizedPackage{}, err
 	}
@@ -359,6 +411,11 @@ func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (R
 			Path:          &segPath,
 		})
 		curMs += seg.DurationMs
+	}
+	if shortfall, truncated := PackagedDurationShortfall(curMs, opts.SourceDurationMs); truncated {
+		return Result{}, db.FinalizedPackage{}, fmt.Errorf(
+			"packaged duration %dms is %dms short of source %dms; encode likely truncated",
+			curMs, shortfall, opts.SourceDurationMs)
 	}
 	if err := db.ReplacePackagedSegments(ctx, conn, opts.PackageID, rows); err != nil {
 		return Result{}, db.FinalizedPackage{}, fmt.Errorf("write packaged segments: %w", err)
@@ -452,7 +509,14 @@ func recordFailure(ctx context.Context, conn *sql.DB, pkg db.MediaPackage, nowMs
 	if kind == "" {
 		kind = "terminal"
 	}
-	_, _ = db.MarkPackageFailedWithKind(ctx, conn, pkg.ID, kind, reason, maxAttempts, nowMs)
+	// The failing encode was often aborted by cancelling ctx (lease lost,
+	// shutdown). The status transition must still land, or the row stays
+	// 'processing' with no lease — invisible to the sweeper until the next
+	// worker restart drains it.
+	ctx = context.WithoutCancel(ctx)
+	if _, err := db.MarkPackageFailedWithKind(ctx, conn, pkg.ID, kind, reason, maxAttempts, nowMs); err != nil {
+		log.Printf("WARN record package failure pkg=%s kind=%s: %v (row may be stuck in processing)", pkg.ID, kind, err)
+	}
 }
 
 func recordFailureIfStillProcessing(ctx context.Context, conn *sql.DB, pkg db.MediaPackage, nowMs int64, cause error, kind string, maxAttempts int) {
@@ -535,7 +599,7 @@ func runFFmpeg(ctx context.Context, input, packageRoot string, targetSegmentMs i
 	if err != nil {
 		return fmt.Errorf("resolve package root: %w", err)
 	}
-	args, err := ffmpegArgs(absInput, absPackageRoot, targetSegmentMs, preset, probe, profile)
+	args, err := ffmpegArgs(absInput, absPackageRoot, targetSegmentMs, preset, probe, profile, nil, -1)
 	if err != nil {
 		return err
 	}
@@ -550,7 +614,10 @@ func runFFmpeg(ctx context.Context, input, packageRoot string, targetSegmentMs i
 	return nil
 }
 
-func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string, probe sourceProbe, profile packageprofile.Profile) ([]string, error) {
+// ffmpegArgs builds the package-encode command line. inputArgs, when non-nil,
+// is spliced in directly before -i (input options such as -ss seeking or
+// -readrate pacing for live sessions); package encodes pass nil.
+func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string, probe sourceProbe, profile packageprofile.Profile, inputArgs []string, burnSubtitleStreamIndex int) ([]string, error) {
 	segmentPattern := filepath.Join(packageRoot, "seg%06d.m4s")
 	targetSeconds := formatSeconds(targetSegmentMs)
 	selected := selectSourceStreams(probe)
@@ -568,9 +635,14 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 	if profile.Video.Mode == packageprofile.VideoModeCopy {
 		args = append(args, "-fflags", "+genpts")
 	}
+	args = append(args, inputArgs...)
+	args = append(args, "-i", input)
+	if burnSubtitleStreamIndex >= 0 {
+		args = append(args, "-filter_complex", subtitleBurnFilter(selected.Video.Index, burnSubtitleStreamIndex, profile), "-map", "[v]")
+	} else {
+		args = append(args, "-map", fmt.Sprintf("0:%d", selected.Video.Index))
+	}
 	args = append(args,
-		"-i", input,
-		"-map", fmt.Sprintf("0:%d", selected.Video.Index),
 		"-map", fmt.Sprintf("0:%d", selected.Audio.Index),
 		"-map_metadata", "-1",
 		"-dn",
@@ -611,8 +683,10 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 		if profile.Video.Level != "" {
 			args = append(args, "-level:v", profile.Video.Level)
 		}
-		args = append(args, "-pix_fmt", "yuv420p")
-		if profile.Video.ScaleHeight > 0 {
+		if burnSubtitleStreamIndex < 0 {
+			args = append(args, "-pix_fmt", "yuv420p")
+		}
+		if profile.Video.ScaleHeight > 0 && burnSubtitleStreamIndex < 0 {
 			// Scale down sources taller than ScaleHeight; leave shorter sources unchanged.
 			// -2 keeps width as a multiple of 2 after the height is pinned.
 			args = append(args, "-vf", fmt.Sprintf("scale=-2:'min(ih,%d)'", profile.Video.ScaleHeight))
@@ -626,6 +700,9 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 		)
 	case packageprofile.VideoModeCopy:
 		args = append(args, "-c:v", "copy")
+		if selected.Video != nil && selected.Video.CodecName == "hevc" {
+			args = append(args, "-tag:v", "hvc1")
+		}
 	default:
 		return nil, fmt.Errorf("unsupported video mode %q for profile %s", profile.Video.Mode, profile.Name)
 	}
@@ -658,6 +735,14 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 		filepath.Join(packageRoot, "stream.m3u8"),
 	)
 	return args, nil
+}
+
+func subtitleBurnFilter(videoStreamIndex, subtitleStreamIndex int, profile packageprofile.Profile) string {
+	scale := "scale=-2:ih"
+	if profile.Video.ScaleHeight > 0 {
+		scale = fmt.Sprintf("scale=-2:'min(ih,%d)'", profile.Video.ScaleHeight)
+	}
+	return fmt.Sprintf("[0:%d][0:%d]overlay=eof_action=pass,%s,format=yuv420p[v]", videoStreamIndex, subtitleStreamIndex, scale)
 }
 
 type packageMeta struct {
@@ -820,14 +905,18 @@ func gopFramesForStream(stream probeStream, targetSegmentMs int64) int {
 	return frames
 }
 
-func parseHLSManifest(path string) ([]hlsSegment, error) {
+// ParseHLSManifest reads an HLS media playlist from disk and returns its
+// segments with exact EXTINF durations. ffmpeg appends EXTINF+URI pairs as
+// segments complete, so this is safe to call on a still-growing playlist of a
+// live encode: it simply returns the segments written so far.
+func ParseHLSManifest(path string) ([]HLSSegment, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var out []hlsSegment
+	var out []HLSSegment
 	var pendingDuration int64
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -848,7 +937,7 @@ func parseHLSManifest(path string) ([]hlsSegment, error) {
 		if pendingDuration <= 0 {
 			return nil, fmt.Errorf("segment URI %q without preceding EXTINF", line)
 		}
-		out = append(out, hlsSegment{URI: line, DurationMs: pendingDuration})
+		out = append(out, HLSSegment{URI: line, DurationMs: pendingDuration})
 		pendingDuration = 0
 	}
 	if err := scanner.Err(); err != nil {

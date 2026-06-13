@@ -10,6 +10,7 @@ import type { PlaybackStats } from "./types";
 
 const ACTIVE_CHANNEL_KEY = "tc.activeChannelId";
 const MUTED_KEY = "tc.muted";
+const ABR_MODE_KEY = "tc.abrMode";
 const HINT_SEEN_KEY = "tc.hintSeen";
 const IDLE_MS = 3000;
 const HINT_MS = 5500;
@@ -107,6 +108,23 @@ export function App() {
     }
   }
 
+  const [abrMode, setAbrModeState] = useState<"best" | "saver">(() => {
+    try {
+      return window.localStorage.getItem(ABR_MODE_KEY) === "saver" ? "saver" : "best";
+    } catch {
+      return "best";
+    }
+  });
+
+  function setAbrMode(mode: "best" | "saver") {
+    setAbrModeState(mode);
+    try {
+      window.localStorage.setItem(ABR_MODE_KEY, mode);
+    } catch {
+      /* localStorage may be unavailable */
+    }
+  }
+
   const [debugOpen, setDebugOpen] = useState(false);
   const [channelsOpen, setChannelsOpen] = useState(false);
   const [stats, setStats] = useState<PlaybackStats>(emptyStats);
@@ -164,11 +182,32 @@ export function App() {
     setActiveChannelID,
     muted,
     setMuted,
+    abrMode,
+    setAbrMode,
     debugOpen,
     setDebugOpen,
     channelsOpen,
     setChannelsOpen,
   });
+
+  // Pause keepalive: while paused, ping the server every 30s so the
+  // on-demand session stays alive (capped server-side at the configured
+  // keepalive ceiling, default 15 min).
+  const prevPausedRef = useRef(false);
+  useEffect(() => {
+    if (!activeChannelID) return;
+    if (!stats.paused) {
+      prevPausedRef.current = false;
+      return;
+    }
+    // Just transitioned to paused — clear any previous ceiling timer.
+    fetch(`/hls/channel/${encodeURIComponent(activeChannelID)}/keepalive`, { method: "POST" }).catch(() => {});
+    prevPausedRef.current = true;
+    const id = setInterval(() => {
+      fetch(`/hls/channel/${encodeURIComponent(activeChannelID)}/keepalive`, { method: "POST" }).catch(() => {});
+    }, 30000);
+    return () => clearInterval(id);
+  }, [activeChannelID, stats.paused]);
 
   const activeSource =
     activeSources.find((c) => c.id === activeChannelID) ?? null;
@@ -187,8 +226,11 @@ export function App() {
         source={appliedSource}
         autoPlay={autoPlay}
         muted={muted}
+        abrMode={abrMode}
+        abrAvailable={activeSource?.adaptiveBitrate ?? false}
         controlsVisible={cornerVisible}
         onMutedChange={setMuted}
+        onAbrModeChange={setAbrMode}
         probe={probe}
         activeSource={activeSource}
         hasSources={activeSources.length > 0}
@@ -252,6 +294,8 @@ export function App() {
         <kbd>↑</kbd><kbd>↓</kbd> change channel
         <span className="tv-hint-sep">·</span>
         <kbd>M</kbd> mute
+        <span className="tv-hint-sep">·</span>
+        <kbd>Q</kbd> quality
         <span className="tv-hint-sep">·</span>
         <kbd>F</kbd> fullscreen
       </div>

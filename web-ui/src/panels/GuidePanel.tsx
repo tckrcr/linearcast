@@ -201,6 +201,11 @@ export function GuidePanel({ onChannelSelect }: { onChannelSelect: (id: string) 
                     <span className={`sidebar-dot status-dot-${channel.status}`} />
                     <span className="guide-channel-label-name">
                       {channel.displayName || channel.id}
+                      {channel.prefillMode === "on_demand" && (
+                        <span className="guide-channel-badge" title="On-demand — packages on tune-in">
+                          on-demand
+                        </span>
+                      )}
                     </span>
                   </button>
                   <div className="guide-track" style={{ height: `${ROW_HEIGHT_PX}px` }}>

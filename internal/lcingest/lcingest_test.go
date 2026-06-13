@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tckrcr/linearcast/internal/codec"
 	"github.com/tckrcr/linearcast/internal/db"
 )
 
@@ -101,6 +102,68 @@ func TestIngestRecordsPassAndCodecFailure(t *testing.T) {
 	}
 	if failRow == nil || failRow.CodecCheckPassed || !strings.Contains(failRow.CodecCheckReason, "video_codec=hevc") {
 		t.Fatalf("fail row=%+v, want codec failure recorded", failRow)
+	}
+}
+
+func TestIngestRecordsColorMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffprobe helper is POSIX-only")
+	}
+
+	conn := openTestDB(t)
+	defer conn.Close()
+
+	dir := t.TempDir()
+	hdrPath := mustWriteMediaFile(t, dir, "hdr.mkv")
+	sdrPath := mustWriteMediaFile(t, dir, "sdr.mkv")
+	t.Setenv("LINEARCAST_FFPROBE_PATH", writeFakeFFprobe(t, map[string]string{
+		"hdr.mkv": `{
+  "format": {"duration": "120.0", "format_name": "matroska,webm"},
+  "streams": [
+    {
+      "codec_type": "video",
+      "codec_name": "hevc",
+      "width": 3840,
+      "height": 2160,
+      "color_transfer": "smpte2084",
+      "color_primaries": "bt2020",
+      "disposition": {"default": 1, "attached_pic": 0}
+    },
+    {
+      "codec_type": "audio",
+      "codec_name": "aac",
+      "disposition": {"default": 1, "attached_pic": 0}
+    }
+  ]
+}`,
+		"sdr.mkv": fakeFFprobeJSON("h264", 1080, "aac", "120.0"),
+	}))
+
+	if _, err := Ingest(context.Background(), conn, dir, nil); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	hdrRow, err := db.MediaByID(context.Background(), conn, mediaIDFor(hdrPath))
+	if err != nil {
+		t.Fatalf("MediaByID(hdr): %v", err)
+	}
+	if hdrRow == nil || hdrRow.VideoWidth != 3840 || hdrRow.ColorTransfer != "smpte2084" || hdrRow.ColorPrimaries != "bt2020" {
+		t.Fatalf("hdr row=%+v, want width=3840 transfer=smpte2084 primaries=bt2020", hdrRow)
+	}
+	if !codec.IsHDRTransfer(hdrRow.ColorTransfer) {
+		t.Fatalf("IsHDRTransfer(%q)=false, want true", hdrRow.ColorTransfer)
+	}
+
+	// Sources without color metadata (and pre-v29 rows) must read back empty.
+	sdrRow, err := db.MediaByID(context.Background(), conn, mediaIDFor(sdrPath))
+	if err != nil {
+		t.Fatalf("MediaByID(sdr): %v", err)
+	}
+	if sdrRow == nil || sdrRow.ColorTransfer != "" || sdrRow.ColorPrimaries != "" {
+		t.Fatalf("sdr row=%+v, want empty color metadata", sdrRow)
+	}
+	if codec.IsHDRTransfer(sdrRow.ColorTransfer) {
+		t.Fatalf("IsHDRTransfer(%q)=true, want false", sdrRow.ColorTransfer)
 	}
 }
 

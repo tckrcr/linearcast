@@ -3,10 +3,12 @@ import {
   cleanupInvalidProfilePackages,
   getCacheSummary,
   getEncoderSweeperSettings,
+  getOnDemandSessionSettings,
   getSchedulerTunables,
   getSubtitleSettings,
   optimizeDatabase,
   updateEncoderSweeperSettings,
+  updateOnDemandSessionSettings,
   updateSchedulerTunables,
   updateSubtitleSettings,
 } from "../api";
@@ -85,6 +87,7 @@ export function ToolsPanel({ onChannelImported }: { onChannelImported: () => voi
       <section className={`admin-panel-section ${styles["settings-row"]}`}>
         <SchedulerTunablesPanel />
         <EncoderSweeperSettingsPanel />
+        <OnDemandSessionSettingsPanel />
         <SubtitleSettingsPanel />
       </section>
     </div>
@@ -378,6 +381,183 @@ function SubtitleSettingsPanel() {
         <div className="admin-form-actions">
           <button type="submit" disabled={busy || !loaded}>
             {busy ? "Saving..." : "Save"}
+          </button>
+          {status && <span className="muted">{status}</span>}
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function OnDemandSessionSettingsPanel() {
+  const [draft, setDraft] = useState({
+    graceSeconds: "",
+    maxConcurrent: "",
+    evictIdleSeconds: "",
+    stallTimeoutSeconds: "",
+    restartBudget: "",
+    keepaliveCeilingSec: "",
+  });
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    getOnDemandSessionSettings()
+      .then((s) => {
+        if (cancelled) return;
+        setDraft({
+          graceSeconds: String(s.graceSeconds),
+          maxConcurrent: String(s.maxConcurrent),
+          evictIdleSeconds: String(s.evictIdleSeconds),
+          stallTimeoutSeconds: String(s.stallTimeoutSeconds),
+          restartBudget: String(s.restartBudget),
+          keepaliveCeilingSec: String(s.keepaliveCeilingSec),
+        });
+        setLoaded(true);
+        setStatus("");
+      })
+      .catch((err) => {
+        if (!cancelled) setStatus(err instanceof Error ? err.message : String(err));
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const graceSeconds = parseInt(draft.graceSeconds, 10);
+    const maxConcurrent = parseInt(draft.maxConcurrent, 10);
+    const evictIdleSeconds = parseInt(draft.evictIdleSeconds, 10);
+    const stallTimeoutSeconds = parseInt(draft.stallTimeoutSeconds, 10);
+    const restartBudget = parseInt(draft.restartBudget, 10);
+    const keepaliveCeilingSec = parseInt(draft.keepaliveCeilingSec, 10);
+
+    if (Number.isNaN(graceSeconds) || graceSeconds <= 0) {
+      setStatus("grace seconds must be > 0");
+      return;
+    }
+    if (Number.isNaN(maxConcurrent) || maxConcurrent <= 0) {
+      setStatus("max concurrent must be > 0");
+      return;
+    }
+    if (Number.isNaN(evictIdleSeconds) || evictIdleSeconds <= 0) {
+      setStatus("evict idle seconds must be > 0");
+      return;
+    }
+    if (Number.isNaN(stallTimeoutSeconds) || stallTimeoutSeconds <= 0) {
+      setStatus("stall timeout seconds must be > 0");
+      return;
+    }
+    if (Number.isNaN(restartBudget) || restartBudget <= 0) {
+      setStatus("restart budget must be > 0");
+      return;
+    }
+    if (Number.isNaN(keepaliveCeilingSec) || keepaliveCeilingSec <= 0) {
+      setStatus("keepalive ceiling must be > 0");
+      return;
+    }
+
+    const payload = { graceSeconds, maxConcurrent, evictIdleSeconds, stallTimeoutSeconds, restartBudget, keepaliveCeilingSec };
+    setBusy(true);
+    setStatus("saving...");
+    try {
+      const saved = await updateOnDemandSessionSettings(payload);
+      setDraft({
+        graceSeconds: String(saved.graceSeconds),
+        maxConcurrent: String(saved.maxConcurrent),
+        evictIdleSeconds: String(saved.evictIdleSeconds),
+        stallTimeoutSeconds: String(saved.stallTimeoutSeconds),
+        restartBudget: String(saved.restartBudget),
+        keepaliveCeilingSec: String(saved.keepaliveCeilingSec),
+      });
+      setStatus("saved");
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className={styles["settings-col"]}>
+      <h2>On-demand session</h2>
+      <form className={`${styles["admin-form"]} on-demand-session-form`} onSubmit={(event) => void save(event)}>
+        <label>
+          <span>grace (seconds)</span>
+          <input
+            type="number"
+            min={1}
+            value={draft.graceSeconds}
+            disabled={busy || !loaded}
+            onChange={(event) =>
+              setDraft((prev) => ({ ...prev, graceSeconds: event.target.value }))
+            }
+          />
+        </label>
+        <label>
+          <span>max concurrent</span>
+          <input
+            type="number"
+            min={1}
+            value={draft.maxConcurrent}
+            disabled={busy || !loaded}
+            onChange={(event) =>
+              setDraft((prev) => ({ ...prev, maxConcurrent: event.target.value }))
+            }
+          />
+        </label>
+        <label>
+          <span>evict idle (seconds)</span>
+          <input
+            type="number"
+            min={1}
+            value={draft.evictIdleSeconds}
+            disabled={busy || !loaded}
+            onChange={(event) =>
+              setDraft((prev) => ({ ...prev, evictIdleSeconds: event.target.value }))
+            }
+          />
+        </label>
+        <label>
+          <span>stall timeout (seconds)</span>
+          <input
+            type="number"
+            min={1}
+            value={draft.stallTimeoutSeconds}
+            disabled={busy || !loaded}
+            onChange={(event) =>
+              setDraft((prev) => ({ ...prev, stallTimeoutSeconds: event.target.value }))
+            }
+          />
+        </label>
+        <label>
+          <span>restart budget</span>
+          <input
+            type="number"
+            min={1}
+            value={draft.restartBudget}
+            disabled={busy || !loaded}
+            onChange={(event) =>
+              setDraft((prev) => ({ ...prev, restartBudget: event.target.value }))
+            }
+          />
+        </label>
+        <label>
+          <span>keepalive ceiling (sec)</span>
+          <input
+            type="number"
+            min={1}
+            value={draft.keepaliveCeilingSec}
+            disabled={busy || !loaded}
+            onChange={(event) =>
+              setDraft((prev) => ({ ...prev, keepaliveCeilingSec: event.target.value }))
+            }
+          />
+        </label>
+        <div className="admin-form-actions">
+          <button type="submit" disabled={busy || !loaded}>
+            {busy ? "Saving..." : "Save session settings"}
           </button>
           {status && <span className="muted">{status}</span>}
         </div>

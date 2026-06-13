@@ -49,7 +49,7 @@ func TestHandleChannelPolicyNullFieldsWireShape(t *testing.T) {
 
 	defaultProfile := db.DefaultPackageProfileForMediaKind(db.MediaKindVideo)
 	want := fmt.Sprintf(
-		`{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":%q,"packagePrefillMs":null,"mediaKind":"video"}`+"\n",
+		`{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":%q,"adaptiveBitrate":false,"packagePrefillMs":null,"mediaKind":"video"}`+"\n",
 		defaultProfile,
 	)
 	if got := res.Body.String(); got != want {
@@ -72,7 +72,7 @@ func TestHandleChannelPolicySetFieldsWireShape(t *testing.T) {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 
-	want := `{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":"h264-main-1080p","packagePrefillMs":5000,"mediaKind":"video"}` + "\n"
+	want := `{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":"h264-main-1080p","adaptiveBitrate":false,"packagePrefillMs":5000,"mediaKind":"video"}` + "\n"
 	if got := res.Body.String(); got != want {
 		t.Fatalf("policy body mismatch:\n got: %s\nwant: %s", got, want)
 	}

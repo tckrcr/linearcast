@@ -28,6 +28,8 @@ type ServiceOptions struct {
 	// already removed an entry and wants the extend to skip that media item and
 	// continue with the one after it.
 	ResumeAfterMediaID string
+	ScheduleMode       string
+	SlotDurationMs     int64
 }
 
 type ExtendResult struct {
@@ -45,6 +47,8 @@ type ExtendResult struct {
 	BootstrapTotal       int64
 	RequireReadyPackages bool
 	RenditionProfile     string
+	ScheduleMode         string
+	SlotDurationMs       int64
 	Error                string
 }
 
@@ -119,10 +123,14 @@ func ExtendChannel(ctx context.Context, conn db.Execer, channelID string, opts S
 		RenditionProfile:     opts.RenditionProfile,
 		InTransaction:        opts.InTransaction,
 		ResumeAfterMediaID:   opts.ResumeAfterMediaID,
+		ScheduleMode:         opts.ScheduleMode,
+		SlotDurationMs:       opts.SlotDurationMs,
 	}
 	effective := OptionsForChannel(*ch, base)
 	result.RequireReadyPackages = effective.RequireReadyPackages
 	result.RenditionProfile = effective.RenditionProfile
+	result.ScheduleMode = effective.ScheduleMode
+	result.SlotDurationMs = effective.SlotDurationMs
 
 	if opts.BootstrapRequireAllReady && last == nil && effective.RequireReadyPackages {
 		readiness, rerr := db.ChannelProfileReadiness(ctx, conn, channelID, effective.RenditionProfile)

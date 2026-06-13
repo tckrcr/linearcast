@@ -39,6 +39,8 @@ type channelListRow struct {
 	DisplayName     string `json:"displayName"`
 	Enabled         bool   `json:"enabled"`
 	Ordering        string `json:"ordering"`
+	ScheduleMode    string `json:"scheduleMode"`
+	SlotDurationMs  *int64 `json:"slotDurationMs,omitempty"`
 	HiddenFromGuide bool   `json:"hiddenFromGuide"`
 	ArtworkURL      string `json:"artworkUrl,omitempty"`
 	MediaKind       string `json:"mediaKind"`
@@ -48,6 +50,7 @@ type channelPolicyResponse struct {
 	ChannelID              string `json:"channelId"`
 	PlaybackMode           string `json:"playbackMode"`
 	RequiredPackageProfile string `json:"requiredPackageProfile"`
+	AdaptiveBitrate        bool   `json:"adaptiveBitrate"`
 	PackagePrefillMs       *int64 `json:"packagePrefillMs"`
 	MediaKind              string `json:"mediaKind"`
 }
@@ -73,10 +76,37 @@ type channelCloneResponse struct {
 
 type createChannelRequest struct {
 	DisplayName    string   `json:"displayName"`
+	PlaybackMode   string   `json:"playbackMode,omitempty"` // "packaged" (default) or "plex_relay"
 	PackageProfile string   `json:"packageProfile"`
 	MediaIDs       []string `json:"mediaIds"`
 	Ordering       string   `json:"ordering,omitempty"`
+	ScheduleMode   string   `json:"scheduleMode,omitempty"`
+	SlotDurationMs *int64   `json:"slotDurationMs,omitempty"`
 	UpstreamHLSURL string   `json:"upstreamHlsUrl,omitempty"`
+	// PrefillMode is "eager" (default) or "on_demand". On-demand channels defer
+	// packaging until a viewer tunes in; the schedule still builds ahead.
+	PrefillMode string `json:"prefillMode,omitempty"`
+	// AdaptiveBitrate selects a prepackaged video ladder at channel creation
+	// time: "" (off), "cpu" (libx264), or "nvenc" (h264_nvenc).
+	// It is intentionally not a mutable channel policy.
+	AdaptiveBitrate string `json:"adaptiveBitrate,omitempty"`
+	// Entries, when present, is an explicit wall-clock-ordered schedule the
+	// client has already composed (primary programming plus the filler that
+	// covers every slot gap). The server lays them contiguously from 0, so the
+	// schedule is gap-free by construction; FillerMediaIDs marks which entries
+	// are filler so the slot grid can be validated. Empty Entries falls back to
+	// server-built scheduling (ExtendChannel).
+	Entries        []scheduleEntryInput `json:"entries,omitempty"`
+	FillerMediaIDs []string             `json:"fillerMediaIds,omitempty"`
+}
+
+// scheduleEntryInput is one client-composed schedule row. start_ms is implied by
+// contiguous laying (sum of preceding durations), so only the media, its play
+// offset, and its on-air duration are sent.
+type scheduleEntryInput struct {
+	MediaID    string `json:"mediaId"`
+	OffsetMs   int64  `json:"offsetMs"`
+	DurationMs int64  `json:"durationMs"`
 }
 
 type createChannelResponse struct {
@@ -113,13 +143,30 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 	req.DisplayName = strings.TrimSpace(req.DisplayName)
 	req.PackageProfile = strings.TrimSpace(req.PackageProfile)
 	req.Ordering = strings.TrimSpace(req.Ordering)
+	req.ScheduleMode = strings.TrimSpace(req.ScheduleMode)
 	req.UpstreamHLSURL = strings.TrimSpace(req.UpstreamHLSURL)
+	req.PrefillMode = strings.TrimSpace(req.PrefillMode)
 
 	if req.DisplayName == "" {
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "missing_display_name", Message: "displayName is required"}
 	}
 	if req.Ordering == "" {
 		req.Ordering = "alphabetical"
+	}
+	if req.ScheduleMode == "" {
+		req.ScheduleMode = "back_to_back"
+	}
+	if req.ScheduleMode != "back_to_back" && req.ScheduleMode != "slot_grid" {
+		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_schedule_mode", Message: "scheduleMode must be back_to_back or slot_grid"}
+	}
+	if req.SlotDurationMs != nil && (*req.SlotDurationMs <= 0 || *req.SlotDurationMs%scheduler.TargetSegmentMs != 0) {
+		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_slot_duration", Message: "slotDurationMs must be a positive 6000ms-aligned value"}
+	}
+	if req.PrefillMode == "" {
+		req.PrefillMode = "eager"
+	}
+	if req.PrefillMode != "eager" && req.PrefillMode != "on_demand" {
+		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_prefill_mode", Message: "prefillMode must be eager or on_demand"}
 	}
 
 	// Auto-generate a unique channel ID from the display name.
@@ -149,11 +196,86 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 			DisplayName:    req.DisplayName,
 			Ordering:       req.Ordering,
 			MediaKind:      db.MediaKindMusic,
+			ScheduleMode:   req.ScheduleMode,
+			SlotDurationMs: req.SlotDurationMs,
 			UpstreamHLSURL: &req.UpstreamHLSURL,
 		}); err != nil {
 			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("create channel: %v", err)}
 		}
 		return createChannelResponse{ChannelID: channelID, DisplayName: req.DisplayName, Created: true}, nil
+	}
+
+	if req.PlaybackMode == string(db.PlaybackModePlexRelay) {
+		if len(req.MediaIDs) == 0 {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "empty_media", Message: "at least one mediaId is required for schedule"}
+		}
+		nowMs := a.now().UTC().UnixMilli()
+		mediaMap, err := db.MediaByIDs(ctx, a.dbConn, req.MediaIDs)
+		if err != nil {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: err.Error()}
+		}
+		members := make([]db.ChannelMediaRow, 0, len(req.MediaIDs))
+		seen := make(map[string]bool)
+		for _, id := range req.MediaIDs {
+			m, ok := mediaMap[id]
+			if !ok || seen[m.ID] {
+				continue
+			}
+			if !strings.HasPrefix(strings.TrimSpace(m.SourceRef), "plex://") {
+				return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "non_plex_media", Message: "plex_relay channels can only use media imported from Plex"}
+			}
+			if !m.CodecCheckPassed {
+				continue
+			}
+			seen[m.ID] = true
+			members = append(members, db.ChannelMediaRow{
+				ChannelID: channelID,
+				MediaID:   m.ID,
+				AddedAtMs: nowMs,
+			})
+		}
+		if len(members) == 0 {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusUnprocessableEntity, Code: "no_eligible_media", Message: "none of the supplied mediaIds are eligible Plex media"}
+		}
+		if err := db.InsertChannel(ctx, a.dbConn, db.ChannelWrite{
+			ID:           channelID,
+			DisplayName:  req.DisplayName,
+			PlaybackMode: db.PlaybackModePlexRelay,
+			Ordering:     req.Ordering,
+			MediaKind:    db.MediaKindVideo,
+			ScheduleMode: req.ScheduleMode,
+		}); err != nil {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("create channel: %v", err)}
+		}
+		if err := db.WithTx(ctx, a.dbConn, func(tx db.Execer) error {
+			return db.ReplaceChannelMedia(ctx, tx, channelID, members)
+		}); err != nil {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("write channel_media: %v", err)}
+		}
+		scheduleEntries := 0
+		if len(req.Entries) > 0 {
+			explicitEntries, fillerAssetIDs, herr := a.validateExplicitSchedule(ctx, channelID, req, nowMs)
+			if herr != nil {
+				return createChannelResponse{}, herr
+			}
+			n, herr := a.writeExplicitSchedule(ctx, channelID, explicitEntries, fillerAssetIDs)
+			if herr != nil {
+				return createChannelResponse{}, herr
+			}
+			scheduleEntries = n
+		}
+		if len(req.Entries) == 0 {
+			if sched, err := scheduler.ExtendChannel(ctx, a.dbConn, channelID, scheduler.ServiceOptions{HorizonHours: 24}); err == nil {
+				scheduleEntries = sched.Inserted
+			}
+		}
+		return createChannelResponse{
+			ChannelID:       channelID,
+			DisplayName:     req.DisplayName,
+			Created:         true,
+			SyncedMedia:     len(members),
+			ScheduleEntries: scheduleEntries,
+		}, nil
 	}
 
 	if req.PackageProfile == "" {
@@ -172,6 +294,28 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_profile", Message: fmt.Sprintf("package profile %q is not available", req.PackageProfile)}
 	}
 	mediaKind := db.NormalizeMediaKind(db.MediaKind(profileRecord.Profile.MediaKind))
+	var abrLadder []string
+	if req.AdaptiveBitrate != "" {
+		if mediaKind != db.MediaKindVideo {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_media_kind", Message: "adaptive bitrate is only available for video channels"}
+		}
+		if req.PrefillMode == "on_demand" {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_prefill", Message: "adaptive bitrate is only available for pre-encoded channels"}
+		}
+		switch req.AdaptiveBitrate {
+		case "cpu":
+			abrLadder = db.StandardVideoABRLadder
+		case "nvenc":
+			abrLadder = db.StandardVideoNVENCABRLadder
+		case "hdr":
+			abrLadder = db.StandardVideoHDRABRLadder
+		default:
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_mode", Message: "adaptiveBitrate must be \"cpu\", \"nvenc\", or \"hdr\""}
+		}
+		if req.PackageProfile != db.DefaultPackageProfile {
+			abrLadder = append([]string{req.PackageProfile}, abrLadder...)
+		}
+	}
 
 	// Resolve media IDs to eligible rows (already ingested, pass codec/kind check).
 	nowMs := a.now().UTC().UnixMilli()
@@ -200,13 +344,30 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusUnprocessableEntity, Code: "no_eligible_media", Message: "none of the supplied mediaIds are eligible (not ingested or failed codec check)"}
 	}
 
+	// Validate an explicit client-composed schedule up front, before any channel
+	// row is written, so a malformed or gappy payload never leaves a half-built
+	// channel behind.
+	var explicitEntries []db.ScheduleEntry
+	var fillerAssetIDs []string
+	if len(req.Entries) > 0 {
+		var herr *adminHTTPError
+		explicitEntries, fillerAssetIDs, herr = a.validateExplicitSchedule(ctx, channelID, req, nowMs)
+		if herr != nil {
+			return createChannelResponse{}, herr
+		}
+	}
+
 	// Create the channel.
 	if err := db.InsertChannel(ctx, a.dbConn, db.ChannelWrite{
 		ID:                     channelID,
 		DisplayName:            req.DisplayName,
 		Ordering:               req.Ordering,
 		RequiredPackageProfile: req.PackageProfile,
+		ABRLadder:              abrLadder,
 		MediaKind:              mediaKind,
+		ScheduleMode:           req.ScheduleMode,
+		SlotDurationMs:         req.SlotDurationMs,
+		PrefillMode:            req.PrefillMode,
 	}); err != nil {
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("create channel: %v", err)}
 	}
@@ -218,10 +379,20 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("write channel_media: %v", err)}
 	}
 
-	// Best-effort schedule extension — no ready packages yet is fine.
 	scheduleEntries := 0
-	if sched, err := scheduler.ExtendChannel(ctx, a.dbConn, channelID, scheduler.ServiceOptions{HorizonHours: 24}); err == nil {
-		scheduleEntries = sched.Inserted
+	if len(explicitEntries) > 0 {
+		// Client owns the layout: persist the explicit, already-contiguous
+		// schedule and skip the server-built (gappy) slot grid.
+		n, herr := a.writeExplicitSchedule(ctx, channelID, explicitEntries, fillerAssetIDs)
+		if herr != nil {
+			return createChannelResponse{}, herr
+		}
+		scheduleEntries = n
+	} else {
+		// Best-effort schedule extension — no ready packages yet is fine.
+		if sched, err := scheduler.ExtendChannel(ctx, a.dbConn, channelID, scheduler.ServiceOptions{HorizonHours: 24}); err == nil {
+			scheduleEntries = sched.Inserted
+		}
 	}
 
 	return createChannelResponse{
@@ -231,6 +402,135 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 		SyncedMedia:     len(members),
 		ScheduleEntries: scheduleEntries,
 	}, nil
+}
+
+// validateExplicitSchedule turns a client-composed schedule into persistable
+// entries. It is read-only so it can run before the channel row is written.
+// Entries are laid contiguously from 0 (gap-free by construction); for slot-grid
+// channels it also enforces that every primary (non-filler) entry lands on a slot
+// boundary — a primary falling off-boundary means an upstream gap was never
+// filled, which is exactly the "never save a channel with gaps" invariant. The
+// returned fillerAssetIDs are the channel_filler_assets rows writeExplicitSchedule
+// must attach.
+func (a *App) validateExplicitSchedule(ctx context.Context, channelID string, req createChannelRequest, nowMs int64) ([]db.ScheduleEntry, []string, *adminHTTPError) {
+	ids := make([]string, 0, len(req.Entries))
+	for _, e := range req.Entries {
+		ids = append(ids, strings.TrimSpace(e.MediaID))
+	}
+	mediaMap, err := db.MediaByIDs(ctx, a.dbConn, ids)
+	if err != nil {
+		return nil, nil, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: err.Error()}
+	}
+
+	fillerSet := make(map[string]bool, len(req.FillerMediaIDs))
+	for _, id := range req.FillerMediaIDs {
+		fillerSet[strings.TrimSpace(id)] = true
+	}
+
+	slotMs := int64(0)
+	if req.ScheduleMode == "slot_grid" {
+		slotMs = 30 * 60 * 1000
+		if req.SlotDurationMs != nil {
+			slotMs = *req.SlotDurationMs
+		}
+	}
+
+	// schedule_entries.start_ms is wall-clock epoch ms. The client composes a
+	// 0-based layout, so rebase onto the current 6s grid; for slot-grid snap that
+	// base forward to the next real slot boundary so primaries land on :00/:30
+	// wall-clock, matching BuildEntriesSlotGrid.
+	base := scheduler.Align6s(nowMs)
+	if slotMs > 0 {
+		base = scheduler.AlignToSlot(base, slotMs)
+	}
+
+	entries := make([]db.ScheduleEntry, 0, len(req.Entries))
+	cursor := int64(0)
+	for i, in := range req.Entries {
+		mediaID := strings.TrimSpace(in.MediaID)
+		if mediaID == "" {
+			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_entry", Message: fmt.Sprintf("entry %d has an empty mediaId", i)}
+		}
+		if _, ok := mediaMap[mediaID]; !ok {
+			return nil, nil, &adminHTTPError{Status: http.StatusUnprocessableEntity, Code: "invalid_entry", Message: fmt.Sprintf("entry %d references unknown media %q", i, mediaID)}
+		}
+		if in.DurationMs <= 0 || in.DurationMs%scheduler.TargetSegmentMs != 0 {
+			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_entry", Message: fmt.Sprintf("entry %d duration_ms=%d must be a positive %dms-aligned value", i, in.DurationMs, scheduler.TargetSegmentMs)}
+		}
+		if in.OffsetMs < 0 || in.OffsetMs%scheduler.TargetSegmentMs != 0 {
+			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_entry", Message: fmt.Sprintf("entry %d offset_ms=%d must be a non-negative %dms-aligned value", i, in.OffsetMs, scheduler.TargetSegmentMs)}
+		}
+		// Slot-grid integrity: a primary entry must begin on a slot boundary. If
+		// it does not, a preceding gap was left unfilled.
+		if slotMs > 0 && !fillerSet[mediaID] && cursor%slotMs != 0 {
+			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "schedule_has_gaps", Message: fmt.Sprintf("entry %d (%s) starts at %dms, off the %dms slot grid — fill every gap before creating the channel", i, mediaID, cursor, slotMs)}
+		}
+		kind := "primary"
+		if fillerSet[mediaID] {
+			kind = "filler"
+		}
+		entries = append(entries, db.ScheduleEntry{
+			ChannelID:   channelID,
+			StartMs:     base + cursor,
+			MediaID:     mediaID,
+			OffsetMs:    in.OffsetMs,
+			DurationMs:  in.DurationMs,
+			CreatedAtMs: nowMs,
+			Kind:        kind,
+		})
+		cursor += in.DurationMs
+	}
+	if len(entries) == 0 {
+		return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "empty_schedule", Message: "explicit schedule must contain at least one entry"}
+	}
+
+	// Resolve filler media to their asset IDs (so writeExplicitSchedule can attach
+	// them). This mirrors the auto-attach FillGap performs at fill time.
+	fillerAssetIDs := make([]string, 0, len(fillerSet))
+	for mediaID := range fillerSet {
+		if mediaID == "" {
+			continue
+		}
+		asset, assetErr := db.FillerAssetByMediaID(ctx, a.dbConn, mediaID)
+		if assetErr != nil {
+			if errors.Is(assetErr, sql.ErrNoRows) {
+				return nil, nil, &adminHTTPError{Status: http.StatusUnprocessableEntity, Code: "invalid_filler", Message: fmt.Sprintf("filler media %q is not a registered filler asset", mediaID)}
+			}
+			return nil, nil, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: assetErr.Error()}
+		}
+		fillerAssetIDs = append(fillerAssetIDs, asset.ID)
+	}
+
+	return entries, fillerAssetIDs, nil
+}
+
+// writeExplicitSchedule attaches the channel's filler assets and persists the
+// validated entries. Entries insert atomically; InsertScheduleEntries chains
+// anchors and re-checks 6s alignment.
+func (a *App) writeExplicitSchedule(ctx context.Context, channelID string, entries []db.ScheduleEntry, fillerAssetIDs []string) (int, *adminHTTPError) {
+	for _, assetID := range fillerAssetIDs {
+		if attachErr := db.AttachChannelFillerAsset(ctx, a.dbConn, channelID, assetID, 1, true); attachErr != nil {
+			return 0, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: attachErr.Error()}
+		}
+	}
+
+	var inserted int
+	if txErr := db.WithImmediateTx(ctx, a.dbConn, func(tx db.Execer) error {
+		n, err := db.InsertScheduleEntries(ctx, tx, entries)
+		inserted = n
+		return err
+	}); txErr != nil {
+		return 0, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("insert schedule: %v", txErr)}
+	}
+
+	// Defense-in-depth: contiguous laying cannot leave a hole, but verify before
+	// declaring the schedule complete in case of an insert/anchor regression.
+	firstStart := entries[0].StartMs
+	lastEnd := entries[len(entries)-1].StartMs + entries[len(entries)-1].DurationMs
+	if gaps, gapErr := db.ScheduleGaps(ctx, a.dbConn, channelID, firstStart, lastEnd); gapErr == nil && len(gaps) > 0 {
+		return 0, &adminHTTPError{Status: http.StatusInternalServerError, Code: "schedule_has_gaps", Message: "persisted schedule unexpectedly contains gaps"}
+	}
+	return inserted, nil
 }
 
 func (a *App) handleChannelList(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +545,8 @@ func (a *App) handleChannelList(w http.ResponseWriter, r *http.Request) {
 			ID:              c.ID,
 			DisplayName:     c.DisplayName,
 			Ordering:        c.Ordering,
+			ScheduleMode:    c.ScheduleMode,
+			SlotDurationMs:  c.SlotDurationMs,
 			Enabled:         c.Enabled,
 			HiddenFromGuide: c.HiddenFromGuide,
 			ArtworkURL:      c.ArtworkURL,
@@ -494,10 +796,16 @@ func (a *App) handleChannelPolicy(w http.ResponseWriter, r *http.Request) {
 
 	prefillMs := ch.PackagePrefillMs
 
+	playbackMode := string(ch.PlaybackMode)
+	if playbackMode == "" {
+		playbackMode = "packaged"
+	}
+
 	writeJSON(w, channelPolicyResponse{
 		ChannelID:              ch.ID,
-		PlaybackMode:           "packaged",
+		PlaybackMode:           playbackMode,
 		RequiredPackageProfile: profile,
+		AdaptiveBitrate:        db.ABRLadderEnabled(profile, ch.ABRLadder),
 		PackagePrefillMs:       prefillMs,
 		MediaKind:              string(db.NormalizeMediaKind(ch.MediaKind)),
 	})
@@ -605,7 +913,7 @@ func (a *App) handleChannelPolicyUpdate(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	updated, err := db.UpdateChannelPlaybackPolicy(r.Context(), a.dbConn, channelID, db.PlaybackModePackaged, profile, prefillMs, mediaKind)
+	updated, err := db.UpdateChannelPlaybackPolicy(r.Context(), a.dbConn, channelID, db.PlaybackModePackaged, profile, existing.ABRLadder, prefillMs, mediaKind)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
@@ -629,6 +937,7 @@ func (a *App) handleChannelPolicyUpdate(w http.ResponseWriter, r *http.Request) 
 		ChannelID:              channelID,
 		PlaybackMode:           "packaged",
 		RequiredPackageProfile: respProfile,
+		AdaptiveBitrate:        db.ABRLadderEnabled(respProfile, ch.ABRLadder),
 		PackagePrefillMs:       respPrefill,
 		MediaKind:              string(db.NormalizeMediaKind(ch.MediaKind)),
 	})

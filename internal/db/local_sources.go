@@ -67,8 +67,8 @@ func UpsertLocalMediaSource(ctx context.Context, conn *sql.DB, s LocalMediaSourc
 	if s.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
-	if s.MediaKind != "movies" && s.MediaKind != "shows" && s.MediaKind != "music" {
-		return nil, fmt.Errorf("mediaKind must be movies, shows, or music")
+	if s.MediaKind != "movies" && s.MediaKind != "shows" && s.MediaKind != "music" && s.MediaKind != "filler" {
+		return nil, fmt.Errorf("mediaKind must be movies, shows, music, or filler")
 	}
 	paths := normalizeLocalSourcePaths(s.Paths)
 	if len(paths) == 0 {

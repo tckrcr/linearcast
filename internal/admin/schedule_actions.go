@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+
+	"github.com/tckrcr/linearcast/internal/scheduler"
 )
 
 type scheduleEntryWriteRequest struct {
@@ -22,6 +24,16 @@ type scheduleWindowSaveOrderedRequest struct {
 
 type scheduleWindowSaveOrderedEntry struct {
 	MediaID string `json:"mediaId"`
+}
+
+type scheduleGapFillRequest struct {
+	MediaID  string `json:"mediaId"`
+	StartMs  int64  `json:"startMs"`
+	OffsetMs int64  `json:"offsetMs"`
+	// OffsetMode selects how the filler start offset is chosen. "" / "zero" use
+	// the client-provided OffsetMs as-is; "sequential" lets the server continue
+	// the filler rotation from the previous placement of the same asset.
+	OffsetMode string `json:"offsetMode"`
 }
 
 type scheduleEntryInsertRequest struct {
@@ -54,11 +66,94 @@ func scheduleServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "package_not_ready", err.Error(), hintPackageNotReady)
 	case errors.Is(err, errInsideScheduleEntry):
 		writeError(w, http.StatusConflict, "inside_schedule_entry", err.Error(), "Choose the existing entry start time or the next aligned boundary after it.")
+	case errors.Is(err, errNoScheduleGap):
+		writeError(w, http.StatusConflict, "no_schedule_gap", err.Error(), "Drop filler onto an open schedule gap with a 6-second-aligned boundary.")
+	case errors.Is(err, errFillerTooShort):
+		writeError(w, http.StatusConflict, "filler_too_short", err.Error(), "Choose a longer filler asset or an earlier filler offset.")
 	case errors.Is(err, errScheduleEntryLocked):
 		writeError(w, http.StatusConflict, "schedule_entry_locked", err.Error(), hintRefreshSchedule)
+	case errors.Is(err, errNotSlotGrid):
+		writeError(w, http.StatusConflict, "not_slot_grid", err.Error())
+	case errors.Is(err, scheduler.ErrNoReadyPackages):
+		writeError(w, http.StatusConflict, "no_ready_packages", "no eligible ready packaged media to recompose the schedule", hintPackageNotReady)
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 	}
+}
+
+func (a *App) handleChannelFillScheduleGap(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	channelID := r.PathValue("channelID")
+
+	var req scheduleGapFillRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	req.MediaID = strings.TrimSpace(req.MediaID)
+	if req.MediaID == "" {
+		writeError(w, http.StatusBadRequest, "missing_media_id", "mediaId is required")
+		return
+	}
+	if req.StartMs%segmentMs != 0 {
+		writeError(w, http.StatusBadRequest, "invalid_start_ms", "startMs must be aligned to the schedule segment grid", hintScheduleBoundary)
+		return
+	}
+	if req.OffsetMs < 0 || req.OffsetMs%segmentMs != 0 {
+		writeError(w, http.StatusBadRequest, "invalid_offset_ms", "offsetMs must be non-negative and aligned to the schedule segment grid", hintScheduleBoundary)
+		return
+	}
+	req.OffsetMode = strings.TrimSpace(req.OffsetMode)
+	switch req.OffsetMode {
+	case "", "zero", "sequential":
+	default:
+		writeError(w, http.StatusBadRequest, "invalid_offset_mode", "offsetMode must be empty, zero, or sequential")
+		return
+	}
+
+	res, err := a.schedule.FillGap(r.Context(), channelID, req)
+	if err != nil {
+		scheduleServiceError(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"channelID":      channelID,
+		"entryId":        res.EntryID,
+		"mediaId":        res.MediaID,
+		"startMs":        res.StartMs,
+		"endMs":          res.EndMs,
+		"durationMs":     res.DurationMs,
+		"offsetMs":       res.OffsetMs,
+		"packageProfile": res.PackageProfile,
+	})
+}
+
+// handleChannelRecomposeSlotGrid rebuilds a slot-grid channel's future schedule
+// gap-free in one shot (clear-after-now + server-side slot tiling). It is the
+// existing-channel edit-path replacement for one-gap-at-a-time FillGap.
+func (a *App) handleChannelRecomposeSlotGrid(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	channelID := r.PathValue("channelID")
+
+	res, err := a.schedule.RecomposeSlotGridFuture(r.Context(), channelID)
+	if err != nil {
+		scheduleServiceError(w, err)
+		return
+	}
+
+	note := ""
+	if res.Gappy {
+		note = "no usable filler; schedule rebuilt with gaps — attach a ready filler asset and recompose again"
+	}
+	writeJSON(w, map[string]any{
+		"channelID": channelID,
+		"fromMs":    res.FromMs,
+		"cleared":   res.Cleared,
+		"inserted":  res.Inserted,
+		"lastEndMs": res.LastEndMs,
+		"gappy":     res.Gappy,
+		"note":      note,
+	})
 }
 
 func (a *App) handleChannelSaveScheduleWindowOrdered(w http.ResponseWriter, r *http.Request) {

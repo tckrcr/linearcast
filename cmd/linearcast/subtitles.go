@@ -19,11 +19,16 @@ import (
 func (a *app) handleSubtitlePlaylist(w http.ResponseWriter, r *http.Request) {
 	channelID := r.PathValue("channelID")
 	language := r.PathValue("language")
-	if a.lookupChannelOr404(r.Context(), w, channelID) == nil {
+	rt := a.lookupChannelOr404(r.Context(), w, channelID)
+	if rt == nil {
+		return
+	}
+	if rt.PlaybackMode != db.PlaybackModePackaged {
+		http.NotFound(w, r)
 		return
 	}
 	profile := a.packagedProfile
-	if rt := a.channel(channelID); rt != nil && rt.RequiredPackageProfile != "" {
+	if rt.RequiredPackageProfile != "" {
 		profile = rt.RequiredPackageProfile
 	}
 

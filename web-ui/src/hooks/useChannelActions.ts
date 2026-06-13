@@ -412,7 +412,10 @@ export function profilesForMediaKind(
   mediaKind: string | undefined,
 ): string[] {
   const kind = normalizeChannelMediaKind(mediaKind);
-  return allowedProfiles.filter((profile) => normalizeChannelMediaKind(profileDetails[profile]?.mediaKind) === kind);
+  return allowedProfiles.filter((profile) => {
+    const detail = profileDetails[profile];
+    return normalizeChannelMediaKind(detail?.mediaKind) === kind && !(detail?.tags ?? []).includes("abr");
+  });
 }
 
 function msToHoursInput(value: number | null | undefined): string {

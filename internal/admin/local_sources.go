@@ -104,7 +104,7 @@ func (a *App) decodeLocalSourceRequest(w http.ResponseWriter, r *http.Request, i
 	}
 	kind := normalizeLocalMediaKind(req.MediaKind)
 	if kind == "" {
-		writeError(w, http.StatusBadRequest, "invalid_media_kind", "mediaKind must be movies, shows, or music")
+		writeError(w, http.StatusBadRequest, "invalid_media_kind", "mediaKind must be movies, shows, music, or filler")
 		return db.LocalMediaSource{}, false
 	}
 	paths, ok := a.validateLocalSourcePaths(w, req.Paths, false)
@@ -169,6 +169,8 @@ func normalizeLocalMediaKind(kind string) string {
 		return "shows"
 	case "music", "audio":
 		return "music"
+	case "filler":
+		return "filler"
 	default:
 		return ""
 	}
@@ -223,6 +225,13 @@ func (a *App) runLocalSourceScan(job *ingestJob, mediaKind string, paths []strin
 			job.Printf("error scanning %s: %v", path, err)
 			acc.Failed++
 			acc.Failures = append(acc.Failures, err.Error())
+			continue
+		}
+		if mediaKind == "filler" {
+			nowMs := a.now().UTC().UnixMilli()
+			if err := db.RegisterFillerAssetsFromDirectory(ctx, a.dbConn, path, nowMs); err != nil {
+				job.Printf("error registering filler assets for %s: %v", path, err)
+			}
 		}
 	}
 	switch {

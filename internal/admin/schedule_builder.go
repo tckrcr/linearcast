@@ -71,10 +71,26 @@ func (a *App) handleScheduleBuilderCreateChannel(w http.ResponseWriter, r *http.
 		return
 	}
 
-	packageResult, err := db.RequestMediaPackages(r.Context(), a.dbConn, req.MediaIDs, strings.TrimSpace(req.PackageProfile))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
-		return
+	playbackMode := strings.TrimSpace(req.PlaybackMode)
+	if ch, err := db.ChannelByID(r.Context(), a.dbConn, channelResp.ChannelID); err == nil && ch != nil {
+		playbackMode = string(ch.PlaybackMode)
+	}
+	// On-demand channels use ephemeral live sessions for unpackaged playback, so
+	// creation must NOT eagerly queue the whole channel — that is the point.
+	// Plex relay channels bypass linearcast packaging entirely.
+	packageResult := db.MediaPackageRequestResult{
+		Profile:        strings.TrimSpace(req.PackageProfile),
+		Queued:         []string{},
+		AlreadyPending: []string{},
+		AlreadyReady:   []string{},
+	}
+	if strings.TrimSpace(req.PrefillMode) != "on_demand" && playbackMode != string(db.PlaybackModePlexRelay) {
+		var err error
+		packageResult, err = db.RequestMediaPackages(r.Context(), a.dbConn, req.MediaIDs, strings.TrimSpace(req.PackageProfile))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			return
+		}
 	}
 	resp := scheduleBuilderCreateChannelResponse{
 		ChannelID:       channelResp.ChannelID,

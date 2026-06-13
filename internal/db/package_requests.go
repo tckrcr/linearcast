@@ -152,6 +152,69 @@ func RequestMediaPackages(ctx context.Context, conn *sql.DB, mediaIDs []string, 
 	return result, nil
 }
 
+// EnsurePendingPackages inserts a pending package row for each codec-passing
+// media id that has no package row yet for profile. Unlike RequestMediaPackages
+// it leaves every existing row untouched — ready, pending, processing, and
+// crucially failed. That makes it safe to call on the extender's tight demand
+// sweep: a permanently-failing on-demand program is enqueued once, not
+// re-requeued every tick. Returns the count of newly-queued media. The worker's
+// DiscoverCandidates branch-1 ("any pending package not needed by an eager
+// channel") picks these rows up for encoding.
+func EnsurePendingPackages(ctx context.Context, conn *sql.DB, mediaIDs []string, profile string) (int, error) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		profile = DefaultPackageProfile
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	nowMs := time.Now().UTC().UnixMilli()
+	queued := 0
+	seen := make(map[string]bool, len(mediaIDs))
+	for _, raw := range mediaIDs {
+		mediaID := strings.TrimSpace(raw)
+		if mediaID == "" || seen[mediaID] {
+			continue
+		}
+		seen[mediaID] = true
+
+		var codecPassed int64
+		err := tx.QueryRowContext(ctx, `SELECT codec_check_passed FROM media WHERE id = ?`, mediaID).Scan(&codecPassed)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && codecPassed != 1) {
+			continue
+		}
+		if err != nil {
+			return queued, err
+		}
+
+		var existing string
+		err = tx.QueryRowContext(ctx, `
+			SELECT status FROM media_packages
+			WHERE media_id = ? AND rendition_profile = ?`, mediaID, profile).Scan(&existing)
+		if err == nil {
+			continue // a row already exists in some state; leave it alone
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return queued, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			packageid.For(mediaID, profile), mediaID, profile, string(PackageStatusPending), nowMs, nowMs); err != nil {
+			return queued, err
+		}
+		metrics.PackageStateTransitionsTotal.WithLabelValues(profile, "missing", string(PackageStatusPending)).Inc()
+		queued++
+	}
+	if err := tx.Commit(); err != nil {
+		return queued, err
+	}
+	return queued, nil
+}
+
 // CancelMediaPackages marks pending and processing package rows as failed with
 // an operator-cancel reason. Pending rows stop being claimable immediately.
 // Processing rows rely on the packager worker's status monitor to interrupt
@@ -323,19 +386,27 @@ func scanPackageCancelTarget(row scanner) (packageCancelTarget, error) {
 // MediaPackageCandidates returns codec-passing media without a ready package
 // for the supplied profile. Pending/processing rows are included so operators
 
-// ClaimRequest is the input to ClaimPackage. EncoderID is "" for local
-// claims and a registered encoder ID for remote claims. LeaseTTL is required
-// when EncoderID is non-empty; it sets the initial lease_expires_ms on the
-// encoder_jobs row that ClaimPackage will insert in the same transaction.
+// ClaimRequest is the input to ClaimPackage. A claim carrying an EncoderID is
+// "leased": ClaimPackage inserts an encoder_jobs row (LeaseTTL is then
+// required) so the sweeper can reclaim the job if the encoder dies. This holds
+// for remote encoders and for the in-process local worker, which now claims as
+// its registered encoder rather than running lease-free.
 //
-// The concurrency cap is no longer a caller input: ClaimPackage reads the
-// limit from the encoder row (remote) or the local_worker_concurrency setting
-// (local) and applies it inside the same transaction.
+// Local distinguishes the in-process worker from a remote encoder for channel
+// encoder_policy only: the local worker sets Local even though it holds a
+// lease, so local_only channels still accept it and remote_only channels still
+// reject it. A claim with no EncoderID (legacy/one-shot) is lease-free and
+// always treated as local.
+//
+// The concurrency cap is not a caller input: ClaimPackage reads the limit from
+// the encoder row (leased) or the local_worker_concurrency setting (lease-free)
+// and applies it inside the same transaction.
 type ClaimRequest struct {
 	MediaID   string
 	Profile   string
 	PackageID string
 	EncoderID string
+	Local     bool
 	LeaseTTL  time.Duration
 	NowMs     int64
 }
@@ -361,9 +432,15 @@ func ClaimPackage(ctx context.Context, conn *sql.DB, req ClaimRequest) (bool, er
 	if req.MediaID == "" || req.Profile == "" || req.PackageID == "" {
 		return false, errors.New("media id, profile, and package id are required")
 	}
-	isRemote := req.EncoderID != ""
-	if isRemote && req.LeaseTTL <= 0 {
-		return false, errors.New("LeaseTTL is required for remote claims")
+	// leased drives the encoder_jobs lease, the per-encoder concurrency count,
+	// and encoder validation — true for remote encoders and for the local
+	// worker, which now claims as its registered encoder so the sweeper
+	// supervises it. isRemote drives only channel encoder_policy, so the local
+	// worker (Local=true) stays policy-local despite holding a lease.
+	leased := req.EncoderID != ""
+	isRemote := leased && !req.Local
+	if leased && req.LeaseTTL <= 0 {
+		return false, errors.New("LeaseTTL is required for an encoder claim")
 	}
 
 	tx, err := conn.BeginTx(ctx, nil)
@@ -372,7 +449,7 @@ func ClaimPackage(ctx context.Context, conn *sql.DB, req ClaimRequest) (bool, er
 	}
 	defer tx.Rollback()
 
-	if isRemote {
+	if leased {
 		if err := requireActiveEncoder(ctx, tx, req.EncoderID); err != nil {
 			return false, err
 		}
@@ -388,15 +465,15 @@ func ClaimPackage(ctx context.Context, conn *sql.DB, req ClaimRequest) (bool, er
 		return false, tx.Commit()
 	}
 
-	// Per-encoder (remote) or per-machine (local) concurrency cap.
-	maxCon, err := concurrencyCapForClaim(ctx, tx, isRemote, req.EncoderID)
+	// Per-encoder (leased) or per-machine (lease-free) concurrency cap.
+	maxCon, err := concurrencyCapForClaim(ctx, tx, leased, req.EncoderID)
 	if err != nil {
 		return false, err
 	}
 	if maxCon > 0 {
 		var active int
 		var countErr error
-		if isRemote {
+		if leased {
 			countErr = tx.QueryRowContext(ctx, `
 				SELECT COUNT(*) FROM encoder_jobs WHERE encoder_id = ?`,
 				req.EncoderID).Scan(&active)
@@ -414,7 +491,9 @@ func ClaimPackage(ctx context.Context, conn *sql.DB, req ClaimRequest) (bool, er
 			return false, tx.Commit()
 		}
 	} else if !isRemote {
-		// local_worker_concurrency=0 means "local worker disabled."
+		// A zero cap disables the local worker (its encoder concurrency=0, or
+		// no local encoder registered). Remote encoders with a zero cap are
+		// rejected at registration, so this guard is local-only.
 		return false, tx.Commit()
 	}
 
@@ -470,7 +549,7 @@ func ClaimPackage(ctx context.Context, conn *sql.DB, req ClaimRequest) (bool, er
 		metrics.PackageStateTransitionsTotal.WithLabelValues(req.Profile, metrics.PackageStatusLabel(status), string(PackageStatusProcessing)).Inc()
 	}
 
-	if isRemote {
+	if leased {
 		leaseExpires := req.NowMs + req.LeaseTTL.Milliseconds()
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO encoder_jobs (package_id, encoder_id, claimed_at_ms, lease_expires_ms, last_heartbeat_ms)

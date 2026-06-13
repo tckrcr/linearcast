@@ -8,7 +8,9 @@ After a fresh deploy the database is empty. The viewer at `/` will show a "no me
 
 Use the **Ingest** panel in `/admin` → Tools to ingest a media directory from the browser with a live log tail. `linearcast-ingest` remains available only as a recovery/bootstrap tool when the admin API is unavailable.
 
-Once ingest finishes, open `/admin` → Schedule Builder to create channels and queue packaging.
+Once ingest finishes, open `/admin` → Schedule Builder to create channels. Use
+Pre-encode or On-demand playback for packaged channels, or Plex relay for
+scheduled Plex playback that bypasses linearcast packaging.
 
 ## Add a channel
 
@@ -18,7 +20,7 @@ Use `/admin` → Schedule Builder for routine channel creation.
 
 ### Build a channel from a media server
 
-Connect Plex or Jellyfin in `/admin` → Tools, then browse and queue media from the connected library through the Schedule Builder. Connection credentials are stored in the database (set via the Tools panel), not in `.env`.
+Connect Plex or Jellyfin in `/admin` → Tools, then browse and queue media from the connected library through the Schedule Builder. Connection credentials are stored in the database (set via the Tools panel), not in `.env`. When Plex is connected, the builder exposes a Plex relay playback mode for Plex-imported video media.
 
 ### Ordering modes
 

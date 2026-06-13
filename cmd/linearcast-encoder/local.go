@@ -105,6 +105,7 @@ func runLocal(ctx context.Context, subcmd string, getenv func(string) string, ou
 		DB:         conn,
 		OutputRoot: lcfg.outputRoot,
 		WorkDir:    lcfg.workDir,
+		EncoderID:  encoderID,
 	}
 	fmt.Fprintf(out, "local encoder starting output=%s work=%s\n", lcfg.outputRoot, lcfg.workDir)
 	w.Run(sigCtx)

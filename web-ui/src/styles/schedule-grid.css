@@ -85,6 +85,10 @@
   position: relative;
   height: 110px;
   user-select: none;
+  /* Stretch to fill the scroll container so short schedules still have a
+     trailing drop area; dropping past the last entry appends to the end. */
+  min-width: 100%;
+  box-sizing: border-box;
 }
 
 .schedule-timeline-rail {
@@ -147,6 +151,31 @@
 .schedule-timeline-entry.is-now {
   border-color: var(--good);
   background: var(--good-bg);
+}
+
+.schedule-timeline-entry.is-filler {
+  background: var(--bg-elev-1, var(--bg-elev-2));
+  border-style: dashed;
+  color: var(--text-muted, var(--text));
+  cursor: default;
+  opacity: 0.85;
+}
+
+.schedule-timeline-entry.is-reorderable {
+  cursor: grab;
+}
+
+.schedule-timeline-entry.is-reorderable:active {
+  cursor: grabbing;
+}
+
+.schedule-timeline-entry.is-dragging {
+  opacity: 0.4;
+}
+
+.schedule-timeline-entry.is-drop-target {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 .schedule-timeline-entry-title {
@@ -213,6 +242,18 @@
   background: var(--good);
   pointer-events: none;
   z-index: 2;
+}
+
+.schedule-timeline-insert-marker {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 3px;
+  margin-left: -1px;
+  border-radius: 2px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 3;
 }
 
 /* Multi-channel Guide (EPG-style overview). */
@@ -296,6 +337,19 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.guide-channel-badge {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.7em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--bg, #111);
+  background: var(--accent, #6cf);
+  vertical-align: middle;
 }
 
 .guide-track {

@@ -126,7 +126,7 @@ func ChannelFillerAssetMediaExists(ctx context.Context, conn *sql.DB, channelID,
 	return true, nil
 }
 
-func ChannelFillerAssets(ctx context.Context, conn *sql.DB, channelID, renditionProfile string) ([]ChannelFillerAsset, error) {
+func ChannelFillerAssets(ctx context.Context, conn Execer, channelID, renditionProfile string) ([]ChannelFillerAsset, error) {
 	return queryRows(ctx, conn, scanChannelFillerAsset, `
 		SELECT cfa.channel_id, cfa.weight, cfa.enabled,
 		       fa.id, fa.media_id, fa.label, fa.kind, fa.enabled, fa.created_at_ms,
@@ -141,6 +141,96 @@ func ChannelFillerAssets(ctx context.Context, conn *sql.DB, channelID, rendition
 		WHERE cfa.channel_id = ?
 		ORDER BY cfa.enabled DESC, fa.enabled DESC, cfa.weight DESC, fa.label COLLATE NOCASE`,
 		renditionProfile, channelID)
+}
+
+// FillerAssetCandidate is a filler asset with per-profile package status,
+// used by the schedule-builder filler tab.
+type FillerAssetCandidate struct {
+	ID                 string
+	MediaID            string
+	Label              string
+	Kind               string
+	DurationMs         int64
+	PackageID          *string
+	PackageStatus      string
+	PackagedDurationMs *int64
+}
+
+// FillerAssetsForScheduleBuilder returns all enabled filler assets joined with
+// package status for the given profile. Used by the schedule-builder filler tab.
+func FillerAssetsForScheduleBuilder(ctx context.Context, conn *sql.DB, profile string) ([]FillerAssetCandidate, error) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		profile = DefaultPackageProfile
+	}
+	return queryRows(ctx, conn, scanFillerAssetCandidate(profile), `
+		SELECT fa.id, fa.media_id, fa.label, fa.kind, m.duration_ms,
+		       p.id, p.status, p.packaged_duration_ms
+		FROM filler_assets fa
+		JOIN media m ON m.id = fa.media_id
+		LEFT JOIN media_packages p
+		       ON p.media_id = m.id
+		      AND p.rendition_profile = ?
+		WHERE fa.enabled = 1
+		ORDER BY fa.label COLLATE NOCASE, fa.id`,
+		profile)
+}
+
+func scanFillerAssetCandidate(profile string) func(scanner) (FillerAssetCandidate, error) {
+	return func(row scanner) (FillerAssetCandidate, error) {
+		var c FillerAssetCandidate
+		var pkgID, pkgStatus sql.NullString
+		var pkgDur sql.NullInt64
+		if err := row.Scan(&c.ID, &c.MediaID, &c.Label, &c.Kind, &c.DurationMs,
+			&pkgID, &pkgStatus, &pkgDur); err != nil {
+			return FillerAssetCandidate{}, err
+		}
+		if pkgID.Valid {
+			v := pkgID.String
+			c.PackageID = &v
+		}
+		c.PackageStatus = "missing"
+		if pkgStatus.Valid {
+			c.PackageStatus = pkgStatus.String
+		}
+		if pkgDur.Valid {
+			v := pkgDur.Int64
+			c.PackagedDurationMs = &v
+		}
+		return c, nil
+	}
+}
+
+// RegisterFillerAssetsFromDirectory upserts a filler_assets row for every
+// video media row whose path is under dir. Existing rows are left unchanged
+// (INSERT OR IGNORE). Safe to call after each filler source scan.
+func RegisterFillerAssetsFromDirectory(ctx context.Context, conn *sql.DB, dir string, nowMs int64) error {
+	dir = strings.TrimRight(dir, "/")
+	rows, err := conn.QueryContext(ctx, `
+		SELECT id, COALESCE(NULLIF(TRIM(title), ''), id)
+		FROM media
+		WHERE path LIKE ? || '/%'
+		  AND codec_check_passed = 1
+		  AND COALESCE(media_kind, 'video') = 'video'`,
+		dir)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mediaID, label string
+		if err := rows.Scan(&mediaID, &label); err != nil {
+			continue
+		}
+		id := uuid.New().String()
+		if _, err := conn.ExecContext(ctx, `
+			INSERT OR IGNORE INTO filler_assets (id, media_id, label, kind, enabled, created_at_ms)
+			VALUES (?, ?, ?, 'filler', 1, ?)`,
+			id, mediaID, label, nowMs); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func scanFillerAsset(row scanner) (FillerAsset, error) {

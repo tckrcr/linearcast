@@ -110,6 +110,29 @@ func (a *App) handleEncoderSweeperSettingsUpdate(w http.ResponseWriter, r *http.
 	writeJSON(w, req)
 }
 
+func (a *App) handleOnDemandSessionSettings(w http.ResponseWriter, r *http.Request) {
+	s, err := db.GetOnDemandSessionSettings(r.Context(), a.dbConn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", "failed to read on-demand session settings")
+		return
+	}
+	writeJSON(w, s)
+}
+
+func (a *App) handleOnDemandSessionSettingsUpdate(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var req db.OnDemandSessionSettings
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if err := db.SetOnDemandSessionSettings(r.Context(), a.dbConn, req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_settings", err.Error())
+		return
+	}
+	writeJSON(w, req)
+}
+
 func normalizeSubtitleLanguagePreference(raw []string) ([]string, error) {
 	if len(raw) == 0 {
 		return nil, errSubtitleLangsRequired{}

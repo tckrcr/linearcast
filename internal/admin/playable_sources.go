@@ -30,6 +30,8 @@ type playableSource struct {
 	PackageCoverageMs     int64               `json:"packageCoverageMs,omitempty"`
 	PackageCoverageHours  float64             `json:"packageCoverageHours,omitempty"`
 	PackageProfile        string              `json:"packageProfile,omitempty"`
+	AdaptiveBitrate       bool                `json:"adaptiveBitrate"`
+	PrefillMode           string              `json:"prefillMode,omitempty"`
 	NowPlaying            *externalNowPlaying `json:"nowPlaying,omitempty"`
 }
 
@@ -48,17 +50,18 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				nowPlaying = nil
 			}
-			sources = append(sources, playableSource{
-				ID:           ch.ID,
-				DisplayName:  ch.DisplayName,
-				ArtworkURL:   artworkForExternalChannel(ch, nowPlaying),
-				Kind:         "live",
-				PlaybackType: "hls",
-				Status:       "live",
-				ManifestURL:  externalHLSManifestURL(ch.ID),
-				Enabled:      ch.Enabled,
-				NowPlaying:   nowPlaying,
-			})
+		sources = append(sources, playableSource{
+			ID:              ch.ID,
+			DisplayName:     ch.DisplayName,
+			ArtworkURL:      artworkForExternalChannel(ch, nowPlaying),
+			Kind:            "live",
+			PlaybackType:    "hls",
+			Status:          "live",
+			ManifestURL:     externalHLSManifestURL(ch.ID),
+			Enabled:         ch.Enabled,
+			AdaptiveBitrate: false,
+			NowPlaying:      nowPlaying,
+		})
 			continue
 		}
 		now, err := a.channelNowForRow(r.Context(), nowMs, ch, cacheByChannel[ch.ID])
@@ -82,6 +85,8 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 			PackageCoverageMs:     now.PackageCoverageMs,
 			PackageCoverageHours:  now.PackageCoverageHours,
 			PackageProfile:        now.PackageProfile,
+			AdaptiveBitrate:       now.AdaptiveBitrate,
+			PrefillMode:           now.PrefillMode,
 		})
 	}
 	writeJSON(w, playableSourcesResponse{

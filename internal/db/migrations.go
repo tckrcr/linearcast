@@ -953,6 +953,352 @@ func migrateV20toV21(db *sql.DB) error {
 	return nil
 }
 
+// migrateV21toV22 adds per-channel schedule mode fields. Existing channels
+// stay back-to-back; slot-grid channels opt in by setting schedule_mode and a
+// 6-second-aligned slot_duration_ms.
+func migrateV21toV22(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 22 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN schedule_mode TEXT NOT NULL DEFAULT 'back_to_back' CHECK (schedule_mode IN ('back_to_back', 'slot_grid'))`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add schedule_mode column: %w", err)
+		}
+	}
+	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN slot_duration_ms INTEGER CHECK (slot_duration_ms IS NULL OR (slot_duration_ms > 0 AND slot_duration_ms % 6000 = 0))`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add slot_duration_ms column: %w", err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '22' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// migrateV22toV23 widens local_media_sources.media_kind to include 'filler'
+// so directories of filler video clips can be imported and auto-registered as
+// filler_assets on each scan.
+func migrateV22toV23(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 23 {
+		return nil
+	}
+
+	if _, err := db.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer db.Exec(`PRAGMA foreign_keys = ON`)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE local_media_sources_new (
+			id            TEXT PRIMARY KEY,
+			name          TEXT NOT NULL,
+			media_kind    TEXT NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			updated_at_ms INTEGER NOT NULL,
+			CHECK (media_kind IN ('movies', 'shows', 'music', 'filler'))
+		)`,
+		`INSERT INTO local_media_sources_new (id, name, media_kind, created_at_ms, updated_at_ms)
+		 SELECT id, name, media_kind, created_at_ms, updated_at_ms FROM local_media_sources`,
+		`DROP TABLE local_media_sources`,
+		`ALTER TABLE local_media_sources_new RENAME TO local_media_sources`,
+		`UPDATE meta SET value = '23' WHERE key = 'schema_version'`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("v22->v23 step: %w (sql: %s)", err, stmt)
+		}
+	}
+	return tx.Commit()
+}
+
+// migrateV23toV24 adds the on-demand channel mode. The transient
+// channel_demand table is kept here for databases that already observed v24;
+// v25 drops it after live sessions replaced the demand-sweep shortcut.
+func migrateV23toV24(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 24 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN prefill_mode TEXT NOT NULL DEFAULT 'eager' CHECK (prefill_mode IN ('eager', 'on_demand'))`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add prefill_mode column: %w", err)
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS channel_demand (
+		channel_id   TEXT PRIMARY KEY,
+		last_seen_ms INTEGER NOT NULL,
+		FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("create channel_demand table: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '24' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+func migrateV24toV25(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 25 {
+		return nil
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS channel_demand`); err != nil {
+		return fmt.Errorf("drop channel_demand table: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '25' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// migrateV25toV26 adds schedule_entries.entry_kind ('primary' / 'filler'),
+// making filler an authoritative per-entry property instead of inferring it
+// from channel_media membership. Existing rows are backfilled to match the old
+// inference exactly: an entry is 'filler' iff its media is NOT in the channel's
+// channel_media chain (i.e. it is attached filler, not primary programming).
+// Idempotent: the column add is guarded against re-runs, and the backfill only
+// touches rows still at the 'primary' default.
+func migrateV25toV26(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 26 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE schedule_entries ADD COLUMN entry_kind TEXT NOT NULL DEFAULT 'primary' CHECK (entry_kind IN ('primary', 'filler'))`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add schedule_entries.entry_kind: %w", err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE schedule_entries SET entry_kind = 'filler'
+		WHERE entry_kind = 'primary'
+		  AND NOT EXISTS (
+			SELECT 1 FROM channel_media cm
+			WHERE cm.channel_id = schedule_entries.channel_id
+			  AND cm.media_id = schedule_entries.media_id
+		)`); err != nil {
+		return fmt.Errorf("backfill schedule_entries.entry_kind: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '26' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// migrateV26toV27 lowers the scheduler horizon default from 48h to 24h (and
+// low-water from 24h to 23h) on deployments still sitting on the old default.
+// Generating schedule past the EPG/guide visible window (24h) is wasted work.
+// Only rows still at the old default are touched, so an operator's custom values
+// are preserved; the low-water update additionally clamps any row that would
+// otherwise land >= the new horizon, keeping the low_water < horizon invariant.
+func migrateV26toV27(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 27 {
+		return nil
+	}
+	if _, err := db.Exec(`UPDATE settings SET value = '24'
+		WHERE key = 'scheduler_horizon_hours' AND value = '48'`); err != nil {
+		return fmt.Errorf("lower scheduler_horizon_hours default: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE settings SET value = '23'
+		WHERE key = 'scheduler_low_water_hours'
+		  AND CAST(value AS INTEGER) >= (
+			SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'scheduler_horizon_hours'
+		)`); err != nil {
+		return fmt.Errorf("clamp scheduler_low_water_hours below horizon: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '27' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// migrateV27toV28 adds media.source_ref for Plex rating keys and widens the
+// channels.playback_mode CHECK constraint to accept 'plex_relay'.
+//
+// The channels table must be recreated because SQLite does not support ALTER
+// TABLE to modify CHECK constraints. Foreign key enforcement is temporarily
+// disabled during the swap. Multiple Exec calls are safe here because
+// OpenReadWrite uses MaxOpenConns=1, so all PRAGMA/DDL statements land on the
+// same connection.
+func migrateV27toV28(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 28 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE media ADD COLUMN source_ref TEXT`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add media.source_ref: %w", err)
+		}
+	}
+	// Drop channels_new from any previous partial run so the CREATE TABLE
+	// below is idempotent across retries. The old channels table is untouched
+	// until the data copy succeeds, so a crash between CREATE and RENAME will
+	// leave channels intact for the next attempt.
+	if _, err := db.Exec(`DROP TABLE IF EXISTS channels_new`); err != nil {
+		return fmt.Errorf("drop stale channels_new: %w", err)
+	}
+
+	if _, err := db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		return fmt.Errorf("disable foreign_keys: %w", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE channels_new (
+			id               TEXT PRIMARY KEY,
+			display_name     TEXT NOT NULL,
+			source_directory TEXT NOT NULL,
+			ordering         TEXT NOT NULL,
+			enabled          INTEGER NOT NULL,
+			created_at_ms    INTEGER NOT NULL,
+			description      TEXT,
+			hidden_from_guide INTEGER NOT NULL DEFAULT 0,
+			artwork_url      TEXT,
+			playback_mode    TEXT NOT NULL DEFAULT 'packaged',
+			required_package_profile TEXT,
+			package_prefill_ms INTEGER,
+			encoder_policy TEXT,
+			media_kind TEXT NOT NULL DEFAULT 'video',
+			schedule_mode TEXT NOT NULL DEFAULT 'back_to_back',
+			slot_duration_ms INTEGER,
+			upstream_hls_url TEXT,
+			prefill_mode TEXT NOT NULL DEFAULT 'eager',
+			CHECK (enabled IN (0, 1)),
+			CHECK (hidden_from_guide IN (0, 1)),
+			CHECK (playback_mode IN ('generated', 'packaged', 'plex_relay')),
+			CHECK (package_prefill_ms IS NULL OR package_prefill_ms > 0),
+			CHECK (encoder_policy IS NULL OR encoder_policy IN ('any', 'remote_only', 'remote_preferred', 'local_only')),
+			CHECK (media_kind IN ('video', 'music')),
+			CHECK (schedule_mode IN ('back_to_back', 'slot_grid')),
+			CHECK (slot_duration_ms IS NULL OR (slot_duration_ms > 0 AND slot_duration_ms % 6000 = 0)),
+			CHECK (prefill_mode IN ('eager', 'on_demand'))
+		)
+	`); err != nil {
+		return fmt.Errorf("create channels_new: %w", err)
+	}
+	// Use explicit column lists so the INSERT matches by name, not by ordinal
+	// position. The old channels table has columns in a different order —
+	// columns added by ALTER TABLE (upstream_hls_url, schedule_mode,
+	// slot_duration_ms, prefill_mode) were appended at the end, while the
+	// new table defines them in the schema.sql order.
+	if _, err := db.Exec(`
+		INSERT INTO channels_new (
+			id, display_name, source_directory, ordering, enabled, created_at_ms,
+			description, hidden_from_guide, artwork_url, playback_mode,
+			required_package_profile, package_prefill_ms, encoder_policy, media_kind,
+			schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
+		)
+		SELECT
+			id, display_name, source_directory, ordering, enabled, created_at_ms,
+			description, hidden_from_guide, artwork_url, playback_mode,
+			required_package_profile, package_prefill_ms, encoder_policy, media_kind,
+			schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
+		FROM channels
+	`); err != nil {
+		return fmt.Errorf("copy channels to channels_new: %w", err)
+	}
+	if _, err := db.Exec(`DROP TABLE channels`); err != nil {
+		return fmt.Errorf("drop channels: %w", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE channels_new RENAME TO channels`); err != nil {
+		return fmt.Errorf("rename channels_new to channels: %w", err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		return fmt.Errorf("re-enable foreign_keys: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '28' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// migrateV28toV29 adds media.video_width, media.color_transfer, and
+// media.color_primaries so HDR sources can be detected reliably (smpte2084 /
+// arib-std-b67 transfer characteristics). Columns are nullable: existing rows
+// stay NULL until the next ingest re-probe backfills them.
+func migrateV28toV29(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 29 {
+		return nil
+	}
+	for _, col := range []string{
+		`ALTER TABLE media ADD COLUMN video_width INTEGER`,
+		`ALTER TABLE media ADD COLUMN color_transfer TEXT`,
+		`ALTER TABLE media ADD COLUMN color_primaries TEXT`,
+	} {
+		if _, err := db.Exec(col); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return fmt.Errorf("%s: %w", col, err)
+			}
+		}
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '29' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// migrateV29toV30 adds the canonical per-channel ABR ladder JSON array. Existing
+// channels keep single-profile behavior until an explicit ladder is written.
+func migrateV29toV30(db *sql.DB) error {
+	currentVersion, err := readSchemaVersion(db)
+	if err != nil {
+		return err
+	}
+	if currentVersion >= 30 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE channels ADD COLUMN abr_ladder_json TEXT`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add channels.abr_ladder_json: %w", err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE meta SET value = '30' WHERE key = 'schema_version'`); err != nil {
+		return fmt.Errorf("bump schema_version: %w", err)
+	}
+	return nil
+}
+
+// SetMediaSourceRef stores or clears the source_ref for the media row with the
+// given path. Used by the Plex scan flow after ingest to record the rating key.
+func SetMediaSourceRef(ctx context.Context, conn *sql.DB, path, sourceRef string) error {
+	_, err := conn.ExecContext(ctx, `UPDATE media SET source_ref = ? WHERE path = ?`, sourceRef, path)
+	if err != nil {
+		return fmt.Errorf("set media source_ref path=%q: %w", path, err)
+	}
+	return nil
+}
+
 func profileMediaKindsForMigration(conn *sql.DB) (map[string]MediaKind, error) {
 	out := map[string]MediaKind{
 		DefaultPackageProfile: MediaKindVideo,

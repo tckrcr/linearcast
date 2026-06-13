@@ -23,15 +23,15 @@ A normal deploy runs all of these together in a single Docker container.
 
 ## Quick Start
 
-You'll need Docker with Docker Compose and a media library reachable from the host. Pull the published image — no build step:
+You'll need Docker with Docker Compose and a media library reachable from the host. Build and run the single-container stack:
 
 ```sh
-cp deploy/docker-compose.image.yml docker-compose.yml
-cp deploy/.env.example .env   # set LINEARCAST_IMAGE, host paths, admin password
+cp deploy/.env.example .env   # set host paths and admin password
+docker compose build
 docker compose up -d
 ```
 
-Then open `/admin` to ingest media and build your first channel — see [docs/usage.md](docs/usage.md). Prefer to build from source? See [docs/deploy.md](docs/deploy.md).
+Then open `/admin` to ingest media and build your first channel — see [docs/usage.md](docs/usage.md). Deployment details live in [docs/deploy.md](docs/deploy.md).
 
 ## Documentation
 

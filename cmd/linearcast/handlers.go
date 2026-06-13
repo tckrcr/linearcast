@@ -24,5 +24,25 @@ func (a *app) lookupChannelOr404(ctx context.Context, w http.ResponseWriter, cha
 		http.NotFound(w, nil)
 		return nil
 	}
-	return a.channel(channelID)
+	if row.UpstreamHLSURL != nil {
+		http.NotFound(w, nil)
+		return nil
+	}
+	rt := &channelRuntime{
+		ID:                     row.ID,
+		DisplayName:            row.DisplayName,
+		PlaybackMode:           row.PlaybackMode,
+		RequiredPackageProfile: packagedProfileForChannel(*row, a.packagedProfile),
+		PrefillMode:            row.PrefillMode,
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.channels == nil {
+		a.channels = map[string]*channelRuntime{}
+	}
+	if existing := a.channels[channelID]; existing != nil {
+		return existing
+	}
+	a.channels[channelID] = rt
+	return rt
 }

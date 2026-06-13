@@ -184,7 +184,7 @@ func walkMedia(dir string) ([]string, error) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(p))
-		if ext == ".mkv" || ext == ".mp4" {
+		if ext == ".mkv" || ext == ".mp4" || ext == ".webm" {
 			paths = append(paths, p)
 		}
 		return nil
@@ -206,7 +206,7 @@ func CountMediaFiles(dir string) (int, error) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(p))
-		if ext == ".mkv" || ext == ".mp4" {
+		if ext == ".mkv" || ext == ".mp4" || ext == ".webm" {
 			count++
 		}
 		return nil
@@ -220,11 +220,14 @@ type ffprobeOutput struct {
 		FormatName string `json:"format_name"`
 	} `json:"format"`
 	Streams []struct {
-		CodecType   string `json:"codec_type"`
-		CodecName   string `json:"codec_name"`
-		Profile     string `json:"profile"`
-		Height      int64  `json:"height"`
-		Disposition struct {
+		CodecType      string `json:"codec_type"`
+		CodecName      string `json:"codec_name"`
+		Profile        string `json:"profile"`
+		Width          int64  `json:"width"`
+		Height         int64  `json:"height"`
+		ColorTransfer  string `json:"color_transfer"`
+		ColorPrimaries string `json:"color_primaries"`
+		Disposition    struct {
 			Default     int `json:"default"`
 			AttachedPic int `json:"attached_pic"`
 		} `json:"disposition"`
@@ -284,7 +287,10 @@ func ffprobeFile(ctx context.Context, path string) (codec.Probe, int64, error) {
 	v := raw.Streams[bestVideoIdx]
 	a := raw.Streams[bestAudioIdx]
 	probe.VideoCodec = strings.ToLower(v.CodecName)
+	probe.VideoWidth = v.Width
 	probe.VideoHeight = v.Height
+	probe.ColorTransfer = strings.ToLower(v.ColorTransfer)
+	probe.ColorPrimaries = strings.ToLower(v.ColorPrimaries)
 	probe.AudioCodec = canonicalAudio(a.CodecName, a.Profile)
 
 	return probe, int64(durSecs * 1000), nil
@@ -314,7 +320,7 @@ func containerFromFormat(formatName, path string) string {
 		}
 	}
 	switch strings.ToLower(strings.TrimPrefix(filepath.Ext(path), ".")) {
-	case "mkv":
+	case "mkv", "webm":
 		return "mkv"
 	case "mp4", "m4v", "mov":
 		return "mp4"
@@ -330,7 +336,10 @@ type mediaRow struct {
 	DurationMs       int64
 	Container        string
 	VideoCodec       string
+	VideoWidth       int64
 	VideoHeight      int64
+	ColorTransfer    string
+	ColorPrimaries   string
 	AudioCodec       string
 	CodecCheckPassed bool
 	CodecCheckReason string
@@ -347,7 +356,10 @@ func mediaRowFor(path string, p codec.Probe, durMs int64, passed bool, reason st
 		DurationMs:       durMs,
 		Container:        p.Container,
 		VideoCodec:       p.VideoCodec,
+		VideoWidth:       p.VideoWidth,
 		VideoHeight:      p.VideoHeight,
+		ColorTransfer:    p.ColorTransfer,
+		ColorPrimaries:   p.ColorPrimaries,
 		AudioCodec:       p.AudioCodec,
 		CodecCheckPassed: passed,
 		CodecCheckReason: reason,
@@ -388,25 +400,42 @@ func upsertMedia(conn *sql.DB, m mediaRow) error {
 	if m.MediaKind != "" {
 		kind = m.MediaKind
 	}
+	var width any
+	if m.VideoWidth > 0 {
+		width = m.VideoWidth
+	}
+	var transfer any
+	if m.ColorTransfer != "" {
+		transfer = m.ColorTransfer
+	}
+	var primaries any
+	if m.ColorPrimaries != "" {
+		primaries = m.ColorPrimaries
+	}
 	_, err := conn.Exec(`
         INSERT INTO media (id, path, directory, title, scheduling_group, duration_ms, container,
-                           video_codec, video_height, audio_codec, codec_check_passed, codec_check_reason,
+                           video_codec, video_width, video_height, color_transfer, color_primaries,
+                           audio_codec, codec_check_passed, codec_check_reason,
                            ingested_at_ms, media_kind)
-        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             directory = excluded.directory,
             title = excluded.title,
             duration_ms = excluded.duration_ms,
             container = excluded.container,
             video_codec = excluded.video_codec,
+            video_width = excluded.video_width,
             video_height = excluded.video_height,
+            color_transfer = excluded.color_transfer,
+            color_primaries = excluded.color_primaries,
             audio_codec = excluded.audio_codec,
             codec_check_passed = excluded.codec_check_passed,
             codec_check_reason = excluded.codec_check_reason,
             ingested_at_ms = excluded.ingested_at_ms,
             media_kind = excluded.media_kind`,
 		m.ID, m.Path, m.Directory, title, m.DurationMs, m.Container,
-		m.VideoCodec, m.VideoHeight, m.AudioCodec, passed, reason, m.IngestedAtMs, kind)
+		m.VideoCodec, width, m.VideoHeight, transfer, primaries,
+		m.AudioCodec, passed, reason, m.IngestedAtMs, kind)
 	return err
 }
 

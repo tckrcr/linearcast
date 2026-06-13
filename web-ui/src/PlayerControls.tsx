@@ -2,12 +2,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { SubtitleSettings } from "./types";
 
 type SubTrack = { index: number; label: string; language: string };
+type BurnTrack = { language: string; label: string; streamIndex: number; forced: boolean };
+type BurnTrackResponse = { activeLanguage?: string; tracks?: BurnTrack[] };
 
 type Props = {
+  channelID: string;
   videoRef: React.RefObject<HTMLVideoElement | null>;
   visible: boolean;
   muted: boolean;
+  abrMode: "best" | "saver";
+  abrAvailable: boolean;
   onMutedChange: (muted: boolean) => void;
+  onAbrModeChange: (mode: "best" | "saver") => void;
 };
 
 type State = {
@@ -23,15 +29,21 @@ const initialState: State = {
 };
 
 export function PlayerControls({
+  channelID,
   videoRef,
   visible,
   muted,
+  abrMode,
+  abrAvailable,
   onMutedChange,
+  onAbrModeChange,
 }: Props) {
   const [state, setState] = useState<State>(initialState);
   const [fullscreen, setFullscreen] = useState(false);
   const [subTracks, setSubTracks] = useState<SubTrack[]>([]);
   const [activeSubIdx, setActiveSubIdx] = useState<number>(-1);
+  const [burnTracks, setBurnTracks] = useState<BurnTrack[]>([]);
+  const [activeBurnLang, setActiveBurnLang] = useState<string>("");
   const [subMenuOpen, setSubMenuOpen] = useState(false);
   const subMenuRef = useRef<HTMLDivElement>(null);
   const [subSettings, setSubSettings] = useState<SubtitleSettings | null>(null);
@@ -134,6 +146,23 @@ export function PlayerControls({
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    if (!channelID) {
+      setBurnTracks([]);
+      setActiveBurnLang("");
+      return;
+    }
+    const ac = new AbortController();
+    fetch(`/hls/channel/${encodeURIComponent(channelID)}/subtitles`, { cache: "no-store", signal: ac.signal })
+      .then(r => r.ok ? r.json() : null)
+      .then((data: BurnTrackResponse | null) => {
+        setBurnTracks(data?.tracks ?? []);
+        setActiveBurnLang(data?.activeLanguage ?? "");
+      })
+      .catch(() => {});
+    return () => ac.abort();
+  }, [channelID]);
+
   const selectSubTrack = useCallback((idx: number) => {
     const video = videoRef.current;
     if (!video) return;
@@ -143,6 +172,34 @@ export function PlayerControls({
     }
     setActiveSubIdx(idx);
   }, [videoRef]);
+
+  const setBurnSubtitle = useCallback((language: string) => {
+    if (!channelID) return;
+    fetch(`/hls/channel/${encodeURIComponent(channelID)}/subtitles`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ language }),
+    })
+      .then(r => r.ok ? r.json() : Promise.reject(new Error("subtitle update failed")))
+      .then((data: BurnTrackResponse) => {
+        setActiveBurnLang(data.activeLanguage ?? language);
+      })
+      .catch(() => {});
+  }, [channelID]);
+
+  const turnSubtitlesOff = useCallback(() => {
+    selectSubTrack(-1);
+    if (activeBurnLang) {
+      setBurnSubtitle("");
+      setActiveBurnLang("");
+    }
+  }, [activeBurnLang, selectSubTrack, setBurnSubtitle]);
+
+  const selectBurnTrack = useCallback((language: string) => {
+    selectSubTrack(-1);
+    setActiveBurnLang(language);
+    setBurnSubtitle(language);
+  }, [selectSubTrack, setBurnSubtitle]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -183,15 +240,15 @@ export function PlayerControls({
       </div>
 
       <div className="tv-controls-right">
-      {subTracks.length > 0 && (
+      {(subTracks.length > 0 || burnTracks.length > 0) && (
         <div className="tv-controls-sub" ref={subMenuRef}>
           {subMenuOpen && (
             <div className="tv-controls-sub-menu" role="menu">
               <button
                 type="button"
                 role="menuitem"
-                className={`tv-controls-sub-option${activeSubIdx < 0 ? " is-active" : ""}`}
-                onClick={() => { selectSubTrack(-1); setSubMenuOpen(false); }}
+                className={`tv-controls-sub-option${activeSubIdx < 0 && !activeBurnLang ? " is-active" : ""}`}
+                onClick={() => { turnSubtitlesOff(); setSubMenuOpen(false); }}
               >
                 Off
               </button>
@@ -200,8 +257,19 @@ export function PlayerControls({
                   key={t.index}
                   type="button"
                   role="menuitem"
-                  className={`tv-controls-sub-option${activeSubIdx === t.index ? " is-active" : ""}`}
-                  onClick={() => { selectSubTrack(t.index); setSubMenuOpen(false); }}
+                  className={`tv-controls-sub-option${activeSubIdx === t.index && !activeBurnLang ? " is-active" : ""}`}
+                  onClick={() => { setActiveBurnLang(""); setBurnSubtitle(""); selectSubTrack(t.index); setSubMenuOpen(false); }}
+                >
+                  {t.label}
+                </button>
+              ))}
+              {burnTracks.map(t => (
+                <button
+                  key={`burn-${t.language}-${t.streamIndex}`}
+                  type="button"
+                  role="menuitem"
+                  className={`tv-controls-sub-option${activeBurnLang === t.language ? " is-active" : ""}`}
+                  onClick={() => { selectBurnTrack(t.language); setSubMenuOpen(false); }}
                 >
                   {t.label}
                 </button>
@@ -210,15 +278,17 @@ export function PlayerControls({
           )}
           <button
             type="button"
-            className={`tv-controls-btn${activeSubIdx >= 0 ? " is-active" : ""}`}
+            className={`tv-controls-btn${activeSubIdx >= 0 || activeBurnLang ? " is-active" : ""}`}
             aria-label="Subtitles"
             aria-expanded={subMenuOpen}
             aria-haspopup="menu"
-            title={activeSubIdx >= 0 ? subTracks.find(t => t.index === activeSubIdx)?.label ?? "Subtitles on" : "Subtitles off"}
+            title={activeBurnLang ? burnTracks.find(t => t.language === activeBurnLang)?.label ?? "Subtitles on" : activeSubIdx >= 0 ? subTracks.find(t => t.index === activeSubIdx)?.label ?? "Subtitles on" : "Subtitles off"}
             onClick={() => {
-              if (subTracks.length === 1) {
-                if (activeSubIdx >= 0) selectSubTrack(-1);
-                else selectSubTrack(subTracks[0].index);
+              const totalTracks = subTracks.length + burnTracks.length;
+              if (totalTracks === 1) {
+                if (activeSubIdx >= 0 || activeBurnLang) turnSubtitlesOff();
+                else if (subTracks.length === 1) selectSubTrack(subTracks[0].index);
+                else selectBurnTrack(burnTracks[0].language);
               } else {
                 setSubMenuOpen(o => !o);
               }
@@ -229,10 +299,19 @@ export function PlayerControls({
         </div>
       )}
 
+      {abrAvailable && (
+        <button
+          type="button"
+          className={`tv-controls-btn${abrMode === "saver" ? " is-active" : ""}`}
+          onClick={() => onAbrModeChange(abrMode === "best" ? "saver" : "best")}
+          aria-label={abrMode === "saver" ? "Data Saver" : "Best Available"}
+          title={abrMode === "saver" ? "Quality: Data Saver — tap for Best Available" : "Quality: Best Available — tap for Data Saver"}
+        >
+          {abrMode === "saver" ? "SD" : "HD"}
+        </button>
+      )}
+
       <button
-        type="button"
-        className="tv-controls-btn"
-        onClick={() => onMutedChange(!muted)}
         aria-label={muted ? "Unmute" : "Mute"}
       >
         {muted ? "🔇" : "🔊"}

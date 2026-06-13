@@ -201,8 +201,9 @@ func EligibleReadyPackagedChannelMedia(ctx context.Context, conn Execer, channel
 	rows, err := queryRows(ctx, conn, scanValue(scanMedia), `
         SELECT m.id, m.path, m.directory, m.title, m.scheduling_group, m.user_preference,
                COALESCE(p.packaged_duration_ms, m.duration_ms) AS duration_ms,
-               m.container, m.video_codec, m.video_height, m.audio_codec,
-               m.codec_check_passed, m.codec_check_reason, m.ingested_at_ms, m.media_kind
+               m.container, m.video_codec, m.video_width, m.video_height,
+               m.color_transfer, m.color_primaries, m.audio_codec,
+               m.codec_check_passed, m.codec_check_reason, m.ingested_at_ms, m.media_kind, m.source_ref
         FROM channel_media cm
         JOIN media m ON m.id = cm.media_id
         JOIN channels c ON c.id = cm.channel_id

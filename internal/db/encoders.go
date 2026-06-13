@@ -250,35 +250,6 @@ func ListEncoderJobSummaries(ctx context.Context, conn *sql.DB) ([]EncoderJobSum
 		 ORDER BY j.claimed_at_ms`)
 }
 
-// LocalWorkerJob is the read-side view of a job currently being processed by
-// the local packager-worker. Local jobs have no encoder_jobs row (leases are
-// remote-only in v1), so this query identifies them as processing packages
-// without a matching lease.
-type LocalWorkerJob struct {
-	PackageID   string
-	MediaID     string
-	MediaTitle  string
-	Profile     string
-	ClaimedAtMs int64
-}
-
-// ListLocalWorkerJobs returns every media_packages row in 'processing' that
-// has no matching encoder_jobs lease. These are jobs being handled by the
-// local packager-worker goroutines. Stale rows (left behind by a crashed
-// worker) are included; callers should filter by updated_at_ms if they want
-// to exclude them.
-func ListLocalWorkerJobs(ctx context.Context, conn *sql.DB) ([]LocalWorkerJob, error) {
-	return queryRows(ctx, conn, scanLocalWorkerJob, `
-		SELECT p.id, p.media_id, m.title, p.rendition_profile, p.updated_at_ms
-		  FROM media_packages p
-		  LEFT JOIN media m ON m.id = p.media_id
-		 WHERE p.status = ?
-		   AND NOT EXISTS (
-		       SELECT 1 FROM encoder_jobs j WHERE j.package_id = p.id
-		   )
-		 ORDER BY p.updated_at_ms DESC`, string(PackageStatusProcessing))
-}
-
 // UpdateEncoderCapabilities replaces the opaque capabilities JSON and marks
 // the encoder online. The admin server uses this when an encoder reports host
 // metadata via the bearer-auth ping path.
@@ -351,18 +322,6 @@ func scanEncoderJobSummary(row scanner) (EncoderJobSummary, error) {
 	return j, nil
 }
 
-func scanLocalWorkerJob(row scanner) (LocalWorkerJob, error) {
-	var j LocalWorkerJob
-	var title sql.NullString
-	if err := row.Scan(&j.PackageID, &j.MediaID, &title, &j.Profile, &j.ClaimedAtMs); err != nil {
-		return LocalWorkerJob{}, err
-	}
-	if title.Valid {
-		j.MediaTitle = title.String
-	}
-	return j, nil
-}
-
 type channelEncoderPolicy struct {
 	channelID string
 	policy    sql.NullString
@@ -413,12 +372,13 @@ func hashAPIKey(raw string) string {
 }
 
 // concurrencyCapForClaim returns the active concurrency cap for a claim being
-// processed inside tx. For both remote and local claims the cap lives in the
-// encoder row's concurrency column. For local claims (EncoderID==""), the
-// local encoder row is found via the local_encoder_id settings key; if no
-// local encoder has registered yet, returns 0 (no claims allowed).
-func concurrencyCapForClaim(ctx context.Context, tx *sql.Tx, isRemote bool, encoderID string) (int, error) {
-	if isRemote {
+// processed inside tx. The cap always lives in an encoder row's concurrency
+// column. A leased claim (EncoderID set — remote, or the local worker claiming
+// as its registered encoder) reads its own row directly. A lease-free claim
+// (EncoderID=="") finds the local encoder row via the local_encoder_id settings
+// key; if no local encoder has registered yet, returns 0 (no claims allowed).
+func concurrencyCapForClaim(ctx context.Context, tx *sql.Tx, leased bool, encoderID string) (int, error) {
+	if leased {
 		var n int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT concurrency FROM encoders WHERE id = ?`, encoderID).Scan(&n); err != nil {
@@ -770,6 +730,80 @@ func LeaseExpiredJobs(ctx context.Context, conn *sql.DB, nowMs int64, maxAttempt
 		})
 	}
 	return results, nil
+}
+
+// RequeueEncoderJobs force-recovers every lease held by encoderID without
+// waiting for it to expire: each still-processing package goes back to pending
+// (or failed past maxAttempts) and its lease row is dropped. The local worker
+// calls this at startup so a redeploy mid-encode resumes within a poll interval
+// instead of waiting a full lease TTL for the sweeper. It is safe because a
+// freshly-started worker holds no live jobs, so every lease under its ID is an
+// orphan from its previous process. Reuses the same per-lease transition as the
+// sweeper (expireOneLease), which re-checks status, so a job that already
+// finished just has its lease cleaned up.
+func RequeueEncoderJobs(ctx context.Context, conn *sql.DB, encoderID string, maxAttempts int, nowMs int64) ([]LeaseExpiryResult, error) {
+	candidates, err := queryRows(ctx, conn, scanLeaseExpiryCandidate, `
+		SELECT package_id, encoder_id
+		  FROM encoder_jobs
+		 WHERE encoder_id = ?
+		 ORDER BY claimed_at_ms`, encoderID)
+	if err != nil {
+		return nil, err
+	}
+	var results []LeaseExpiryResult
+	for _, c := range candidates {
+		newStatus, attempts, err := expireOneLease(ctx, conn, c.packageID, maxAttempts, nowMs)
+		if err != nil {
+			return results, fmt.Errorf("requeue lease %s: %w", c.packageID, err)
+		}
+		if newStatus == "" {
+			continue
+		}
+		results = append(results, LeaseExpiryResult{
+			PackageID: c.packageID,
+			EncoderID: c.encoderID,
+			NewStatus: newStatus,
+			Attempts:  attempts,
+		})
+	}
+	return results, nil
+}
+
+// ClearEncoderLease deletes the encoder_jobs lease for a package, if any. The
+// local worker calls it once a job reaches a terminal state; remote completion
+// (CompleteEncoderJob/FailEncoderJob) deletes the lease inline instead. A
+// lingering lease is harmless — the sweeper's expireOneLease re-checks status
+// and drops it — but clearing it promptly keeps the active-job count accurate.
+// Idempotent.
+func ClearEncoderLease(ctx context.Context, conn *sql.DB, packageID string) error {
+	_, err := conn.ExecContext(ctx, `DELETE FROM encoder_jobs WHERE package_id = ?`, packageID)
+	return err
+}
+
+// RequeueLeaselessProcessing recovers processing packages that have no
+// encoder_jobs lease — the pre-lease "local worker" rows. Since every claim now
+// inserts a lease, this only ever finds rows stranded before the lease model
+// shipped; it is a no-op on every startup once that backlog has drained.
+//
+// TODO(transitional): delete this and its caller once the lease-model deploy
+// has cleared pre-lease processing orphans.
+func RequeueLeaselessProcessing(ctx context.Context, conn *sql.DB, maxAttempts int, nowMs int64) (int64, error) {
+	ids, err := queryRows(ctx, conn, scanString, `
+		SELECT id FROM media_packages mp
+		WHERE mp.status = ?
+		  AND NOT EXISTS (SELECT 1 FROM encoder_jobs ej WHERE ej.package_id = mp.id)`,
+		string(PackageStatusProcessing))
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	for _, id := range ids {
+		if _, err := MarkPackageFailedWithKind(ctx, conn, id, "transient", "pre-lease processing orphan requeued at startup", maxAttempts, nowMs); err != nil {
+			return count, fmt.Errorf("requeue leaseless %s: %w", id, err)
+		}
+		count++
+	}
+	return count, nil
 }
 
 func expireOneLease(ctx context.Context, conn *sql.DB, packageID string, maxAttempts int, nowMs int64) (PackageStatus, int, error) {

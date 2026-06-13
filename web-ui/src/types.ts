@@ -43,6 +43,9 @@ export type ChannelNow = {
   hiddenFromGuide: boolean;
   ordering: string;
   mediaKind: "video" | "music" | string;
+  scheduleMode?: "back_to_back" | "slot_grid" | string;
+  slotDurationMs?: number;
+  prefillMode?: "eager" | "on_demand" | string;
   status: ChannelStatus;
   current: MediaWindow | null;
   next: MediaWindow | null;
@@ -53,6 +56,7 @@ export type ChannelNow = {
   packageCoverageHours: number;
   packageReadyCount: number;
   packageProfile: string;
+  playbackMode?: "packaged" | "plex_relay" | string;
   isExternal?: boolean;
   upstreamHlsUrl?: string;
   nowPlaying?: NowPlaying;
@@ -80,6 +84,8 @@ export type PlayableSource = {
   packageCoverageMs?: number;
   packageCoverageHours?: number;
   packageProfile?: string;
+  adaptiveBitrate?: boolean;
+  prefillMode?: "eager" | "on_demand" | string;
   nowPlaying?: NowPlaying;
 };
 
@@ -106,6 +112,7 @@ export type GuideChannel = {
   artworkUrl?: string;
   status: ChannelStatus;
   isExternal?: boolean;
+  prefillMode?: "eager" | "on_demand" | string;
   nowPlaying?: NowPlaying;
   // End of the channel's last scheduled entry; used to stop paging the guide
   // past where a schedule has actually been built.
@@ -126,6 +133,8 @@ export type ChannelSummary = {
   artworkUrl?: string;
   enabled: boolean;
   hiddenFromGuide: boolean;
+  scheduleMode?: "back_to_back" | "slot_grid" | string;
+  slotDurationMs?: number;
   mediaKind: "video" | "music" | string;
 };
 
@@ -153,10 +162,20 @@ export type EncoderSweeperSettings = {
   maxAttempts: number;
 };
 
+export type OnDemandSessionSettings = {
+  graceSeconds: number;
+  maxConcurrent: number;
+  evictIdleSeconds: number;
+  stallTimeoutSeconds: number;
+  restartBudget: number;
+  keepaliveCeilingSec: number;
+};
+
 export type ChannelPolicy = {
   channelId: string;
   playbackMode: string;
   requiredPackageProfile: string;
+  adaptiveBitrate: boolean;
   packagePrefillMs: number | null;
   mediaKind: "video" | "music" | string;
 };
@@ -292,10 +311,28 @@ export type JellyfinStatus = {
 export type LocalMediaSource = {
   id: string;
   name: string;
-  mediaKind: "movies" | "shows" | "music";
+  mediaKind: "movies" | "shows" | "music" | "filler";
   paths: string[];
   createdAtMs: number;
   updatedAtMs: number;
+};
+
+export type FillerAssetCandidateItem = {
+  id: string;
+  mediaId: string;
+  label: string;
+  kind: "filler" | "bumper" | "station_id" | string;
+  durationMs: number;
+  packageId?: string;
+  packageStatus: string;
+  packageReady: boolean;
+  packagedDurationMs?: number;
+};
+
+export type FillerAssetCandidateList = {
+  profile: string;
+  count: number;
+  assets: FillerAssetCandidateItem[];
 };
 
 export type ScheduleEntry = {
@@ -393,6 +430,7 @@ export type PackageProfile = {
   name: string;
   label: string;
   description: string;
+  tags?: string[];
   mediaKind?: "video" | "music" | string;
   isBuiltin?: boolean;
   disabled?: boolean;
@@ -610,7 +648,12 @@ export type ScheduleEditTarget =
 export type DraftChannelConfig = {
   packageProfile: string;
   displayName: string;
-  onImported: (channelId: string) => void;
+  playbackMode?: "packaged" | "plex_relay";
+  scheduleMode?: "back_to_back" | "slot_grid" | string;
+  slotDurationMs?: number;
+  prefillMode?: "eager" | "on_demand";
+  adaptiveBitrate?: string;
+  onImported: (channelId: string, result: { scheduleMode?: "back_to_back" | "slot_grid" | string }) => void;
 };
 
 export type ScheduleInsertItem = {

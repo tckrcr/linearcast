@@ -67,6 +67,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/channels/{channelID}/extend", a.handleChannelExtend)
 	mux.HandleFunc("DELETE /api/channels/{channelID}/schedule", a.handleChannelClearSchedule)
 	mux.HandleFunc("DELETE /api/channels/{channelID}/schedule/range", a.handleChannelDeleteScheduleRange)
+	mux.HandleFunc("POST /api/channels/{channelID}/schedule/gaps/fill", a.handleChannelFillScheduleGap)
+	mux.HandleFunc("POST /api/channels/{channelID}/schedule/recompose", a.handleChannelRecomposeSlotGrid)
 	mux.HandleFunc("PUT /api/channels/{channelID}/schedule/window/order", a.handleChannelSaveScheduleWindowOrdered)
 	mux.HandleFunc("POST /api/channels/{channelID}/schedule/entries", a.handleChannelUpsertScheduleEntry)
 	mux.HandleFunc("POST /api/channels/{channelID}/schedule/entries/{entryId}/after", a.handleChannelInsertScheduleEntryAfter)
@@ -100,6 +102,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/media/package/cancel", a.handleMediaPackageCancel)
 	mux.HandleFunc("GET /api/channels/{channelID}/profile-migration", a.handleChannelProfileMigrationStatus)
 	mux.HandleFunc("POST /api/channels/{channelID}/profile-migration", a.handleChannelProfileMigrationQueue)
+	mux.HandleFunc("GET /api/schedule-builder/filler-candidates", a.handleScheduleBuilderFillerCandidates)
 	mux.HandleFunc("GET /api/filler-assets", a.handleFillerAssets)
 	mux.HandleFunc("POST /api/filler-assets", a.handleFillerAssetCreate)
 	mux.HandleFunc("GET /api/admin/chain-integrity", a.handleChainIntegrity)
@@ -127,6 +130,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/admin/scheduler-tunables", a.handleSchedulerTunablesUpdate)
 	mux.HandleFunc("GET /api/admin/encoder-sweeper-settings", a.handleEncoderSweeperSettings)
 	mux.HandleFunc("PUT /api/admin/encoder-sweeper-settings", a.handleEncoderSweeperSettingsUpdate)
+	mux.HandleFunc("GET /api/admin/on-demand-session-settings", a.handleOnDemandSessionSettings)
+	mux.HandleFunc("PUT /api/admin/on-demand-session-settings", a.handleOnDemandSessionSettingsUpdate)
 
 	// Remote encoder polling API (bearer-token auth via /api/encoder/* prefix).
 	mux.HandleFunc("GET /api/encoder/ping", a.handleEncoderPing)

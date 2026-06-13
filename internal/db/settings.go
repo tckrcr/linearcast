@@ -330,11 +330,121 @@ const (
 	encoderMaxAttemptsSettingKey          = "encoder_max_attempts"
 )
 
+const (
+	onDemandGraceSecondsSettingKey           = "on_demand_grace_seconds"
+	onDemandMaxConcurrentSettingKey          = "on_demand_max_concurrent"
+	onDemandEvictIdleSecondsSettingKey       = "on_demand_evict_idle_seconds"
+	onDemandStallTimeoutSecondsSettingKey    = "on_demand_stall_timeout_seconds"
+	onDemandRestartBudgetSettingKey          = "on_demand_restart_budget"
+	onDemandKeepaliveCeilingSecSettingKey    = "on_demand_keepalive_ceiling_sec"
+)
+
+// OnDemandSessionSettings bundles the tunable knobs for on-demand live
+// sessions. Time values are in seconds (the unit shown in the admin UI).
+type OnDemandSessionSettings struct {
+	GraceSeconds        int `json:"graceSeconds"`
+	MaxConcurrent       int `json:"maxConcurrent"`
+	EvictIdleSeconds    int `json:"evictIdleSeconds"`
+	StallTimeoutSeconds int `json:"stallTimeoutSeconds"`
+	RestartBudget       int `json:"restartBudget"`
+	KeepaliveCeilingSec int `json:"keepaliveCeilingSec"`
+}
+
+const (
+	DefaultOnDemandGraceSeconds        = 120
+	DefaultOnDemandMaxConcurrent       = 4
+	DefaultOnDemandEvictIdleSeconds    = 10
+	DefaultOnDemandStallTimeoutSeconds = 45
+	DefaultOnDemandRestartBudget       = 3
+	DefaultOnDemandKeepaliveCeilingSec = 900
+)
+
+// GetOnDemandSessionSettings returns the on-demand session knobs. Missing or
+// invalid rows fall back to package defaults.
+func GetOnDemandSessionSettings(ctx context.Context, conn *sql.DB) (OnDemandSessionSettings, error) {
+	grace, err := getPositiveIntSetting(ctx, conn, onDemandGraceSecondsSettingKey, DefaultOnDemandGraceSeconds)
+	if err != nil {
+		return OnDemandSessionSettings{}, err
+	}
+	maxConc, err := getPositiveIntSetting(ctx, conn, onDemandMaxConcurrentSettingKey, DefaultOnDemandMaxConcurrent)
+	if err != nil {
+		return OnDemandSessionSettings{}, err
+	}
+	evictIdle, err := getPositiveIntSetting(ctx, conn, onDemandEvictIdleSecondsSettingKey, DefaultOnDemandEvictIdleSeconds)
+	if err != nil {
+		return OnDemandSessionSettings{}, err
+	}
+	stallTimeout, err := getPositiveIntSetting(ctx, conn, onDemandStallTimeoutSecondsSettingKey, DefaultOnDemandStallTimeoutSeconds)
+	if err != nil {
+		return OnDemandSessionSettings{}, err
+	}
+	restartBudget, err := getPositiveIntSetting(ctx, conn, onDemandRestartBudgetSettingKey, DefaultOnDemandRestartBudget)
+	if err != nil {
+		return OnDemandSessionSettings{}, err
+	}
+	keepaliveCeiling, err := getPositiveIntSetting(ctx, conn, onDemandKeepaliveCeilingSecSettingKey, DefaultOnDemandKeepaliveCeilingSec)
+	if err != nil {
+		return OnDemandSessionSettings{}, err
+	}
+	return OnDemandSessionSettings{
+		GraceSeconds:        grace,
+		MaxConcurrent:       maxConc,
+		EvictIdleSeconds:    evictIdle,
+		StallTimeoutSeconds: stallTimeout,
+		RestartBudget:       restartBudget,
+		KeepaliveCeilingSec: keepaliveCeiling,
+	}, nil
+}
+
+// SetOnDemandSessionSettings validates and persists all on-demand session
+// knobs. Each value must be > 0.
+func SetOnDemandSessionSettings(ctx context.Context, conn *sql.DB, s OnDemandSessionSettings) error {
+	if s.GraceSeconds <= 0 {
+		return fmt.Errorf("graceSeconds must be > 0 (got %d)", s.GraceSeconds)
+	}
+	if s.MaxConcurrent <= 0 {
+		return fmt.Errorf("maxConcurrent must be > 0 (got %d)", s.MaxConcurrent)
+	}
+	if s.EvictIdleSeconds <= 0 {
+		return fmt.Errorf("evictIdleSeconds must be > 0 (got %d)", s.EvictIdleSeconds)
+	}
+	if s.StallTimeoutSeconds <= 0 {
+		return fmt.Errorf("stallTimeoutSeconds must be > 0 (got %d)", s.StallTimeoutSeconds)
+	}
+	if s.RestartBudget <= 0 {
+		return fmt.Errorf("restartBudget must be > 0 (got %d)", s.RestartBudget)
+	}
+	if s.KeepaliveCeilingSec <= 0 {
+		return fmt.Errorf("keepaliveCeilingSec must be > 0 (got %d)", s.KeepaliveCeilingSec)
+	}
+	if err := setPositiveIntSetting(ctx, conn, onDemandGraceSecondsSettingKey, s.GraceSeconds); err != nil {
+		return err
+	}
+	if err := setPositiveIntSetting(ctx, conn, onDemandMaxConcurrentSettingKey, s.MaxConcurrent); err != nil {
+		return err
+	}
+	if err := setPositiveIntSetting(ctx, conn, onDemandEvictIdleSecondsSettingKey, s.EvictIdleSeconds); err != nil {
+		return err
+	}
+	if err := setPositiveIntSetting(ctx, conn, onDemandStallTimeoutSecondsSettingKey, s.StallTimeoutSeconds); err != nil {
+		return err
+	}
+	if err := setPositiveIntSetting(ctx, conn, onDemandRestartBudgetSettingKey, s.RestartBudget); err != nil {
+		return err
+	}
+	return setPositiveIntSetting(ctx, conn, onDemandKeepaliveCeilingSecSettingKey, s.KeepaliveCeilingSec)
+}
+
 // Default values for the scheduler tunables. Mirrored in schema.sql's settings
 // seed so fresh installs and migrations land on the same numbers.
 const (
-	DefaultSchedulerHorizonHours  = 48
-	DefaultSchedulerLowWaterHours = 24
+	// Horizon caps how far ahead the extender generates schedule. It is held at
+	// the EPG/guide visible window (24h) — generating beyond what the UI can show
+	// is wasted work. Raise this if the guide views are widened (e.g. to 7 days).
+	// Low-water must stay strictly below horizon; 23h keeps the full visible
+	// window filled while re-extending roughly hourly.
+	DefaultSchedulerHorizonHours  = 24
+	DefaultSchedulerLowWaterHours = 23
 	DefaultSchedulerTickSeconds   = 300
 )
 

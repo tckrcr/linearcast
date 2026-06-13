@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/codec"
@@ -27,6 +28,8 @@ type Options struct {
 	RenditionProfile     string
 	InTransaction        bool
 	ResumeAfterMediaID   string
+	ScheduleMode         string
+	SlotDurationMs       int64
 }
 
 func OptionsForChannel(ch db.Channel, fallback Options) Options {
@@ -37,11 +40,27 @@ func OptionsForChannel(ch db.Channel, fallback Options) Options {
 	if profile == "" {
 		profile = db.DefaultPackageProfile
 	}
+	scheduleMode := ch.ScheduleMode
+	if scheduleMode == "" {
+		scheduleMode = fallback.ScheduleMode
+	}
+	if scheduleMode == "" {
+		scheduleMode = "back_to_back"
+	}
+	slotDurationMs := fallback.SlotDurationMs
+	if ch.SlotDurationMs != nil {
+		slotDurationMs = *ch.SlotDurationMs
+	}
 	return Options{
-		RequireReadyPackages: true,
+		// On-demand and Plex relay channels schedule from eligible media without
+		// requiring ready linearcast packages. Eager packaged channels keep the
+		// ready-package requirement.
+		RequireReadyPackages: ch.PrefillMode != "on_demand" && ch.PlaybackMode != db.PlaybackModePlexRelay,
 		RenditionProfile:     profile,
 		InTransaction:        fallback.InTransaction,
 		ResumeAfterMediaID:   fallback.ResumeAfterMediaID,
+		ScheduleMode:         scheduleMode,
+		SlotDurationMs:       slotDurationMs,
 	}
 }
 
@@ -94,7 +113,16 @@ func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering 
 	var entries []db.ScheduleEntry
 	lastMediaID := opts.ResumeAfterMediaID
 	if lastMediaID == "" {
-		tail, tailErr := db.LastScheduleEntry(ctx, conn, channelID)
+		var tail *db.ScheduleEntry
+		var tailErr error
+		if opts.ScheduleMode == "slot_grid" {
+			// Filler entries persist at the tail of a gap-free slot-grid
+			// schedule; resuming after the literal last row would miss the
+			// primary media list and reset episode rotation to the top.
+			tail, tailErr = db.LastPrimaryScheduleEntry(ctx, conn, channelID)
+		} else {
+			tail, tailErr = db.LastScheduleEntry(ctx, conn, channelID)
+		}
 		if tailErr != nil {
 			return 0, existingEnd, fmt.Errorf("last schedule entry: %w", tailErr)
 		}
@@ -103,17 +131,32 @@ func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering 
 		}
 	}
 
-	switch ordering {
-	case "block":
-		cursors, recentGroup, lerr := db.LoadGroupHistory(ctx, conn, channelID)
-		if lerr != nil {
-			return 0, existingEnd, fmt.Errorf("load group history: %w", lerr)
+	if opts.ScheduleMode == "slot_grid" {
+		slotMs := opts.SlotDurationMs
+		if slotMs == 0 {
+			slotMs = 30 * 60 * 1000
 		}
-		entries, err = BuildEntriesBlock(channelID, media, cursors, recentGroup, startMs, wantEndMs)
-	case "", "alphabetical":
-		entries, err = BuildEntries(channelID, ordering, media, startMs, wantEndMs, lastMediaID)
-	default:
-		return 0, existingEnd, fmt.Errorf("unknown ordering %q (want alphabetical|block)", ordering)
+		filler, ferr := loadSlotGridFiller(ctx, conn, channelID, opts.RenditionProfile, startMs)
+		if ferr != nil {
+			return 0, existingEnd, fmt.Errorf("load slot-grid filler: %w", ferr)
+		}
+		if len(filler) == 0 {
+			log.Printf("WARN channel=%s slot_grid extension found no enabled filler assets with a ready %q package; extending with gaps", channelID, opts.RenditionProfile)
+		}
+		entries, err = BuildEntriesSlotGridFilled(channelID, media, filler, startMs, wantEndMs, slotMs, lastMediaID)
+	} else {
+		switch ordering {
+		case "block":
+			cursors, recentGroup, lerr := db.LoadGroupHistory(ctx, conn, channelID)
+			if lerr != nil {
+				return 0, existingEnd, fmt.Errorf("load group history: %w", lerr)
+			}
+			entries, err = BuildEntriesBlock(channelID, media, cursors, recentGroup, startMs, wantEndMs)
+		case "", "alphabetical":
+			entries, err = BuildEntries(channelID, ordering, media, startMs, wantEndMs, lastMediaID)
+		default:
+			return 0, existingEnd, fmt.Errorf("unknown ordering %q (want alphabetical|block)", ordering)
+		}
 	}
 	if err != nil {
 		return 0, existingEnd, err
@@ -140,6 +183,42 @@ func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering 
 	}
 	last := entries[len(entries)-1]
 	return n, last.StartMs + last.DurationMs, nil
+}
+
+// loadSlotGridFiller assembles the filler set for slot-grid gap tiling:
+// channel-attached, enabled, with a ready package for the rendition profile.
+// Each asset's rotation cursor seeds from its most recent persisted placement
+// before beforeMs (the extension start), matching the "sequential" offset mode
+// of the interactive gap fill, so extension continues the rotation instead of
+// replaying each asset's opening seconds.
+func loadSlotGridFiller(ctx context.Context, conn db.Execer, channelID, profile string, beforeMs int64) ([]SlotFiller, error) {
+	assets, err := db.ChannelFillerAssets(ctx, conn, channelID, profile)
+	if err != nil {
+		return nil, fmt.Errorf("channel filler assets: %w", err)
+	}
+	var out []SlotFiller
+	for _, a := range assets {
+		if !a.Enabled || !a.ChannelEnabled {
+			continue
+		}
+		if a.PackageStatus == nil || *a.PackageStatus != string(db.PackageStatusReady) || a.PackagedDurationMs == nil {
+			continue
+		}
+		dur := ClipTo6s(*a.PackagedDurationMs)
+		if dur <= 0 {
+			continue
+		}
+		var cursor int64
+		prev, perr := db.LastEntryWithMediaBefore(ctx, conn, channelID, a.MediaID, beforeMs)
+		if perr != nil {
+			return nil, fmt.Errorf("last filler placement: %w", perr)
+		}
+		if prev != nil {
+			cursor = (prev.OffsetMs + prev.DurationMs) % dur
+		}
+		out = append(out, SlotFiller{MediaID: a.MediaID, DurationMs: dur, CursorMs: cursor})
+	}
+	return out, nil
 }
 
 // scheduleStart returns (nextStartMs, currentEndMs, tailID).
@@ -259,10 +338,12 @@ func enforceCodecAllowlist(m db.Media) error {
 		return nil
 	}
 	reason, ok := codec.Check(codec.Probe{
-		Container:   m.Container,
-		VideoCodec:  m.VideoCodec,
-		VideoHeight: m.VideoHeight,
-		AudioCodec:  m.AudioCodec,
+		Container:       m.Container,
+		VideoCodec:      m.VideoCodec,
+		VideoHeight:     m.VideoHeight,
+		ColorTransfer:   m.ColorTransfer,
+		ColorPrimaries:  m.ColorPrimaries,
+		AudioCodec:      m.AudioCodec,
 	})
 	if !ok {
 		return fmt.Errorf("%s", reason)

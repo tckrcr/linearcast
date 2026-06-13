@@ -31,6 +31,7 @@ func SchedulingGroupRollup(ctx context.Context, conn *sql.DB) ([]SchedulingGroup
 		FROM media
 		WHERE scheduling_group IS NOT NULL AND scheduling_group != ''
 		  AND COALESCE(media_kind, 'video') = 'video'
+		  AND id NOT IN (SELECT media_id FROM filler_assets)
 		GROUP BY scheduling_group
 		ORDER BY scheduling_group`)
 }

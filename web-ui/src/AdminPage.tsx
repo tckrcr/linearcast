@@ -18,9 +18,6 @@ import {
   useChannelActions,
 } from "./hooks/useChannelActions";
 // Admin panels are lazy-loaded so each chunk only fetches on first selection.
-const ChannelMediaPanel = lazy(() =>
-  import("./panels/ChannelMediaPanel").then((m) => ({ default: m.ChannelMediaPanel }))
-);
 const EncodingPanel = lazy(() =>
   import("./panels/EncodingPanel").then((m) => ({ default: m.EncodingPanel }))
 );
@@ -30,14 +27,17 @@ const GuidePanel = lazy(() =>
 const ProfilesPanel = lazy(() =>
   import("./panels/ProfilesPanel").then((m) => ({ default: m.ProfilesPanel }))
 );
-const ScheduleEditorPanel = lazy(() =>
-  import("./panels/ScheduleEditorPanel").then((m) => ({ default: m.ScheduleEditorPanel }))
-);
 const SubtitlesPanel = lazy(() =>
   import("./panels/SubtitlesPanel").then((m) => ({ default: m.SubtitlesPanel }))
 );
 const ToolsPanel = lazy(() =>
   import("./panels/ToolsPanel").then((m) => ({ default: m.ToolsPanel }))
+);
+const FillerAssetsPanel = lazy(() =>
+  import("./panels/FillerAssetsPanel").then((m) => ({ default: m.FillerAssetsPanel }))
+);
+const ScheduleBuilderPanel = lazy(() =>
+  import("./panels/ScheduleBuilderPanel").then((m) => ({ default: m.ScheduleBuilderPanel }))
 );
 import type {
   ChannelNow,
@@ -48,7 +48,7 @@ import type {
 } from "./types";
 
 const SCHEDULE_WARN_HOURS = 6;
-const ADMIN_PANEL_IDS = new Set(["guide", "tools", "encoding", "profiles", "subtitles"]);
+const ADMIN_PANEL_IDS = new Set(["guide", "tools", "encoding", "profiles", "subtitles", "filler", "schedule"]);
 const SIDEBAR_AUTO_CLOSE_QUERY = "(max-width: 900px)";
 const NON_ERROR_STATUS_PREFIXES = [
   "queueing package run",
@@ -189,6 +189,9 @@ function AdminWorkspace({
   });
   const [allowedProfiles, setAllowedProfiles] = useState<string[]>([]);
   const [profileDetails, setProfileDetails] = useState<Record<string, PackageProfile>>({});
+  // When the schedule panel is open in edit mode this holds the channel to
+  // preload; null means the panel is building a brand-new channel.
+  const [scheduleChannelId, setScheduleChannelId] = useState<string | null>(null);
   const {
     rowBusy,
     rowStatus,
@@ -341,12 +344,23 @@ function AdminWorkspace({
           >
             Subtitles
           </button>
-          <a
-            className="admin-sidebar-item"
-            href="/schedule"
+          <button
+            type="button"
+            className={`admin-sidebar-item${selected === "filler" ? " is-selected" : ""}`}
+            onClick={() => selectChannel("filler")}
           >
-            Schedule Builder ↗
-          </a>
+            Filler
+          </button>
+          <button
+            type="button"
+            className={`admin-sidebar-item${selected === "schedule" ? " is-selected" : ""}`}
+            onClick={() => {
+              setScheduleChannelId(null);
+              selectChannel("schedule");
+            }}
+          >
+            Schedule Builder
+          </button>
 
           {enabledChannels.length > 0 && (
             <div className="admin-sidebar-label">Enabled</div>
@@ -396,6 +410,20 @@ function AdminWorkspace({
 
           {selected === "subtitles" && <SubtitlesPanel />}
 
+          {selected === "filler" && <FillerAssetsPanel />}
+
+          {selected === "schedule" && (
+            <ScheduleBuilderPanel
+              existingChannel={scheduleChannelId ? enabledChannels.find((c) => c.id === scheduleChannelId) : undefined}
+              onChannelImported={() => {
+                refreshChannels();
+                setScheduleChannelId(null);
+                selectChannel("guide");
+              }}
+              onOpenMediaSources={() => selectChannel("tools")}
+            />
+          )}
+
           {selectedEnabled && (
             <ChannelPanel
               channel={selectedEnabled}
@@ -436,6 +464,10 @@ function AdminWorkspace({
                 )
               }
               onUpdateUpstreamHLS={(url) => void updateUpstreamHLS(selectedEnabled.id, url)}
+              onEditSchedule={() => {
+                setScheduleChannelId(selectedEnabled.id);
+                selectChannel("schedule");
+              }}
               onHiddenFromGuideChange={(hidden) =>
                 void setHiddenFromGuide(selectedEnabled.id, selectedEnabled.displayName, hidden)
               }
@@ -481,6 +513,7 @@ function ChannelPanel({
   onClone,
   onUpdateArtwork,
   onUpdateUpstreamHLS,
+  onEditSchedule,
   onHiddenFromGuideChange,
   onDisable,
 }: {
@@ -501,6 +534,7 @@ function ChannelPanel({
   onClone: () => void;
   onUpdateArtwork: () => void;
   onUpdateUpstreamHLS: (url: string) => void;
+  onEditSchedule: () => void;
   onHiddenFromGuideChange: (hidden: boolean) => void;
   onDisable: () => void;
 }) {
@@ -723,11 +757,18 @@ function ChannelPanel({
             )}
           </section>
 
-          {/* Episodes */}
-          <ChannelMediaPanel channelId={channel.id} />
-
           {/* Schedule */}
-          <ScheduleEditorPanel channel={channel} />
+          <section className="admin-panel-section">
+            <div className="section-headline">
+              <h3>Schedule</h3>
+              <button type="button" className="link-button" onClick={onEditSchedule}>
+                Edit schedule
+              </button>
+            </div>
+            <p className="muted">
+              Opens the schedule builder with this channel preloaded.
+            </p>
+          </section>
         </>
       )}
     </div>

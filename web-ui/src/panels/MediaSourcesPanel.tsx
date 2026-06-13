@@ -739,6 +739,7 @@ function LocalFormDialog({ open, initial, onClose, onSaved }: LocalFormDialogPro
             <option value="movies">movies</option>
             <option value="shows">tv</option>
             <option value="music">music</option>
+            <option value="filler">filler</option>
           </select>
         </label>
         {rootDirs.length > 0 && (

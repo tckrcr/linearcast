@@ -286,12 +286,13 @@ func (a *App) handleEncoderComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, finalized, err := packager.FinalizePackage(r.Context(), a.dbConn, packager.FinalizeOptions{
-		MediaPath:  media.Path,
-		MediaID:    pkg.MediaID,
-		Profile:    pkg.RenditionProfile,
-		OutputRoot: outputRoot,
-		PackageID:  packageID,
-		NowMs:      a.now().UTC().UnixMilli(),
+		MediaPath:        media.Path,
+		MediaID:          pkg.MediaID,
+		Profile:          pkg.RenditionProfile,
+		OutputRoot:       outputRoot,
+		PackageID:        packageID,
+		NowMs:            a.now().UTC().UnixMilli(),
+		SourceDurationMs: media.DurationMs,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "finalize_failed", err.Error())

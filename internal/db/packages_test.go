@@ -857,7 +857,7 @@ func TestPackageProfilesComesFromActiveRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("profiles: %v", err)
 	}
-	wantProfiles := DefaultPackageProfile + "," + packageprofile.MusicName
+	wantProfiles := DefaultPackageProfile + "," + packageprofile.H264CopySourceName + "," + packageprofile.HEVCCopySourceName + "," + packageprofile.H264Main720pName + "," + packageprofile.H264Main480pName + "," + packageprofile.MusicName + "," + packageprofile.H264NVENC1080pName + "," + packageprofile.H264NVENCCopySrcName + "," + packageprofile.H264NVENC720pName + "," + packageprofile.H264NVENC480pName
 	if strings.Join(got, ",") != wantProfiles {
 		t.Fatalf("profiles=%v, want active registry profiles only", got)
 	}

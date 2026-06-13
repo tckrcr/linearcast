@@ -1,4 +1,4 @@
-import type { EncoderSweeperSettings, SchedulerTunables, SubtitleSettings } from "../types";
+import type { EncoderSweeperSettings, OnDemandSessionSettings, SchedulerTunables, SubtitleSettings } from "../types";
 import { apiFetch } from "./client";
 
 export async function getSchedulerTunables() {
@@ -22,6 +22,19 @@ export async function getEncoderSweeperSettings() {
 
 export async function updateEncoderSweeperSettings(settings: EncoderSweeperSettings) {
   return apiFetch<EncoderSweeperSettings>("/api/admin/encoder-sweeper-settings", {
+    method: "PUT",
+    json: settings,
+  });
+}
+
+export async function getOnDemandSessionSettings() {
+  return apiFetch<OnDemandSessionSettings>("/api/admin/on-demand-session-settings", {
+    cache: "no-store",
+  });
+}
+
+export async function updateOnDemandSessionSettings(settings: OnDemandSessionSettings) {
+  return apiFetch<OnDemandSessionSettings>("/api/admin/on-demand-session-settings", {
     method: "PUT",
     json: settings,
   });

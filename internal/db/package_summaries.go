@@ -79,7 +79,8 @@ func MediaPackageCandidates(ctx context.Context, conn *sql.DB, profile string, l
 		       ON p.media_id = m.id
 		      AND p.rendition_profile = ?
 		WHERE m.codec_check_passed = 1
-		  AND COALESCE(m.media_kind, 'video') = ?`+baseStatusWhere+extraWhere+`
+		  AND COALESCE(m.media_kind, 'video') = ?
+		  AND m.id NOT IN (SELECT media_id FROM filler_assets)`+baseStatusWhere+extraWhere+`
 		ORDER BY
 		  CASE COALESCE(p.status, 'missing')
 		    WHEN 'missing' THEN 0

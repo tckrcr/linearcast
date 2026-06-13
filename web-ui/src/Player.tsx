@@ -29,8 +29,11 @@ type PlayerProps = {
   source: string;
   autoPlay: boolean;
   muted: boolean;
+  abrMode: "best" | "saver";
+  abrAvailable: boolean;
   controlsVisible: boolean;
   onMutedChange: (muted: boolean) => void;
+  onAbrModeChange: (mode: "best" | "saver") => void;
   probe: StreamProbe;
   activeSource: PlayableSource | null;
   hasSources: boolean;
@@ -43,8 +46,11 @@ export function Player({
   source,
   autoPlay,
   muted,
+  abrMode,
+  abrAvailable,
   controlsVisible,
   onMutedChange,
+  onAbrModeChange,
   probe,
   activeSource,
   hasSources,
@@ -79,6 +85,7 @@ export function Player({
     enabled: probe.status === "ready",
     autoPlay,
     muted,
+    abrMode,
     videoRef,
     hlsRef,
     initialStats,
@@ -95,10 +102,14 @@ export function Player({
       <video ref={videoRef} playsInline muted={muted} />
       {probe.status === "ready" && !stats.streamUnavailable && (
         <PlayerControls
+          channelID={activeSource?.id ?? ""}
           videoRef={videoRef}
           visible={controlsVisible}
           muted={muted}
+          abrMode={abrMode}
+          abrAvailable={abrAvailable}
           onMutedChange={onMutedChange}
+          onAbrModeChange={onAbrModeChange}
         />
       )}
       {probe.status !== "ready" && !stats.streamUnavailable && (

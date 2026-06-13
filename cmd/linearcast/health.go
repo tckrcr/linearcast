@@ -36,6 +36,9 @@ func (a *app) handleReady(w http.ResponseWriter, r *http.Request) {
 		if !has {
 			continue
 		}
+		if rt.PlaybackMode == db.PlaybackModePlexRelay {
+			continue
+		}
 		if _, err := a.packagedManifestItems(r.Context(), rt.ID, rt.RequiredPackageProfile, time.Now().UTC().UnixMilli()); err != nil {
 			http.Error(w, fmt.Sprintf("channel %s packaged manifest not ready: %v", rt.ID, err), http.StatusServiceUnavailable)
 			return
@@ -189,7 +192,9 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 		has, _ := db.ChannelHasSchedule(r.Context(), a.dbConn, rt.ID)
 		cs.HasSchedule = has
 		if has {
-			if _, err := a.packagedManifestItems(r.Context(), rt.ID, rt.RequiredPackageProfile, nowMs); err != nil {
+			if rt.PlaybackMode == db.PlaybackModePlexRelay {
+				cs.PackageReady = true
+			} else if _, err := a.packagedManifestItems(r.Context(), rt.ID, rt.RequiredPackageProfile, nowMs); err != nil {
 				cs.PackageError = err.Error()
 			} else {
 				cs.PackageReady = true

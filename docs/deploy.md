@@ -8,19 +8,18 @@ How to run linearcast on a server, plus the runtime configuration reference.
 - A media library accessible from the host (local path or NFS mount)
 - Go only if you build from source (see below)
 
-## Run the published image (recommended)
+## Build from source
 
-Published images live at `ghcr.io/tckrcr/linearcast` and pull anonymously — no build step, no registry login. Image tags track GitHub Releases: a `v1.2.3` release publishes `:v1.2.3` and updates `:latest`.
+The repo's root `docker-compose.yml` builds the image locally. The deploy
+script wraps build + start + release smoke checks:
 
 ```sh
-cp deploy/docker-compose.image.yml docker-compose.yml
-cp deploy/.env.example .env
-# in .env: set LINEARCAST_IMAGE (e.g. ghcr.io/tckrcr/linearcast:latest),
-# your host paths, and a unique LINEARCAST_ADMIN_PASSWORD
-docker compose up -d
+cp deploy/.env.example .env   # the script also creates it on first run, then exits so you can edit
+scripts/deploy-linearcast.sh
 ```
 
-The single container runs playback, admin API, schedule extender, local encoder worker, and web UI together under one service. Prefer the immutable version tag (e.g. `:v1.2.3`) over `:latest` for reproducible rollbacks — change the tag and `docker compose up -d` again.
+The single container runs playback, admin API, schedule extender, local encoder
+worker, and web UI together under one service.
 
 A single `.env` beside the compose file drives everything: Docker Compose reads it automatically both for `${VAR}` interpolation (host bind paths, ports) and as the container `env_file` (runtime config). No `set -a; source` step is needed for manual `docker compose` commands.
 
@@ -39,13 +38,17 @@ curl -fsS http://localhost:8080/api/healthz
 curl -fsS http://localhost:8080/status
 ```
 
-## Build from source
+## Run an image tag
 
-For contributors and anyone who'd rather build locally, the repo's root `docker-compose.yml` builds the image (`build: .`). The deploy script wraps build + start + release smoke checks:
+`deploy/docker-compose.image.yml` is the pull-based compose file for a published
+or private registry image. Public GHCR publishing is planned but not wired yet;
+until then, set `LINEARCAST_IMAGE` to an image tag you publish yourself.
+Prefer an immutable version tag over `:latest` for reproducible rollbacks.
 
 ```sh
-cp deploy/.env.example .env   # the script also creates it on first run, then exits so you can edit
-scripts/deploy-linearcast.sh
+cp deploy/docker-compose.image.yml docker-compose.yml
+cp deploy/.env.example .env   # set LINEARCAST_IMAGE, host paths, and admin password
+docker compose up -d
 ```
 
 ## Configuration

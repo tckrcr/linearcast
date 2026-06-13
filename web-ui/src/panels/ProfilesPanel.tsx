@@ -188,6 +188,10 @@ export function ProfilesPanel() {
     }
   }
 
+  const abrProfiles = abrGroupProfiles(profiles);
+  const ladderGroups = buildLadderGroups(profiles);
+  const visibleProfiles = profiles.filter((p) => !isABRProfile(p));
+
   return (
     <div className="admin-panel profiles-panel">
       <section className="admin-panel-section">
@@ -215,7 +219,42 @@ export function ProfilesPanel() {
             <span>Status</span>
             <span>Actions</span>
           </div>
-          {profiles.map((p) => {
+          {abrProfiles.length > 0 && (
+            <Fragment key="abr-ladder">
+              <div className={`${styles["profiles-list-row"]}${expanded === "abr-ladder" ? " is-expanded" : ""}`} role="row">
+                <div className={styles["profile-identity"]}>
+                  <button
+                    type="button"
+                    className={styles["profile-identity-toggle"]}
+                    onClick={() => setExpanded(expanded === "abr-ladder" ? null : "abr-ladder")}
+                    aria-expanded={expanded === "abr-ladder"}
+                  >
+                    <span className={styles["profile-identity-chevron"]}>{expanded === "abr-ladder" ? "▾" : "▸"}</span>
+                    <span className={styles["profile-identity-text"]}>
+                      <span className={styles["profile-identity-label"]}>Adaptive bitrate</span>
+                      {ladderGroups.map((g) => g.profiles.length > 0 && (
+                        <code key={g.label} className={styles["profile-identity-name"]} style={{ marginRight: "0.5rem" }}>
+                          {g.label} ({g.profiles.length})
+                        </code>
+                      ))}
+                    </span>
+                  </button>
+                </div>
+                <div><span className={`${styles["encoder-badge"]} encoder-cpu`}>ABR</span></div>
+                <div>{formatABROutput(abrProfiles)}</div>
+                <div>{formatABRAudio(abrProfiles)}</div>
+                <div><span className={styles["profile-type"]}>Built-in</span></div>
+                <div><span className={styles["profile-status"]}>{abrProfiles.some((p) => p.disabled) ? "Partial" : "Active"}</span></div>
+                <div className={styles["profile-actions"]} />
+              </div>
+              {expanded === "abr-ladder" && (
+                <div className={styles["profile-detail-row"]} role="row">
+                  <ABRProfileDetail profiles={abrProfiles} ladderGroups={ladderGroups} />
+                </div>
+              )}
+            </Fragment>
+          )}
+          {visibleProfiles.map((p) => {
             const isDefault = p.name === defaultProfile;
             const isExpanded = expanded === p.name;
             return (
@@ -324,6 +363,85 @@ export function ProfilesPanel() {
       )}
     </div>
   );
+}
+
+function isABRProfile(profile: PackageProfile): boolean {
+  return (profile.tags ?? []).includes("abr");
+}
+
+function isABRBridgeProfile(profile: PackageProfile): boolean {
+  return profile.mediaKind !== "music" && (profile.tags ?? []).includes("default");
+}
+
+type LadderGroup = { label: string; profiles: PackageProfile[] };
+
+const LADDER_DEFS: { label: string; names: string[] }[] = [
+  { label: "CPU",  names: ["h264-copy-source", "h264-main-1080p", "h264-main-720p", "h264-main-480p"] },
+  { label: "NVENC", names: ["h264-nvenc-copy-source", "h264-nvenc-main-1080p", "h264-nvenc-main-720p", "h264-nvenc-main-480p"] },
+  { label: "HDR",  names: ["hevc-copy-source", "h264-main-1080p"] },
+];
+
+function buildLadderGroups(profiles: PackageProfile[]): LadderGroup[] {
+  const byName = new Map(profiles.map((p) => [p.name, p]));
+  return LADDER_DEFS.map((def) => ({
+    label: def.label,
+    profiles: def.names.map((n) => byName.get(n)).filter((p): p is PackageProfile => p != null),
+  }));
+}
+
+function abrGroupProfiles(profiles: PackageProfile[]): PackageProfile[] {
+  const grouped = profiles.filter((p) => isABRProfile(p) || isABRBridgeProfile(p));
+  const order = new Map([
+    ["h264-copy-source", 0],
+    ["h264-main-1080p", 1],
+    ["h264-main-720p", 2],
+    ["h264-main-480p", 3],
+    ["h264-nvenc-copy-source", 10],
+    ["h264-nvenc-main-1080p", 11],
+    ["h264-nvenc-main-720p", 12],
+    ["h264-nvenc-main-480p", 13],
+    ["hevc-copy-source", 20],
+  ]);
+  return grouped.sort((a, b) => (order.get(a.name) ?? 100) - (order.get(b.name) ?? 100));
+}
+
+function ABRProfileDetail({ profiles, ladderGroups }: { profiles: PackageProfile[]; ladderGroups: LadderGroup[] }) {
+  return (
+    <div className={styles["profile-detail"]}>
+      <p className={styles["profile-detail-desc"]}>
+        Three standard ABR ladders are available. Each ladder is assigned as a unit when creating a channel with adaptive bitrate enabled.
+      </p>
+      {ladderGroups.map((group) => group.profiles.length > 0 && (
+        <fieldset key={group.label} className={styles["profile-ladder-group"]}>
+          <legend>{group.label} ladder ({group.profiles.length} rungs)</legend>
+          <div className={styles["profile-detail-grid"]}>
+            {group.profiles.map((p) => (
+              <section key={p.name}>
+                <h4>{p.label}</h4>
+                <dl>
+                  <dt>Profile</dt><dd>{p.name}</dd>
+                  <dt>Video</dt><dd>{formatOutput(p)}</dd>
+                  <dt>Audio</dt><dd>{formatAudioCell(p)}</dd>
+                  <dt>Status</dt><dd>{p.disabled ? "Disabled" : "Active"}</dd>
+                </dl>
+              </section>
+            ))}
+          </div>
+        </fieldset>
+      ))}
+    </div>
+  );
+}
+
+function formatABROutput(profiles: PackageProfile[]): string {
+  const labels = profiles.map((p) => p.video.mode === "copy" ? "source" : p.video.scaleHeight ? `${p.video.scaleHeight}p` : "source");
+  return labels.join(" / ");
+}
+
+function formatABRAudio(profiles: PackageProfile[]): string {
+  const transcodes = profiles.filter((p) => p.audio.mode === "transcode");
+  if (transcodes.length === profiles.length) return "AAC";
+  return "mixed";
 }
 
 function ProfileDetail({ profile }: { profile: PackageProfile }) {

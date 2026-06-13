@@ -30,6 +30,8 @@ func TestCheckRejected(t *testing.T) {
 		{Probe{Container: "mkv", VideoCodec: "h264", VideoHeight: 2160, AudioCodec: "aac"}, "video_height=2160"},
 		{Probe{Container: "avi", VideoCodec: "h264", VideoHeight: 720, AudioCodec: "aac"}, "container=avi"},
 		{Probe{Container: "mkv", VideoCodec: "h264", VideoHeight: 1080, AudioCodec: "wmav2"}, "audio_codec=wmav2"},
+		// HEVC without HDR transfer characteristic is still rejected.
+		{Probe{Container: "mkv", VideoCodec: "hevc", VideoHeight: 2160, AudioCodec: "aac"}, "video_codec=hevc"},
 	}
 	for _, c := range cases {
 		reason, ok := Check(c.probe)
@@ -39,6 +41,39 @@ func TestCheckRejected(t *testing.T) {
 		}
 		if !contains(reason, c.want) {
 			t.Errorf("reason %q missing %q", reason, c.want)
+		}
+	}
+}
+
+func TestCheckHDRAllowed(t *testing.T) {
+	cases := []Probe{
+		// HEVC with PQ transfer and 4K → allowed via HDR gate.
+		{Container: "mkv", VideoCodec: "hevc", VideoHeight: 2160, ColorTransfer: "smpte2084", AudioCodec: "aac"},
+		// HEVC with HLG and 4K → also HDR.
+		{Container: "mkv", VideoCodec: "hevc", VideoHeight: 2160, ColorTransfer: "arib-std-b67", AudioCodec: "aac"},
+		// HEVC with PQ at 1080p → allowed.
+		{Container: "mkv", VideoCodec: "hevc", VideoHeight: 1080, ColorTransfer: "smpte2084", AudioCodec: "aac"},
+		// h264 with PQ at 4K → height cap lifted by HDR gate (h264 already allowed).
+		{Container: "mkv", VideoCodec: "h264", VideoHeight: 2160, ColorTransfer: "smpte2084", AudioCodec: "aac"},
+	}
+	for _, p := range cases {
+		if reason, ok := Check(p); !ok {
+			t.Errorf("expected ok for %+v, got reason=%q", p, reason)
+		}
+	}
+}
+
+func TestIsHDRTransfer(t *testing.T) {
+	hdr := []string{"smpte2084", "arib-std-b67", "SMPTE2084", " smpte2084 "}
+	for _, tr := range hdr {
+		if !IsHDRTransfer(tr) {
+			t.Errorf("IsHDRTransfer(%q)=false, want true", tr)
+		}
+	}
+	sdr := []string{"", "bt709", "bt601", "smpte170m", "unknown", "bt2020-10"}
+	for _, tr := range sdr {
+		if IsHDRTransfer(tr) {
+			t.Errorf("IsHDRTransfer(%q)=true, want false", tr)
 		}
 	}
 }

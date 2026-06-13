@@ -44,9 +44,11 @@ var (
 // a row per file into the media table. Titles and scheduling groups are derived
 // from embedded tags with a path-structure fallback.
 //
-// All music rows are written with codec_check_passed=false ("music:
-// audio-only media"). The packager and channel-add gate skip them until a
-// music packaging pipeline exists.
+// All music rows are written with codec_check_passed=true and
+// media_kind="music". The media_kind column — not the codec gate — is what
+// routes them: the channel-add and filler-attach gates require the media kind
+// to match the channel's kind, and the packager only packages music under a
+// music profile.
 func IngestMusic(ctx context.Context, conn *sql.DB, musicDir string, logger Logger) (Result, error) {
 	if logger == nil {
 		logger = nopLogger{}

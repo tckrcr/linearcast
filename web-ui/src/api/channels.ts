@@ -25,6 +25,8 @@ export async function createChannel(req: {
   packageProfile: string;
   mediaIds: string[];
   ordering?: string;
+  scheduleMode?: "back_to_back" | "slot_grid" | string;
+  slotDurationMs?: number;
 }) {
   return apiFetch<{
     channelID: string;
@@ -41,6 +43,8 @@ export async function createChannel(req: {
 export async function createExternalChannel(req: {
   displayName: string;
   upstreamHlsUrl: string;
+  scheduleMode?: "back_to_back" | "slot_grid" | string;
+  slotDurationMs?: number;
 }) {
   return apiFetch<{
     channelID: string;
@@ -223,6 +227,45 @@ export async function getChannelMedia(channelID: string) {
 export async function getChannelFillerAssets(channelID: string) {
   return apiFetch<ChannelFillerAssetList>(channelPath(channelID, "/filler-assets"), {
     cache: "no-store",
+  });
+}
+
+export async function fillScheduleGap(
+  channelID: string,
+  mediaId: string,
+  startMs: number,
+  offsetMs = 0,
+  offsetMode?: "zero" | "sequential",
+) {
+  return apiFetch<{
+    channelID: string;
+    entryId: string;
+    startMs: number;
+    endMs: number;
+    mediaId: string;
+    durationMs: number;
+    offsetMs: number;
+    packageProfile: string;
+  }>(channelPath(channelID, "/schedule/gaps/fill"), {
+    method: "POST",
+    json: { mediaId, startMs, offsetMs, ...(offsetMode ? { offsetMode } : {}) },
+  });
+}
+
+// recomposeSlotGridSchedule rebuilds a slot-grid channel's future schedule
+// gap-free in one shot (clear-after-now + server-side slot tiling). Replaces
+// the per-gap fillScheduleGap editing flow for existing slot-grid channels.
+export async function recomposeSlotGridSchedule(channelID: string) {
+  return apiFetch<{
+    channelID: string;
+    fromMs: number;
+    cleared: number;
+    inserted: number;
+    lastEndMs: number;
+    gappy: boolean;
+    note?: string;
+  }>(channelPath(channelID, "/schedule/recompose"), {
+    method: "POST",
   });
 }
 

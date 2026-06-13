@@ -19,6 +19,9 @@ export function ChannelBanner({ channel, visible }: Props) {
           className="tv-banner-artwork"
         />
         <strong>{channel.displayName || channel.id}</strong>
+        {channel.prefillMode === "on_demand" && (
+          <span className="guide-channel-badge" title="On-demand — packages on tune-in">on-demand</span>
+        )}
         <span className={`status status-${channel.status}`}>{channel.status}</span>
       </div>
       <div className="tv-banner-slot">

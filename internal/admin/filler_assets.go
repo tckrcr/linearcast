@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -78,6 +79,39 @@ func channelFillerAssetResponse(a db.ChannelFillerAsset) channelFillerAssetItem 
 		item.PackageError = *a.PackageError
 	}
 	return item
+}
+
+func (a *App) handleScheduleBuilderFillerCandidates(w http.ResponseWriter, r *http.Request) {
+	profile := strings.TrimSpace(r.URL.Query().Get("profile"))
+	candidates, err := db.FillerAssetsForScheduleBuilder(r.Context(), a.dbConn, profile)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	items := make([]map[string]any, 0, len(candidates))
+	for _, c := range candidates {
+		item := map[string]any{
+			"id":            c.ID,
+			"mediaId":       c.MediaID,
+			"label":         c.Label,
+			"kind":          c.Kind,
+			"durationMs":    c.DurationMs,
+			"packageStatus": c.PackageStatus,
+			"packageReady":  c.PackageStatus == string(db.PackageStatusReady) && c.PackagedDurationMs != nil,
+		}
+		if c.PackageID != nil {
+			item["packageId"] = *c.PackageID
+		}
+		if c.PackagedDurationMs != nil {
+			item["packagedDurationMs"] = *c.PackagedDurationMs
+		}
+		items = append(items, item)
+	}
+	writeJSON(w, map[string]any{
+		"profile": profile,
+		"count":   len(items),
+		"assets":  items,
+	})
 }
 
 func (a *App) handleFillerAssets(w http.ResponseWriter, r *http.Request) {
@@ -221,6 +255,24 @@ func (a *App) handleChannelFillerAssetAttach(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	// Filler must match the channel's media kind, mirroring the channel-add
+	// gate (channel_media.go). A music asset can only package under a music
+	// profile, so attaching it to a video channel would leave it permanently
+	// unready and the gap-filler would never place it.
+	media, err := db.MediaByID(r.Context(), a.dbConn, asset.MediaID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	if media == nil {
+		writeError(w, http.StatusNotFound, "media_not_found", "filler media not found")
+		return
+	}
+	if mediaKind := db.NormalizeMediaKind(media.MediaKind); mediaKind != ch.MediaKind {
+		writeError(w, http.StatusUnprocessableEntity, "media_kind_mismatch",
+			fmt.Sprintf("media kind %s cannot be used as filler on %s channel %s", mediaKind, ch.MediaKind, channelID))
 		return
 	}
 	enabled := true

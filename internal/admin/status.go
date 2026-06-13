@@ -24,6 +24,9 @@ type channelNow struct {
 	ArtworkURL            string              `json:"artworkUrl,omitempty"`
 	Ordering              string              `json:"ordering"`
 	MediaKind             string              `json:"mediaKind"`
+	ScheduleMode          string              `json:"scheduleMode"`
+	SlotDurationMs        *int64              `json:"slotDurationMs,omitempty"`
+	PrefillMode           string              `json:"prefillMode,omitempty"`
 	Status                string              `json:"status"`
 	Current               *mediaWindow        `json:"current"`
 	Next                  *mediaWindow        `json:"next"`
@@ -34,6 +37,7 @@ type channelNow struct {
 	PackageCoverageHours  float64             `json:"packageCoverageHours"`
 	PackageReadyCount     int                 `json:"packageReadyCount"`
 	PackageProfile        string              `json:"packageProfile"`
+	AdaptiveBitrate       bool                `json:"adaptiveBitrate"`
 	IsExternal            bool                `json:"isExternal,omitempty"`
 	UpstreamHLSURL        string              `json:"upstreamHlsUrl,omitempty"`
 	NowPlaying            *externalNowPlaying `json:"nowPlaying,omitempty"`
@@ -239,6 +243,9 @@ func (a *App) channelNowForRow(ctx context.Context, nowMs int64, ch db.Channel, 
 		ArtworkURL:      ch.ArtworkURL,
 		Ordering:        ch.Ordering,
 		MediaKind:       string(db.NormalizeMediaKind(ch.MediaKind)),
+		ScheduleMode:    ch.ScheduleMode,
+		SlotDurationMs:  ch.SlotDurationMs,
+		PrefillMode:     ch.PrefillMode,
 		Status:          "unknown",
 	}
 	if cache.Format != "" || cache.CacheSize > 0 || cache.LookaheadDepthSegments != nil {
@@ -261,6 +268,7 @@ func (a *App) channelNowForRow(ctx context.Context, nowMs int64, ch db.Channel, 
 		profile = db.DefaultPackageProfile
 	}
 	resp.PackageProfile = profile
+	resp.AdaptiveBitrate = db.ABRLadderEnabled(profile, ch.ABRLadder)
 
 	hasAny, err := db.ChannelHasSchedule(ctx, a.dbConn, ch.ID)
 	if err != nil {

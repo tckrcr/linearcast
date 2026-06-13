@@ -87,6 +87,36 @@ var (
 		Name: "linearcast_schedule_gap_active",
 		Help: "1 if now falls inside a schedule gap for the channel, 0 otherwise.",
 	}, []string{"channel_id"})
+
+	OnDemandSessionSpawnsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_session_spawns_total",
+		Help: "Total on-demand live session spawns (first segment delivered).",
+	})
+	OnDemandSessionRestartsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_session_restarts_total",
+		Help: "Total on-demand session entry restarts after failure.",
+	})
+	OnDemandSessionEvictionsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_session_evictions_total",
+		Help: "Total on-demand sessions evicted to make room for other channels.",
+	})
+	OnDemandWarming503Total = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_warming_503_total",
+		Help: "On-demand session warming (no segments yet) 503 responses.",
+	})
+	OnDemandAtCapacity503Total = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_at_capacity_503_total",
+		Help: "On-demand session at-capacity 503 responses.",
+	})
+	OnDemandSessionSpawnLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "linearcast_on_demand_session_spawn_latency_seconds",
+		Help:    "Seconds from ffmpeg start to first segment available.",
+		Buckets: []float64{0.5, 1, 2, 3, 5, 8, 12, 20, 30, 60},
+	})
+	OnDemandSessions = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "linearcast_on_demand_sessions",
+		Help: "Current on-demand live sessions by state (starting/serving/failed).",
+	}, []string{"state"})
 )
 
 func ObserveDuration(h prometheus.Observer, start time.Time) {

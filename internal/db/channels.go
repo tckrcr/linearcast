@@ -78,18 +78,42 @@ func nonEmptyStr(s string) *string {
 
 func normalizeChannelWrite(c ChannelWrite) ChannelWrite {
 	c.MediaKind = NormalizeMediaKind(c.MediaKind)
+	if c.PrefillMode != "on_demand" {
+		c.PrefillMode = "eager"
+	}
+	if c.ScheduleMode == "" {
+		c.ScheduleMode = "back_to_back"
+	}
+	if c.ScheduleMode == "slot_grid" && c.SlotDurationMs == nil {
+		v := int64(30 * 60 * 1000)
+		c.SlotDurationMs = &v
+	}
 	if c.PlaybackMode == "" || c.PlaybackMode == PlaybackModeGenerated {
 		c.PlaybackMode = PlaybackModePackaged
 	}
 	if c.UpstreamHLSURL != nil {
 		c.SourceDirectory = ""
 		c.RequiredPackageProfile = ""
+		c.ABRLadder = nil
 		c.PackagePrefillMs = nil
+		// On-demand packaging is meaningless for an external HLS proxy — it owns
+		// no packaged media. Keep these eager so they never enter demand tracking.
+		c.PrefillMode = "eager"
+	}
+	if c.PlaybackMode == PlaybackModePlexRelay {
+		c.SourceDirectory = ""
+		c.RequiredPackageProfile = ""
+		c.ABRLadder = nil
+		c.PackagePrefillMs = nil
+		c.PrefillMode = "eager"
 	}
 	if c.PlaybackMode == PlaybackModePackaged && strings.TrimSpace(c.RequiredPackageProfile) == "" {
 		if c.UpstreamHLSURL == nil {
 			c.RequiredPackageProfile = DefaultPackageProfileForMediaKind(c.MediaKind)
 		}
+	}
+	if c.PlaybackMode == PlaybackModePackaged && c.UpstreamHLSURL == nil {
+		c.ABRLadder = NormalizeABRLadder(c.RequiredPackageProfile, mustMarshalStringSlice(c.ABRLadder))
 	}
 	if c.CreatedAtMs == 0 {
 		c.CreatedAtMs = time.Now().UTC().UnixMilli()
@@ -104,11 +128,11 @@ func InsertChannel(ctx context.Context, conn *sql.DB, c ChannelWrite) error {
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile, package_prefill_ms, media_kind, upstream_hls_url
+			playback_mode, required_package_profile, abr_ladder_json, package_prefill_ms, media_kind, schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
 		)
-		VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.DisplayName, c.SourceDirectory, c.Ordering, c.CreatedAtMs,
-		string(c.PlaybackMode), nullString(c.RequiredPackageProfile), c.PackagePrefillMs, string(c.MediaKind), c.UpstreamHLSURL)
+		string(c.PlaybackMode), nullString(c.RequiredPackageProfile), abrLadderValue(c.RequiredPackageProfile, c.ABRLadder), c.PackagePrefillMs, string(c.MediaKind), c.ScheduleMode, c.SlotDurationMs, c.UpstreamHLSURL, c.PrefillMode)
 	return err
 }
 
@@ -147,13 +171,13 @@ func CloneChannel(ctx context.Context, conn *sql.DB, id string, createdAtMs int6
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			description, hidden_from_guide, artwork_url, playback_mode, required_package_profile, package_prefill_ms,
-			media_kind, upstream_hls_url
+			description, hidden_from_guide, artwork_url, playback_mode, required_package_profile, abr_ladder_json, package_prefill_ms,
+			media_kind, schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cloneID, cloneName, src.SourceDirectory, src.Ordering, 0, createdAtMs,
-		nullString(src.Description), src.HiddenFromGuide, nullString(src.ArtworkURL), string(src.PlaybackMode), nullString(src.RequiredPackageProfile), src.PackagePrefillMs,
-		string(src.MediaKind), src.UpstreamHLSURL); err != nil {
+		nullString(src.Description), src.HiddenFromGuide, nullString(src.ArtworkURL), string(src.PlaybackMode), nullString(src.RequiredPackageProfile), abrLadderValue(src.RequiredPackageProfile, src.ABRLadder), src.PackagePrefillMs,
+		string(src.MediaKind), src.ScheduleMode, src.SlotDurationMs, src.UpstreamHLSURL, src.PrefillMode); err != nil {
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -246,10 +270,10 @@ func OverwriteChannelWithPolicy(ctx context.Context, conn *sql.DB, c ChannelWrit
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE channels
 		SET display_name = ?, source_directory = ?, ordering = ?, enabled = 1,
-		    playback_mode = ?, required_package_profile = ?, package_prefill_ms = ?, media_kind = ?
+		    playback_mode = ?, required_package_profile = ?, abr_ladder_json = ?, package_prefill_ms = ?, media_kind = ?
 		WHERE id = ?`,
 		c.DisplayName, c.SourceDirectory, c.Ordering, string(c.PlaybackMode),
-		nullString(c.RequiredPackageProfile), c.PackagePrefillMs, string(c.MediaKind), c.ID); err != nil {
+		nullString(c.RequiredPackageProfile), abrLadderValue(c.RequiredPackageProfile, c.ABRLadder), c.PackagePrefillMs, string(c.MediaKind), c.ID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -279,7 +303,7 @@ func DeleteChannel(ctx context.Context, conn *sql.DB, id string) (int64, error) 
 	return res.RowsAffected()
 }
 
-func UpdateChannelPlaybackPolicy(ctx context.Context, conn *sql.DB, id string, mode PlaybackMode, profile string, prefillMs *int64, mediaKind MediaKind) (bool, error) {
+func UpdateChannelPlaybackPolicy(ctx context.Context, conn *sql.DB, id string, mode PlaybackMode, profile string, abrLadder []string, prefillMs *int64, mediaKind MediaKind) (bool, error) {
 	if mode != PlaybackModePackaged {
 		return false, fmt.Errorf("unsupported playback mode %q: only packaged playback is supported", mode)
 	}
@@ -309,9 +333,9 @@ func UpdateChannelPlaybackPolicy(ctx context.Context, conn *sql.DB, id string, m
 	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE channels
-		SET playback_mode = ?, required_package_profile = ?, package_prefill_ms = ?, media_kind = ?
+		SET playback_mode = ?, required_package_profile = ?, abr_ladder_json = ?, package_prefill_ms = ?, media_kind = ?
 		WHERE id = ?`,
-		string(mode), nullString(profile), prefillMs, string(mediaKind), id)
+		string(mode), nullString(profile), abrLadderValue(profile, abrLadder), prefillMs, string(mediaKind), id)
 	if err != nil {
 		return false, err
 	}
@@ -334,9 +358,12 @@ func NormalizeChannelsToPackaged(ctx context.Context, conn *sql.DB, profile stri
 		UPDATE channels
 		SET playback_mode = 'packaged',
 		    required_package_profile = COALESCE(NULLIF(TRIM(required_package_profile), ''), ?)
-		WHERE playback_mode <> 'packaged'
-		   OR required_package_profile IS NULL
-		   OR TRIM(required_package_profile) = ''`, profile)
+		WHERE playback_mode IS NULL
+		   OR TRIM(playback_mode) = ''
+		   OR playback_mode = 'generated'
+		   OR (playback_mode = 'packaged' AND (
+		       required_package_profile IS NULL OR TRIM(required_package_profile) = ''
+		   ))`, profile)
 	if err != nil {
 		return 0, err
 	}

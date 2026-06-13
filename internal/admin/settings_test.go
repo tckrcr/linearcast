@@ -60,7 +60,7 @@ func TestHandleSchedulerTunables(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
 		t.Fatalf("decode get: %v", err)
 	}
-	want := db.SchedulerTunables{HorizonHours: 48, LowWaterHours: 24, TickSeconds: 300}
+	want := db.SchedulerTunables{HorizonHours: 24, LowWaterHours: 23, TickSeconds: 300}
 	if got != want {
 		t.Fatalf("defaults=%+v want=%+v", got, want)
 	}

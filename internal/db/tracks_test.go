@@ -73,6 +73,13 @@ func TestBitmapSubtitleInventory(t *testing.T) {
 	if has {
 		t.Error("HasSubtitleTrackForLang true for a bitmap-only language, want false")
 	}
+	bitmap, err := BitmapSubtitleTracksForMedia(context.Background(), rw, "m1")
+	if err != nil {
+		t.Fatalf("bitmap tracks: %v", err)
+	}
+	if len(bitmap) != 2 || bitmap[0].StreamIndex != 3 || bitmap[1].StreamIndex != 4 {
+		t.Fatalf("bitmap tracks = %+v, want forced stream 3 then stream 4", bitmap)
+	}
 
 	// Re-upserting the same stream updates in place (idempotent re-package).
 	if err := UpsertMediaTrack(context.Background(), rw, full); err != nil {
