@@ -217,11 +217,18 @@ On-demand sessions are deliberately not durable package state:
   so idle on-demand channels encode nothing.
 - Session files live under `LINEARCAST_SESSION_DIR` (default
   `/tmp/linearcast-sessions`), which `linearcast` wipes on startup and shutdown.
-- Sessions are touched by manifest requests, torn down after idle grace or entry
-  end, and prune already-played segment files behind the playhead.
+- Sessions are touched by manifest requests and detached after idle grace or
+  entry end. Detached session files remain addressable for a short HLS
+  live-sync-depth retention window so clients holding an older playlist do not
+  404 during boundary crossings, restarts, or subtitle burn-in replacement.
+  Already-played segment files are pruned only after the same retention window.
 - Admission is bounded by the session manager's max-concurrent setting. Under
   pressure it evicts the least-recently-touched idle channel; if all sessions
   are fresh, manifests return `503` with `Retry-After`.
+- Repeated session failures exhaust a per-entry restart budget, then place the
+  entry in a short cooldown. After the cooldown expires the entry can be tried
+  again, so transient encoder failures do not poison playback for the process
+  lifetime.
 - Copy-mode video profiles are rejected for sessions because they cannot
   re-keyframe accurately after a seek. Use a transcode profile for on-demand
   channels.
@@ -238,6 +245,10 @@ boundary is the shared state transitions (`db.ApplyFinalizedPackageTransition`,
 `db.resolveAndApplyFailure`) and the packager core (`EncodePackageOutput`,
 `FinalizePackage`). Do not add a generic `JobDriver` interface unless a third
 transport appears.
+Remote encoders report known-unrecoverable claim failures (missing source,
+corrupt/unreadable input, missing required streams, or profile-incompatible
+codec/mode) as `kind=terminal`; transport, upload, host encoder, and other
+ambiguous failures remain `kind=transient`.
 
 ## Package state machine
 

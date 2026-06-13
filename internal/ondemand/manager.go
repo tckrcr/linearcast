@@ -22,32 +22,34 @@ import (
 )
 
 const (
-	defaultGraceMs        int64 = 120_000
-	defaultTrailingMs     int64 = 30_000
-	defaultMaxConcurrent        = 4
-	defaultEvictIdleMs    int64 = 10_000
-	defaultTailIntervalMs int64 = 300
-	defaultStallTimeoutMs int64 = 45_000
-	defaultRestartBudget        = 3
-	defaultSweepInterval        = 5 * time.Second
+	defaultGraceMs           int64 = 120_000
+	defaultTrailingMs        int64 = 30_000
+	defaultMaxConcurrent           = 4
+	defaultEvictIdleMs       int64 = 10_000
+	defaultTailIntervalMs    int64 = 300
+	defaultStallTimeoutMs    int64 = 45_000
+	defaultRestartBudget           = 3
+	defaultRestartCooldownMs int64 = 60_000
+	defaultSweepInterval           = 5 * time.Second
 )
 
 var ErrAtCapacity = errors.New("on-demand live session capacity reached")
 var errAdmissionRetry = errors.New("retry on-demand admission")
 
 type ManagerOptions struct {
-	Root           string
-	GraceMs        int64
-	TrailingMs     int64
-	BurstSec       int
-	MaxConcurrent  int
-	EvictIdleMs    int64
-	TailIntervalMs int64
-	StallTimeoutMs int64
-	RestartBudget  int
-	MaxKeepaliveMs int64
-	NowFn          func() int64
-	Spawn          SpawnFunc
+	Root              string
+	GraceMs           int64
+	TrailingMs        int64
+	BurstSec          int
+	MaxConcurrent     int
+	EvictIdleMs       int64
+	TailIntervalMs    int64
+	StallTimeoutMs    int64
+	RestartBudget     int
+	RestartCooldownMs int64
+	MaxKeepaliveMs    int64
+	NowFn             func() int64
+	Spawn             SpawnFunc
 }
 
 type SpawnFunc func(ctx context.Context, spec packager.LiveSessionSpec) (Process, error)
@@ -78,26 +80,28 @@ type SegmentMeta struct {
 }
 
 type Manager struct {
-	root           string
-	graceMs        int64
-	trailingMs     int64
-	burstSec       int
-	maxConcurrent  int
-	evictIdleMs    int64
-	tailInterval   time.Duration
-	stallTimeoutMs int64
-	restartBudget  int
-	maxKeepaliveMs int64
-	now            func() int64
-	spawn          SpawnFunc
+	root              string
+	graceMs           int64
+	trailingMs        int64
+	burstSec          int
+	maxConcurrent     int
+	evictIdleMs       int64
+	tailInterval      time.Duration
+	stallTimeoutMs    int64
+	restartBudget     int
+	restartCooldownMs int64
+	maxKeepaliveMs    int64
+	now               func() int64
+	spawn             SpawnFunc
 
-	mu        sync.Mutex
-	sessions  map[string]map[string]*session
-	byID      map[string]*session
-	lastTouch map[string]int64
-	restarts  map[string]int
-	blacklist map[string]bool
-	extraDisc map[string]int64
+	mu           sync.Mutex
+	sessions     map[string]map[string]*session
+	byID         map[string]*session
+	retained     map[string]*retainedSession
+	lastTouch    map[string]int64
+	restarts     map[string]int
+	blockedUntil map[string]int64
+	extraDisc    map[string]int64
 	// seqHighWater tracks, per entry ID, the highest HLS media sequence number
 	// any session for that entry has emitted, so a restarted session can be
 	// numbered strictly past it rather than colliding with already-served
@@ -147,6 +151,15 @@ type session struct {
 	spawnedAt        int64
 }
 
+type retainedSession struct {
+	id        string
+	channelID string
+	dir       string
+	initPath  string
+	segments  []SegmentMeta
+	expiresAt int64
+}
+
 func NewManager(opts ManagerOptions) (*Manager, error) {
 	root, err := validateSessionRoot(opts.Root)
 	if err != nil {
@@ -163,27 +176,29 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 		keepaliveMs = 15 * 60 * 1000 // 15 min default ceiling
 	}
 	m := &Manager{
-		root:           root,
-		graceMs:        defaultInt64(opts.GraceMs, defaultGraceMs),
-		trailingMs:     defaultInt64(opts.TrailingMs, defaultTrailingMs),
-		burstSec:       opts.BurstSec,
-		maxConcurrent:  defaultInt(opts.MaxConcurrent, defaultMaxConcurrent),
-		evictIdleMs:    defaultInt64(opts.EvictIdleMs, defaultEvictIdleMs),
-		tailInterval:   time.Duration(defaultInt64(opts.TailIntervalMs, defaultTailIntervalMs)) * time.Millisecond,
-		stallTimeoutMs: defaultInt64(opts.StallTimeoutMs, defaultStallTimeoutMs),
-		restartBudget:  defaultInt(opts.RestartBudget, defaultRestartBudget),
-		maxKeepaliveMs: keepaliveMs,
-		now:            opts.NowFn,
-		spawn:          opts.Spawn,
-		sessions:       make(map[string]map[string]*session),
-		byID:           make(map[string]*session),
-		lastTouch:      make(map[string]int64),
-		restarts:       make(map[string]int),
-		blacklist:      make(map[string]bool),
-		extraDisc:      make(map[string]int64),
-		seqHighWater:   make(map[string]int64),
-		keepaliveUntil: make(map[string]int64),
-		burnLanguage:   make(map[string]string),
+		root:              root,
+		graceMs:           defaultInt64(opts.GraceMs, defaultGraceMs),
+		trailingMs:        defaultInt64(opts.TrailingMs, defaultTrailingMs),
+		burstSec:          opts.BurstSec,
+		maxConcurrent:     defaultInt(opts.MaxConcurrent, defaultMaxConcurrent),
+		evictIdleMs:       defaultInt64(opts.EvictIdleMs, defaultEvictIdleMs),
+		tailInterval:      time.Duration(defaultInt64(opts.TailIntervalMs, defaultTailIntervalMs)) * time.Millisecond,
+		stallTimeoutMs:    defaultInt64(opts.StallTimeoutMs, defaultStallTimeoutMs),
+		restartBudget:     defaultInt(opts.RestartBudget, defaultRestartBudget),
+		restartCooldownMs: defaultInt64(opts.RestartCooldownMs, defaultRestartCooldownMs),
+		maxKeepaliveMs:    keepaliveMs,
+		now:               opts.NowFn,
+		spawn:             opts.Spawn,
+		sessions:          make(map[string]map[string]*session),
+		byID:              make(map[string]*session),
+		retained:          make(map[string]*retainedSession),
+		lastTouch:         make(map[string]int64),
+		restarts:          make(map[string]int),
+		blockedUntil:      make(map[string]int64),
+		extraDisc:         make(map[string]int64),
+		seqHighWater:      make(map[string]int64),
+		keepaliveUntil:    make(map[string]int64),
+		burnLanguage:      make(map[string]string),
 	}
 	if m.now == nil {
 		m.now = func() int64 { return time.Now().UTC().UnixMilli() }
@@ -309,11 +324,15 @@ func (m *Manager) reserveSession(channelID string, entry db.ScheduleEntry, media
 		}
 		delete(m.sessions[channelID], entry.ID)
 		delete(m.byID, existing.id)
-		go m.stopAndRemove(existing)
+		m.retainSessionLocked(existing, now)
+		go m.stop(existing)
 	}
-	if m.blacklist[entry.ID] {
+	if until := m.blockedUntil[entry.ID]; until > now {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("on-demand session restart budget exhausted for entry %s", entry.ID)
+		return nil, fmt.Errorf("on-demand session restart budget exhausted for entry %s until %d", entry.ID, until)
+	} else if until > 0 {
+		delete(m.blockedUntil, entry.ID)
+		delete(m.restarts, entry.ID)
 	}
 	if m.runningLocked() < m.maxConcurrent {
 		s := m.newSessionLocked(channelID, entry, mediaPath, profile, targetSegmentMs, opts, now)
@@ -326,7 +345,7 @@ func (m *Manager) reserveSession(channelID string, entry db.ScheduleEntry, media
 		return nil, ErrAtCapacity
 	}
 	for _, s := range victims {
-		m.stopAndRemove(s)
+		m.stop(s)
 	}
 	return nil, errAdmissionRetry
 }
@@ -608,23 +627,42 @@ func (m *Manager) InitPath(channelID, sessionID string) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.byID[sessionID]
-	if s == nil || s.channelID != channelID {
+	if s != nil && s.channelID == channelID {
+		if _, err := os.Stat(s.initPath); err != nil {
+			return "", false
+		}
+		return s.initPath, true
+	}
+	retained := m.retained[sessionID]
+	if retained == nil || retained.channelID != channelID || retained.expiresAt <= m.now() {
 		return "", false
 	}
-	if _, err := os.Stat(s.initPath); err != nil {
+	if _, err := os.Stat(retained.initPath); err != nil {
 		return "", false
 	}
-	return s.initPath, true
+	return retained.initPath, true
 }
 
 func (m *Manager) SegmentPath(channelID, sessionID string, index int64) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.byID[sessionID]
-	if s == nil || s.channelID != channelID {
+	if s != nil && s.channelID == channelID {
+		for _, seg := range s.segments {
+			if seg.Index == index {
+				if _, err := os.Stat(seg.Path); err != nil {
+					return "", false
+				}
+				return seg.Path, true
+			}
+		}
 		return "", false
 	}
-	for _, seg := range s.segments {
+	retained := m.retained[sessionID]
+	if retained == nil || retained.channelID != channelID || retained.expiresAt <= m.now() {
+		return "", false
+	}
+	for _, seg := range retained.segments {
 		if seg.Index == index {
 			if _, err := os.Stat(seg.Path); err != nil {
 				return "", false
@@ -668,6 +706,7 @@ func (m *Manager) RestartChannel(channelID string) {
 	m.mu.Lock()
 	for entryID, s := range m.sessions[channelID] {
 		delete(m.byID, s.id)
+		m.retainSessionLocked(s, m.now())
 		teardown = append(teardown, s)
 		if hw := s.baseSeq + int64(s.parsedSegments) - 1; hw > m.seqHighWater[entryID] {
 			m.seqHighWater[entryID] = hw
@@ -679,7 +718,7 @@ func (m *Manager) RestartChannel(channelID string) {
 	}
 	m.mu.Unlock()
 	for _, s := range teardown {
-		m.stopAndRemove(s)
+		m.stop(s)
 	}
 }
 
@@ -693,6 +732,7 @@ func (m *Manager) Shutdown() {
 	}
 	m.sessions = make(map[string]map[string]*session)
 	m.byID = make(map[string]*session)
+	m.retained = make(map[string]*retainedSession)
 	m.mu.Unlock()
 	for _, s := range all {
 		m.stopAndRemove(s)
@@ -702,6 +742,7 @@ func (m *Manager) Shutdown() {
 
 func (m *Manager) sweep(now int64) {
 	var teardown []*session
+	var removeDirs []string
 	m.mu.Lock()
 	for channelID, byEntry := range m.sessions {
 		idle := now-m.lastTouch[channelID] > m.graceMs
@@ -717,6 +758,7 @@ func (m *Manager) sweep(now int64) {
 					channelID, entryID, s.id, teardownReason(idle, entryOver, stalled), s.state, s.parsedSegments, now-m.lastTouch[channelID])
 				delete(byEntry, entryID)
 				delete(m.byID, s.id)
+				m.retainSessionLocked(s, now)
 				// Once the program is over no further session will serve this
 				// entry, so its sequence high-water can be forgotten. Keep it for
 				// idle/stall teardown — a re-admitted or restarted session for the
@@ -733,15 +775,24 @@ func (m *Manager) sweep(now int64) {
 			delete(m.extraDisc, channelID)
 		}
 	}
+	for id, retained := range m.retained {
+		if retained.expiresAt <= now {
+			removeDirs = append(removeDirs, retained.dir)
+			delete(m.retained, id)
+		}
+	}
 	m.mu.Unlock()
 	for _, s := range teardown {
-		m.stopAndRemove(s)
+		m.stop(s)
+	}
+	for _, dir := range removeDirs {
+		_ = os.RemoveAll(dir)
 	}
 }
 
 func (m *Manager) pruneTrailingLocked(s *session, now int64) {
 	playhead := s.entry.OffsetMs + clamp(now-s.entry.StartMs, 0, s.entry.DurationMs)
-	cutoff := playhead - m.trailingMs
+	cutoff := playhead - m.artifactRetentionMs(s)
 	keep := s.segments[:0]
 	for _, seg := range s.segments {
 		if seg.MediaStartMs+seg.DurationMs < cutoff {
@@ -780,6 +831,7 @@ func (m *Manager) detachEvictionVictimLocked(requestingChannel string, now int64
 			victim, entryID, s.id, requestingChannel, now-candidates[0].touched)
 		delete(m.byID, s.id)
 		delete(m.sessions[victim], entryID)
+		m.retainSessionLocked(s, now)
 		out = append(out, s)
 	}
 	delete(m.sessions, victim)
@@ -836,7 +888,7 @@ func (m *Manager) noteFailureLocked(s *session, err error) {
 	m.restarts[s.entry.ID]++
 	m.extraDisc[s.channelID]++
 	if m.restarts[s.entry.ID] >= m.restartBudget {
-		m.blacklist[s.entry.ID] = true
+		m.blockedUntil[s.entry.ID] = m.now() + m.restartCooldownMs
 	}
 	switch prev {
 	case stateStarting:
@@ -849,7 +901,39 @@ func (m *Manager) noteFailureLocked(s *session, err error) {
 	log.Printf("WARN on-demand session failed channel=%s entry=%s session=%s: %v", s.channelID, s.entry.ID, s.id, err)
 }
 
-func (m *Manager) stopAndRemove(s *session) {
+func (m *Manager) retainSessionLocked(s *session, now int64) {
+	if s == nil {
+		return
+	}
+	segments := make([]SegmentMeta, len(s.segments))
+	copy(segments, s.segments)
+	expiresAt := now + m.artifactRetentionMs(s)
+	if existing := m.retained[s.id]; existing != nil && existing.expiresAt > expiresAt {
+		expiresAt = existing.expiresAt
+	}
+	m.retained[s.id] = &retainedSession{
+		id:        s.id,
+		channelID: s.channelID,
+		dir:       s.dir,
+		initPath:  s.initPath,
+		segments:  segments,
+		expiresAt: expiresAt,
+	}
+}
+
+func (m *Manager) artifactRetentionMs(s *session) int64 {
+	// HLS clients may legally request segment URIs from an older playlist for
+	// roughly their live sync depth after Linearcast has moved on. Keep at least
+	// three target segments plus slack, and never less than the configured drain
+	// window.
+	retainMs := s.targetMs*3 + 10_000
+	if retainMs < m.trailingMs {
+		retainMs = m.trailingMs
+	}
+	return retainMs
+}
+
+func (m *Manager) stop(s *session) {
 	m.mu.Lock()
 	prevState := s.state
 	if s.state != stateFailed {
@@ -867,6 +951,10 @@ func (m *Manager) stopAndRemove(s *session) {
 	}
 	s.cancel()
 	<-s.done
+}
+
+func (m *Manager) stopAndRemove(s *session) {
+	m.stop(s)
 	_ = os.RemoveAll(s.dir)
 }
 

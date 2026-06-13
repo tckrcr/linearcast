@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/packager"
 )
 
 type missingMediaItem struct {
@@ -387,4 +389,371 @@ func fileSize(path string) (int64, error) {
 		return 0, err
 	}
 	return st.Size(), nil
+}
+
+type packageIntegrityItem struct {
+	PackageID       string   `json:"packageId"`
+	MediaID         string   `json:"mediaId"`
+	Profile         string   `json:"profile"`
+	Status          string   `json:"status"`
+	Checked         bool     `json:"checked"`
+	InitPresent     bool     `json:"initPresent"`
+	ManifestPresent bool     `json:"manifestPresent"`
+	SegmentCount    int      `json:"segmentCount"`
+	MissingSegments []string `json:"missingSegments,omitempty"`
+	FileError       string   `json:"fileError,omitempty"`
+	PackagedMs      int64    `json:"packagedMs,omitempty"`
+	SourceMs        int64    `json:"sourceMs,omitempty"`
+	ShortfallMs     int64    `json:"shortfallMs,omitempty"`
+	DurationUnknown bool     `json:"durationUnknown,omitempty"`
+	Truncated       bool     `json:"truncated,omitempty"`
+	OK              bool     `json:"ok"`
+}
+
+type packageIntegrityResponse struct {
+	GeneratedAt     string                 `json:"generatedAt"`
+	MediaID         string                 `json:"mediaId,omitempty"`
+	Checked         int                    `json:"checked"`
+	Problems        int                    `json:"problems"`
+	UnknownDuration int                    `json:"unknownDuration"`
+	Packages        []packageIntegrityItem `json:"packages"`
+}
+
+// handleMaintenancePackageIntegrity reports the on-disk and duration integrity
+// of ready packages without changing anything — the read-only diagnostic
+// counterpart of the maint package-integrity check. With ?media=<id> it lists
+// every package of that media (including non-ready renditions); without it,
+// every ready package is swept.
+func (a *App) handleMaintenancePackageIntegrity(w http.ResponseWriter, r *http.Request) {
+	mediaID := strings.TrimSpace(r.URL.Query().Get("media"))
+	inspections, err := packager.InspectMediaPackages(r.Context(), a.dbConn, mediaID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+
+	resp := packageIntegrityResponse{
+		GeneratedAt: a.now().UTC().Format(time.RFC3339Nano),
+		MediaID:     mediaID,
+		Packages:    make([]packageIntegrityItem, 0, len(inspections)),
+	}
+	for _, insp := range inspections {
+		resp.Packages = append(resp.Packages, packageIntegrityItem{
+			PackageID:       insp.PackageID,
+			MediaID:         insp.MediaID,
+			Profile:         insp.Profile,
+			Status:          insp.Status,
+			Checked:         insp.Checked,
+			InitPresent:     insp.InitPresent,
+			ManifestPresent: insp.ManifestPresent,
+			SegmentCount:    insp.SegmentCount,
+			MissingSegments: insp.MissingSegments,
+			FileError:       insp.FileError,
+			PackagedMs:      insp.PackagedMs,
+			SourceMs:        insp.SourceMs,
+			ShortfallMs:     insp.ShortfallMs,
+			DurationUnknown: insp.DurationUnknown,
+			Truncated:       insp.Truncated,
+			OK:              insp.OK,
+		})
+		if !insp.Checked {
+			continue
+		}
+		resp.Checked++
+		if !insp.OK {
+			resp.Problems++
+		}
+		if insp.DurationUnknown {
+			resp.UnknownDuration++
+		}
+	}
+	writeJSON(w, resp)
+}
+
+type encodeReclaimItem struct {
+	MediaID     string `json:"mediaId"`
+	PackageID   string `json:"packageId"`
+	Profile     string `json:"profile"`
+	Status      string `json:"status"`
+	PackageRoot string `json:"packageRoot,omitempty"`
+	Bytes       int64  `json:"bytes,omitempty"`
+	Referenced  bool   `json:"referenced"`
+	Skipped     bool   `json:"skipped"`
+	Deleted     bool   `json:"deleted"`
+}
+
+type encodeReclaimResponse struct {
+	GeneratedAt string `json:"generatedAt"`
+	DryRun      bool   `json:"dryRun"`
+	Force       bool   `json:"force"`
+	Candidates  int    `json:"candidates"`
+	DeletedRows int    `json:"deletedRows"`
+	SkippedRows int    `json:"skippedRows"`
+	// TotalBytes is the on-disk size of the packages eligible for deletion
+	// (skipped ones excluded). It is reported on dry-run too, so it answers
+	// "how much would this free" before committing.
+	TotalBytes int64               `json:"totalBytes"`
+	Items      []encodeReclaimItem `json:"items"`
+	Warnings   []string            `json:"warnings,omitempty"`
+}
+
+// reclaimMediaEncodes deletes the package rows and on-disk artifacts for the
+// given media, scoped to one rendition profile when profile is non-empty.
+// packaged_segments rows fall away via ON DELETE CASCADE. A media still
+// referenced by any channel (scheduled or pooled) is skipped and reported
+// unless force is set, so the operation can never strand a live channel by
+// accident. When dryRun is true nothing is touched; the response reports what
+// would be reclaimed. ReclaimedBytes counts the bytes that were (or would be)
+// deleted; skipped packages are excluded.
+func (a *App) reclaimMediaEncodes(ctx context.Context, mediaIDs []string, profile string, force, dryRun bool) (encodeReclaimResponse, error) {
+	res := encodeReclaimResponse{
+		GeneratedAt: a.now().UTC().Format(time.RFC3339Nano),
+		DryRun:      dryRun,
+		Force:       force,
+		Items:       []encodeReclaimItem{},
+	}
+	if len(mediaIDs) == 0 {
+		return res, nil
+	}
+
+	referenced, err := db.MediaIDsReferenced(ctx, a.dbConn, mediaIDs)
+	if err != nil {
+		return res, err
+	}
+
+	var globalRoot string
+	if root := a.effectivePackageRoot(); root != "" {
+		globalRoot = filepath.Clean(root)
+	}
+
+	for _, mediaID := range mediaIDs {
+		pkgs, err := db.MediaPackagesForMedia(ctx, a.dbConn, mediaID)
+		if err != nil {
+			return res, err
+		}
+		isRef := referenced[mediaID]
+		for _, p := range pkgs {
+			if profile != "" && p.RenditionProfile != profile {
+				continue
+			}
+			item := encodeReclaimItem{
+				MediaID:    mediaID,
+				PackageID:  p.ID,
+				Profile:    p.RenditionProfile,
+				Status:     string(p.Status),
+				Referenced: isRef,
+			}
+			if p.PackageRoot != nil && *p.PackageRoot != "" {
+				item.PackageRoot = filepath.Clean(*p.PackageRoot)
+				if n, err := dirSize(item.PackageRoot); err == nil {
+					item.Bytes = n
+				}
+			}
+			res.Candidates++
+
+			if isRef && !force {
+				item.Skipped = true
+				res.SkippedRows++
+				res.Items = append(res.Items, item)
+				continue
+			}
+
+			// Eligible for deletion; TotalBytes reflects this on dry-run too.
+			res.TotalBytes += item.Bytes
+			if dryRun {
+				res.Items = append(res.Items, item)
+				continue
+			}
+
+			// Disk first, then the row — mirrors handleMaintenanceOrphanPackages
+			// so a failed disk cleanup still removes the row and the next
+			// orphan-dir sweep can finish the job.
+			if item.PackageRoot != "" {
+				if err := deletePackageContents(item.PackageRoot); err != nil {
+					res.Warnings = append(res.Warnings, fmt.Sprintf("disk cleanup %s: %v", item.PackageRoot, err))
+				}
+			}
+			if err := db.DeleteMediaPackage(ctx, a.dbConn, p.ID); err != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("delete package row %s: %v", p.ID, err))
+				res.Items = append(res.Items, item)
+				continue
+			}
+
+			item.Deleted = true
+			res.DeletedRows++
+			res.Items = append(res.Items, item)
+		}
+	}
+
+	if !dryRun && globalRoot != "" {
+		pruneEmptyChildDirs(globalRoot)
+	}
+	return res, nil
+}
+
+type orphanEncodeItem struct {
+	MediaID     string `json:"mediaId"`
+	Title       string `json:"title,omitempty"`
+	PackageID   string `json:"packageId"`
+	Profile     string `json:"profile"`
+	Status      string `json:"status"`
+	PackageRoot string `json:"packageRoot,omitempty"`
+	Bytes       int64  `json:"bytes,omitempty"`
+	// Parked means the media is held only by a disabled channel (no active
+	// channel references it, but some channel still does). Parked encodes are
+	// surfaced but skipped unless ?include-parked=true, so re-enabling a parked
+	// channel doesn't find its encodes gone.
+	Parked  bool `json:"parked"`
+	Deleted bool `json:"deleted"`
+}
+
+type orphanEncodesResponse struct {
+	GeneratedAt   string             `json:"generatedAt"`
+	DryRun        bool               `json:"dryRun"`
+	IncludeParked bool               `json:"includeParked"`
+	Candidates    int                `json:"candidates"`
+	ParkedRows    int                `json:"parkedRows"`
+	DeletedRows   int                `json:"deletedRows"`
+	// TotalBytes is the on-disk size of the encodes eligible for deletion
+	// (parked ones excluded unless includeParked). Reported on dry-run too, so it
+	// answers "how much would this free" before committing.
+	TotalBytes int64              `json:"totalBytes"`
+	Items      []orphanEncodeItem `json:"items"`
+	Warnings   []string           `json:"warnings,omitempty"`
+}
+
+// handleMaintenanceOrphanEncodes reclaims encodes whose media is referenced by
+// no active (enabled) channel — the defense-in-depth backstop for the "every
+// media should trace to an active channel" invariant, and the named replacement
+// for the old type-a-media-id delete tool. Items carry the media title so an
+// operator never has to recognise a raw id. Defaults to a dry-run; pass
+// ?dry-run=false to delete. Encodes held only by a *disabled* channel are
+// reported as parked and skipped unless ?include-parked=true.
+func (a *App) handleMaintenanceOrphanEncodes(w http.ResponseWriter, r *http.Request) {
+	dryRun := r.URL.Query().Get("dry-run") != "false"
+	includeParked := r.URL.Query().Get("include-parked") == "true"
+
+	pkgs, err := db.OrphanedEncodePackages(r.Context(), a.dbConn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+
+	resp := orphanEncodesResponse{
+		GeneratedAt:   a.now().UTC().Format(time.RFC3339Nano),
+		DryRun:        dryRun,
+		IncludeParked: includeParked,
+		Items:         []orphanEncodeItem{},
+	}
+
+	// Resolve titles + parked classification for the distinct media in one pass.
+	mediaSet := make(map[string]struct{}, len(pkgs))
+	for _, p := range pkgs {
+		mediaSet[p.MediaID] = struct{}{}
+	}
+	mediaIDs := make([]string, 0, len(mediaSet))
+	for id := range mediaSet {
+		mediaIDs = append(mediaIDs, id)
+	}
+	titles := make(map[string]string, len(mediaIDs))
+	if len(mediaIDs) > 0 {
+		media, err := db.MediaByIDs(r.Context(), a.dbConn, mediaIDs)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			return
+		}
+		for id, m := range media {
+			titles[id] = m.Title
+		}
+	}
+	// OrphanedEncodePackages already excluded active-channel media, so anything
+	// MediaIDsReferenced still reports is parked on a disabled channel.
+	referenced, err := db.MediaIDsReferenced(r.Context(), a.dbConn, mediaIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+
+	var globalRoot string
+	if root := a.effectivePackageRoot(); root != "" {
+		globalRoot = filepath.Clean(root)
+	}
+
+	for _, p := range pkgs {
+		item := orphanEncodeItem{
+			MediaID:   p.MediaID,
+			Title:     titles[p.MediaID],
+			PackageID: p.ID,
+			Profile:   p.RenditionProfile,
+			Status:    p.Status,
+			Parked:    referenced[p.MediaID],
+		}
+		if p.PackageRoot != nil && *p.PackageRoot != "" {
+			item.PackageRoot = filepath.Clean(*p.PackageRoot)
+			if n, err := dirSize(item.PackageRoot); err == nil {
+				item.Bytes = n
+			}
+		}
+		resp.Candidates++
+		if item.Parked {
+			resp.ParkedRows++
+		}
+
+		// Skip parked encodes unless explicitly included — a disabled channel
+		// still pools them and may be re-enabled.
+		if item.Parked && !includeParked {
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+
+		// Eligible for deletion; TotalBytes reflects this on dry-run too.
+		resp.TotalBytes += item.Bytes
+		if dryRun {
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+
+		// Disk first, then the row — mirrors handleMaintenanceOrphanPackages so a
+		// failed disk cleanup still removes the row and the next sweep finishes.
+		if item.PackageRoot != "" {
+			if err := deletePackageContents(item.PackageRoot); err != nil {
+				resp.Warnings = append(resp.Warnings, fmt.Sprintf("disk cleanup %s: %v", item.PackageRoot, err))
+			}
+		}
+		if err := db.DeleteMediaPackage(r.Context(), a.dbConn, p.ID); err != nil {
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf("delete package row %s: %v", p.ID, err))
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+		item.Deleted = true
+		resp.DeletedRows++
+		resp.Items = append(resp.Items, item)
+	}
+
+	if !dryRun && globalRoot != "" {
+		pruneEmptyChildDirs(globalRoot)
+	}
+	writeJSON(w, resp)
+}
+
+// handleMaintenancePackageDelete reclaims a single media's encodes (package rows
+// + on-disk artifacts), optionally limited to one ?profile=. It defaults to a
+// dry-run; pass ?dry-run=false to delete. A media still referenced by a channel
+// is skipped unless ?force=true.
+func (a *App) handleMaintenancePackageDelete(w http.ResponseWriter, r *http.Request) {
+	mediaID := strings.TrimSpace(r.URL.Query().Get("media"))
+	if mediaID == "" {
+		writeError(w, http.StatusBadRequest, "missing_media", "media query parameter is required")
+		return
+	}
+	profile := strings.TrimSpace(r.URL.Query().Get("profile"))
+	force := r.URL.Query().Get("force") == "true"
+	dryRun := r.URL.Query().Get("dry-run") != "false"
+
+	res, err := a.reclaimMediaEncodes(r.Context(), []string{mediaID}, profile, force, dryRun)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	writeJSON(w, res)
 }

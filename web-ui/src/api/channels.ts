@@ -5,6 +5,7 @@ import type {
   ChannelPolicy,
   ChannelSchedule,
   ChannelSchedulePreview,
+  EncodeReclaimResponse,
   GuideResponse,
   ProfileReadiness,
 } from "../types";
@@ -132,11 +133,22 @@ export async function setChannelHiddenFromGuide(channelID: string, hidden: boole
   }>(channelPath(channelID, `/${verb}`), { method: "POST" });
 }
 
-export async function deleteChannel(channelID: string) {
-  return apiFetch<{ channelID: string; deleted: boolean; note?: string }>(
-    channelPath(channelID),
-    { method: "DELETE" },
-  );
+export async function deleteChannel(
+  channelID: string,
+  opts: { reclaimEncodes?: boolean; force?: boolean } = {},
+) {
+  return apiFetch<{
+    channelID: string;
+    deleted: boolean;
+    note?: string;
+    reclaim?: EncodeReclaimResponse;
+  }>(channelPath(channelID), {
+    method: "DELETE",
+    query: {
+      "reclaim-encodes": opts.reclaimEncodes || undefined,
+      force: opts.force || undefined,
+    },
+  });
 }
 
 export async function cloneChannel(channelID: string) {

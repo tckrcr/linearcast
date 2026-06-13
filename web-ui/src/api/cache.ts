@@ -1,9 +1,11 @@
 import type {
   CacheSummary,
+  EncodeReclaimResponse,
   InvalidProfilePackageCleanupResponse,
   MissingMediaMaintenanceResponse,
   OptimizeDBMaintenanceResponse,
   OrphanPackagesMaintenanceResponse,
+  PackageIntegrityResponse,
 } from "../types";
 import { apiFetch } from "./client";
 
@@ -35,5 +37,32 @@ export async function cleanupOrphanPackages(dryRun: boolean) {
 export async function optimizeDatabase() {
   return apiFetch<OptimizeDBMaintenanceResponse>("/api/admin/maintenance/optimize-db", {
     method: "POST",
+  });
+}
+
+// getPackageIntegrity inspects ready packages read-only. With a media id it
+// reports that media's full ladder; without one it sweeps every ready package.
+export async function getPackageIntegrity(media?: string) {
+  return apiFetch<PackageIntegrityResponse>("/api/admin/maintenance/package-integrity", {
+    cache: "no-store",
+    query: { media: media?.trim() || undefined },
+  });
+}
+
+// reclaimMediaEncodes deletes a media's package rows and on-disk artifacts.
+// Referenced media are skipped unless force is set; dryRun previews without
+// touching anything.
+export async function reclaimMediaEncodes(
+  media: string,
+  opts: { profile?: string; force?: boolean; dryRun: boolean },
+) {
+  return apiFetch<EncodeReclaimResponse>("/api/admin/maintenance/packages", {
+    method: "DELETE",
+    query: {
+      media,
+      profile: opts.profile?.trim() || undefined,
+      force: opts.force || undefined,
+      "dry-run": opts.dryRun,
+    },
   });
 }

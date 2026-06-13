@@ -291,6 +291,58 @@ export type OptimizeDBMaintenanceResponse = {
   sizeAfter: number;
 };
 
+export type PackageIntegrityItem = {
+  packageId: string;
+  mediaId: string;
+  profile: string;
+  status: string;
+  checked: boolean;
+  initPresent: boolean;
+  manifestPresent: boolean;
+  segmentCount: number;
+  missingSegments?: string[];
+  fileError?: string;
+  packagedMs?: number;
+  sourceMs?: number;
+  shortfallMs?: number;
+  durationUnknown?: boolean;
+  truncated?: boolean;
+  ok: boolean;
+};
+
+export type PackageIntegrityResponse = {
+  generatedAt: string;
+  mediaId?: string;
+  checked: number;
+  problems: number;
+  unknownDuration: number;
+  packages: PackageIntegrityItem[];
+};
+
+export type EncodeReclaimItem = {
+  mediaId: string;
+  packageId: string;
+  profile: string;
+  status: string;
+  packageRoot?: string;
+  bytes?: number;
+  referenced: boolean;
+  skipped: boolean;
+  deleted: boolean;
+};
+
+export type EncodeReclaimResponse = {
+  generatedAt: string;
+  dryRun: boolean;
+  force: boolean;
+  candidates: number;
+  deletedRows: number;
+  skippedRows: number;
+  totalBytes: number;
+  items: EncodeReclaimItem[];
+  warnings?: string[];
+};
+
 export type PlexStatus = {
   connected: boolean;
   username?: string;

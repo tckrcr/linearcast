@@ -26,6 +26,9 @@ GET    /api/queue-depth                  Schedule coverage + cache lookahead
 GET    /api/channels                     Channel list
 POST   /api/channels/{id}/disable        Disable a channel
 POST   /api/channels/{id}/enable         Enable a channel
+DELETE /api/channels/{id}                Delete a disabled channel; add
+                                         ?reclaim-encodes=true to delete
+                                         unshared packaged encodes for its media
 
 GET    /api/admin/plex/status            Current admin Plex connection status
 PUT    /api/admin/plex/config            Set/test the admin Plex connection
@@ -36,6 +39,9 @@ POST   /api/admin/plex/scan              Scan a Plex library into the DB
 GET    /api/schedule-builder/shows       Media-group browse for the builder
 GET    /api/schedule-builder/package-candidates
 POST   /api/schedule-builder/channels    Create a channel from the builder
+
+GET    /api/admin/maintenance/package-integrity
+DELETE /api/admin/maintenance/packages
 
 POST   /api/channels/{id}/schedule/gaps/fill
                                          Fill an existing schedule gap with an
@@ -55,6 +61,17 @@ optional `offsetMs`, and an optional `offsetMode`. `offsetMode` defaults to
 rotation from where the previous placement of the same asset on the channel
 ended, wrapping back to the asset start when continuing would overrun its
 packaged duration. The response echoes the resolved `offsetMs`.
+
+`DELETE /api/channels/{id}` requires the channel to be disabled. By default it
+removes the channel, playlist membership, and schedule entries while keeping
+packaged media. With `?reclaim-encodes=true`, it also deletes package rows and
+on-disk artifacts for every media item from the deleted channel that is not
+still referenced by another channel; `?force=true` includes shared media.
+
+`GET /api/admin/maintenance/package-integrity` checks package files, optionally
+scoped with `?media=<id>`. `DELETE /api/admin/maintenance/packages?media=<id>`
+reclaims package rows and artifacts for one media item; it defaults to dry-run,
+and `?dry-run=false&force=true` commits deletion including referenced media.
 
 Jellyfin mirrors the Plex `status`/`config`/`libraries`/`scan` shape under
 `/api/admin/jellyfin/*`.

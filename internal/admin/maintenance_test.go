@@ -356,6 +356,142 @@ func TestHandleMaintenanceOrphanPackagesPreservesExtraFiles(t *testing.T) {
 	}
 }
 
+func TestHandleMaintenancePackageDelete(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	pkgRoot := filepath.Join(cacheDir, "packages")
+	dbPath := filepath.Join(dir, "linearcast.db")
+
+	conn, err := db.OpenReadWrite(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := db.ApplySchema(context.Background(), conn); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+
+	makeDir := func(rel string) string {
+		full := filepath.Join(pkgRoot, rel)
+		if err := os.MkdirAll(full, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", full, err)
+		}
+		if err := os.WriteFile(filepath.Join(full, "init.mp4"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write init: %v", err)
+		}
+		return filepath.Clean(full)
+	}
+	refRoot := makeDir("ref/h264-main-1080p")
+	unrefRoot := makeDir("unref/h264-main-1080p")
+
+	mustExec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := conn.Exec(query, args...); err != nil {
+			t.Fatalf("exec %q: %v", query, err)
+		}
+	}
+	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
+		playback_mode, required_package_profile, hidden_from_guide)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0)`)
+	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('ref', '/tmp/ref.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		       ('unref', '/tmp/unref.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0)`)
+	mustExec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, package_root, created_at_ms, updated_at_ms)
+		VALUES ('pkg-ref', 'ref', 'h264-main-1080p', 'ready', ?, 0, 0),
+		       ('pkg-unref', 'unref', 'h264-main-1080p', 'ready', ?, 0, 0)`, refRoot, unrefRoot)
+	// 'ref' is scheduled (referenced); 'unref' is used by no channel.
+	mustExec(`INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, created_at_ms)
+		VALUES ('sched-1', 'ch', 0, 'ref', 0, 18000, 0)`)
+
+	app := New(Config{
+		DB:       conn,
+		CacheDir: cacheDir,
+		Now:      func() time.Time { return time.UnixMilli(0).UTC() },
+	})
+
+	call := func(query string) encodeReclaimResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodDelete, "/api/admin/maintenance/packages?"+query, nil)
+		res := httptest.NewRecorder()
+		app.handleMaintenancePackageDelete(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+		}
+		var body encodeReclaimResponse
+		if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return body
+	}
+	pkgCount := func(id string) int {
+		t.Helper()
+		var c int
+		if err := conn.QueryRow(`SELECT COUNT(*) FROM media_packages WHERE id = ?`, id).Scan(&c); err != nil {
+			t.Fatalf("count %s: %v", id, err)
+		}
+		return c
+	}
+
+	// Missing media param -> 400.
+	{
+		req := httptest.NewRequest(http.MethodDelete, "/api/admin/maintenance/packages", nil)
+		res := httptest.NewRecorder()
+		app.handleMaintenancePackageDelete(res, req)
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("missing media: status=%d, want 400", res.Code)
+		}
+	}
+
+	// Dry-run on the unreferenced media: reports one candidate, deletes nothing.
+	dry := call("media=unref&dry-run=true")
+	if !dry.DryRun || dry.Candidates != 1 || dry.DeletedRows != 0 {
+		t.Fatalf("dry-run=%+v, want dryRun, 1 candidate, 0 deleted", dry)
+	}
+	if pkgCount("pkg-unref") != 1 {
+		t.Fatalf("dry-run deleted the row")
+	}
+	if _, err := os.Stat(unrefRoot); err != nil {
+		t.Fatalf("dry-run removed unref dir: %v", err)
+	}
+
+	// Real run on the unreferenced media: row and dir gone.
+	run := call("media=unref&dry-run=false")
+	if run.DeletedRows != 1 || run.SkippedRows != 0 {
+		t.Fatalf("unref run=%+v, want 1 deleted, 0 skipped", run)
+	}
+	if pkgCount("pkg-unref") != 0 {
+		t.Fatalf("pkg-unref still present")
+	}
+	if _, err := os.Stat(unrefRoot); !os.IsNotExist(err) {
+		t.Fatalf("unref dir still exists: err=%v", err)
+	}
+
+	// Referenced media without force: skipped, left intact.
+	skip := call("media=ref&dry-run=false")
+	if skip.DeletedRows != 0 || skip.SkippedRows != 1 || len(skip.Items) != 1 || !skip.Items[0].Skipped || !skip.Items[0].Referenced {
+		t.Fatalf("ref no-force=%+v, want 1 skipped referenced item, 0 deleted", skip)
+	}
+	if pkgCount("pkg-ref") != 1 {
+		t.Fatalf("pkg-ref deleted without force")
+	}
+	if _, err := os.Stat(refRoot); err != nil {
+		t.Fatalf("ref dir removed without force: %v", err)
+	}
+
+	// Referenced media WITH force: deleted.
+	forced := call("media=ref&dry-run=false&force=true")
+	if forced.DeletedRows != 1 || forced.SkippedRows != 0 {
+		t.Fatalf("ref force=%+v, want 1 deleted, 0 skipped", forced)
+	}
+	if pkgCount("pkg-ref") != 0 {
+		t.Fatalf("pkg-ref still present after force")
+	}
+	if _, err := os.Stat(refRoot); !os.IsNotExist(err) {
+		t.Fatalf("ref dir still exists after force: err=%v", err)
+	}
+}
+
 func TestHandleMaintenanceOptimizeDB(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "linearcast.db")

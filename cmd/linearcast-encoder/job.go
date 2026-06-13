@@ -32,21 +32,21 @@ func encodeJob(ctx context.Context, client *http.Client, cfg config, claim claim
 	sourcePath := filepath.Join(sourceDir, sourceFilename(claim.MediaPath, claim.MediaID))
 	n, err := downloadMedia(ctx, client, cfg, claim.MediaID, sourcePath)
 	if err != nil {
-		_ = failClaim(ctx, client, cfg, claim.PackageID, err.Error())
+		_ = failClaimWithKind(ctx, client, cfg, claim.PackageID, classifyClaimFailure(err), err.Error())
 		return err
 	}
 	fmt.Fprintf(out, "downloaded media=%s bytes=%d path=%s\n", claim.MediaID, n, sourcePath)
 
 	err = packager.EncodePackageOutput(ctx, sourcePath, packageDir, db.ScheduleGridMs, "veryfast", claim.Profile)
 	if err != nil {
-		_ = failClaim(ctx, client, cfg, claim.PackageID, err.Error())
+		_ = failClaimWithKind(ctx, client, cfg, claim.PackageID, classifyClaimFailure(err), err.Error())
 		return fmt.Errorf("encode package: %w", err)
 	}
 	fmt.Fprintf(out, "encoded package=%s path=%s\n", claim.PackageID, packageDir)
 
 	resp, err := completeClaim(ctx, client, cfg, claim.PackageID, packageDir)
 	if err != nil {
-		_ = failClaim(ctx, client, cfg, claim.PackageID, err.Error())
+		_ = failClaimWithKind(ctx, client, cfg, claim.PackageID, classifyClaimFailure(err), err.Error())
 		return err
 	}
 	fmt.Fprintf(out, "completed package=%s segments=%d duration_ms=%d\n",
@@ -55,6 +55,38 @@ func encodeJob(ctx context.Context, client *http.Client, cfg config, claim claim
 		fmt.Fprintf(out, "cleanup warning package=%s path=%s err=%v\n", claim.PackageID, jobDir, err)
 	}
 	return nil
+}
+
+func classifyClaimFailure(err error) string {
+	if isTerminalClaimFailure(err) {
+		return "terminal"
+	}
+	return "transient"
+}
+
+func isTerminalClaimFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	terminalPatterns := []string{
+		"download media returned 404",
+		"source file unavailable:",
+		" is a directory",
+		"source has no video stream",
+		"source has no audio stream",
+		"source video codec ",
+		" is not valid for profile ",
+		"unsupported video mode ",
+		"unsupported audio mode ",
+		"invalid data found when processing input",
+	}
+	for _, pattern := range terminalPatterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveConcurrency picks the effective worker count. A config override wins;

@@ -4,6 +4,27 @@
   gap: 8px;
 }
 
+.maintenance-encodes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.maintenance-encodes input[type="text"] {
+  flex: 1 1 180px;
+  min-width: 140px;
+}
+
+.maintenance-force {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 .maintenance-summary {
   display: flex;
   flex-direction: column;

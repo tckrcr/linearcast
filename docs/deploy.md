@@ -5,27 +5,24 @@ How to run linearcast on a server, plus the runtime configuration reference.
 ## Requirements
 
 - Docker with Docker Compose on the host
-- A media library accessible from the host (local path or NFS mount)
-- Go only if you build from source (see below)
+- A media library accessible from the host, mounted by default at `/data/media`
 
-## Build from source
+## Run
 
-The repo's root `docker-compose.yml` builds the image locally. The deploy
-script wraps build + start + release smoke checks:
+The public `docker-compose.yml` pulls `ghcr.io/tckrcr/linearcast:latest` and
+runs the single-container stack:
 
 ```sh
-cp deploy/.env.example .env   # the script also creates it on first run, then exits so you can edit
-scripts/deploy-linearcast.sh
+docker compose up -d
 ```
 
-The single container runs playback, admin API, schedule extender, local encoder
-worker, and web UI together under one service.
+Open `http://localhost:8080/admin`, sign in with the first-run password
+`linearcast`, then choose a new password when prompted. The password is stored
+in SQLite after first startup.
 
-A single `.env` beside the compose file drives everything: Docker Compose reads it automatically both for `${VAR}` interpolation (host bind paths, ports) and as the container `env_file` (runtime config). No `set -a; source` step is needed for manual `docker compose` commands.
-
-**Bind mounts are identity-mapped.** Host paths come from `LINEARCAST_DATA_DIR`, `LINEARCAST_CACHE_DIR`, and `LINEARCAST_MEDIA_ROOT` (defaults `/data/...`), and each is mounted at the same path inside the container. Because of that, `LINEARCAST_DB` and `CACHE_DIR` must point at paths *inside* those host dirs — e.g. with `LINEARCAST_DATA_DIR=/data/linearcast`, `LINEARCAST_DB=/data/linearcast/linearcast.db` is valid. A path outside the mounts produces a SQLite `CANTOPEN` error at startup.
-
-Schema migrations run automatically on startup — no manual init step.
+Schema migrations run automatically on startup. The single container runs
+playback, admin API, schedule extender, local encoder worker, and web UI
+together under one service.
 
 Useful server-side commands:
 
@@ -38,50 +35,34 @@ curl -fsS http://localhost:8080/api/healthz
 curl -fsS http://localhost:8080/status
 ```
 
-## Run an image tag
-
-`deploy/docker-compose.image.yml` is the pull-based compose file for a published
-or private registry image. Public GHCR publishing is planned but not wired yet;
-until then, set `LINEARCAST_IMAGE` to an image tag you publish yourself.
-Prefer an immutable version tag over `:latest` for reproducible rollbacks.
-
-```sh
-cp deploy/docker-compose.image.yml docker-compose.yml
-cp deploy/.env.example .env   # set LINEARCAST_IMAGE, host paths, and admin password
-docker compose up -d
-```
-
 ## Configuration
 
-Template: `deploy/.env.example`. A single `.env` holds everything — both the host bind paths Docker Compose interpolates and the runtime config the binaries read.
-
-**Compose host bind paths.** Interpolated by Docker Compose into the bind mounts (identity-mapped to the same in-container path), with defaults in the compose file:
+No `.env` file is required. The compose file has runnable defaults, and common
+host-specific settings can be overridden with shell environment variables when
+you run Docker Compose.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `LINEARCAST_DATA_DIR` | `/data/linearcast` | Host dir holding `linearcast.db` and state (read-write) |
-| `LINEARCAST_CACHE_DIR` | `/data/linearcast/cache` | Host dir for the packager output cache (read-write) |
-| `LINEARCAST_MEDIA_ROOT` | `/data/media` | Media library root (read-only); also read by the admin binary's local-source scanner |
+| `LINEARCAST_DATA_DIR` | `/data/linearcast` | Host dir holding `linearcast.db`, package cache, and state |
+| `LINEARCAST_MEDIA_ROOT` | `/data/media` | Host media library root, mounted read-only at `/data/media` in the container |
 | `WEB_UI_PORT` | `8080` | Public nginx/web UI port published by the compose file |
-| `LINEARCAST_IMAGE` | — | Image tag for `docker-compose.image.yml` deploys only |
+| `HOST_UID` | `1000` | Container process UID for writing state/cache files |
+| `HOST_GID` | `1000` | Container process GID for writing state/cache files |
+| `TZ` | `UTC` | Timezone for the running processes |
 
-**Runtime config.** Read by the linearcast binaries inside the container. Because mounts are identity-mapped, the path values must sit inside the host dirs above:
+Example with a custom media path and web port:
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `LINEARCAST_DB` | — | Path to `linearcast.db`, inside `LINEARCAST_DATA_DIR` (required) |
-| `CACHE_DIR` | — | Packager output root, inside `LINEARCAST_CACHE_DIR` (required) |
+```sh
+LINEARCAST_MEDIA_ROOT=/mnt/media WEB_UI_PORT=8090 docker compose up -d
+```
+
+The container runtime paths are fixed:
+
+| Variable | Value | Meaning |
+|----------|-------|---------|
+| `LINEARCAST_DB` | `/data/linearcast/linearcast.db` | SQLite database path |
+| `CACHE_DIR` | `/data/linearcast/cache` | Package cache path |
 | `LINEARCAST_ADDR` | `:8888` | Playback listen address inside the container |
-| `LINEARCAST_ADMIN_PASSWORD` | — | Required single-password auth for `/admin` and protected admin APIs |
-| `TZ` | — | Timezone for the running processes |
-| `LINEARCAST_ADMIN_ALLOW_NO_AUTH` | `false` | Development/recovery-only escape hatch; set `true` to start `linearcast-admin` without auth |
-| `LINEARCAST_ADMIN_COOKIE_SECURE` | `false` | Set `true` only when browsers access `/admin` over HTTPS |
-| `PLEX_URL` | — | Optional Plex base URL seed for admin builds (DB takes precedence once saved via Admin → Tools) |
-| `PLEX_PATH_MAP` | — | `plex=server` path prefix pairs |
-| `JELLYFIN_URL` | — | Jellyfin base URL for admin connection setup |
-| `JELLYFIN_PATH_MAP` | — | `jellyfin=server` path prefix pairs |
-| `LINEARCAST_OPENSUBS_API_KEY` | — | OpenSubtitles API key for subtitle backfill tools |
 
-Keep `.env` outside source control and readable only by the deploy user because it contains `LINEARCAST_ADMIN_PASSWORD`. Rotate the admin password by updating `.env` and restarting `linearcast-admin`, which also clears in-memory admin sessions. Do not ship a shared default password; set a unique value per deployment. Use `LINEARCAST_ADMIN_ALLOW_NO_AUTH=true` only for deliberate development or recovery starts when no admin password is available.
-
-For admin UI media-server integrations, set or clear Plex tokens and Jellyfin API keys from the Tools panel; credentials are stored in the database, not `.env`.
+For admin UI media-server integrations, set or clear Plex tokens and Jellyfin
+API keys from the Tools panel; credentials are stored in the database.

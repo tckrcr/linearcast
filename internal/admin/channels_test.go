@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
 )
@@ -33,7 +36,7 @@ func TestHandleChannelDeleteRequiresDisabledChannel(t *testing.T) {
 	}
 }
 
-func TestHandleChannelDeleteRemovesChannelButKeepsPackages(t *testing.T) {
+func TestHandleChannelDeleteKeepsPackagesByDefault(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertDeleteFixture(t, conn, false)
 
@@ -69,6 +72,95 @@ func TestHandleChannelDeleteRemovesChannelButKeepsPackages(t *testing.T) {
 	assertCount(t, conn, `SELECT COUNT(*) FROM media WHERE id = 'm1'`, 1)
 	assertCount(t, conn, `SELECT COUNT(*) FROM media_packages WHERE media_id = 'm1'`, 1)
 	assertCount(t, conn, `SELECT COUNT(*) FROM packaged_segments WHERE package_id = 'pkg-m1'`, 1)
+}
+
+func TestHandleChannelDeleteReclaimEncodes(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	pkgRoot := filepath.Join(cacheDir, "packages")
+	dbPath := filepath.Join(dir, "linearcast.db")
+
+	conn, err := db.OpenReadWrite(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := db.ApplySchema(context.Background(), conn); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+
+	makeDir := func(rel string) string {
+		full := filepath.Join(pkgRoot, rel)
+		if err := os.MkdirAll(full, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", full, err)
+		}
+		if err := os.WriteFile(filepath.Join(full, "init.mp4"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write init: %v", err)
+		}
+		return filepath.Clean(full)
+	}
+	sharedRoot := makeDir("shared/h264-main-1080p")
+	soloRoot := makeDir("solo/h264-main-1080p")
+
+	mustExec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := conn.Exec(query, args...); err != nil {
+			t.Fatalf("exec %q: %v", query, err)
+		}
+	}
+	// 'ch' is the disabled channel being deleted; 'keep' survives and also pools
+	// 'shared', so 'shared' must be skipped while 'solo' (only on 'ch') is reclaimed.
+	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
+		playback_mode, required_package_profile, hidden_from_guide)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-main-1080p', 0),
+		       ('keep', 'Keep', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0)`)
+	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('shared', '/tmp/shared.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		       ('solo', '/tmp/solo.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0)`)
+	// ch pool chains shared (head) -> solo; keep pool holds shared (head).
+	mustExec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms) VALUES
+		('ch', 'shared', NULL, 0),
+		('ch', 'solo', 'shared', 1),
+		('keep', 'shared', NULL, 0)`)
+	mustExec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, package_root, created_at_ms, updated_at_ms)
+		VALUES ('pkg-shared', 'shared', 'h264-main-1080p', 'ready', ?, 0, 0),
+		       ('pkg-solo', 'solo', 'h264-main-1080p', 'ready', ?, 0, 0)`, sharedRoot, soloRoot)
+
+	app := New(Config{DB: conn, CacheDir: cacheDir, Now: func() time.Time { return time.UnixMilli(0).UTC() }})
+
+	// Explicit reclaim deletes encodes for media no surviving channel uses.
+	req := httptest.NewRequest(http.MethodDelete, "/api/channels/ch?reclaim-encodes=true", nil)
+	req.SetPathValue("channelID", "ch")
+	res := httptest.NewRecorder()
+	app.handleChannelDelete(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	var body struct {
+		Deleted bool                  `json:"deleted"`
+		Reclaim encodeReclaimResponse `json:"reclaim"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.Deleted {
+		t.Fatalf("channel not deleted")
+	}
+	// 'solo' reclaimed; 'shared' skipped because 'keep' still pools it.
+	if body.Reclaim.DeletedRows != 1 || body.Reclaim.SkippedRows != 1 {
+		t.Fatalf("reclaim=%+v, want 1 deleted 1 skipped", body.Reclaim)
+	}
+
+	assertCount(t, conn, `SELECT COUNT(*) FROM media_packages WHERE id = 'pkg-solo'`, 0)
+	assertCount(t, conn, `SELECT COUNT(*) FROM media_packages WHERE id = 'pkg-shared'`, 1)
+	if _, err := os.Stat(soloRoot); !os.IsNotExist(err) {
+		t.Fatalf("solo dir still exists: err=%v", err)
+	}
+	if _, err := os.Stat(sharedRoot); err != nil {
+		t.Fatalf("shared dir removed despite being referenced: %v", err)
+	}
 }
 
 func TestHandleChannelCloneCreatesConfigCopyWithoutSchedule(t *testing.T) {

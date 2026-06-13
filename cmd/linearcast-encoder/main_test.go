@@ -283,6 +283,185 @@ func TestRunEncodeOnceSuccess(t *testing.T) {
 	}
 }
 
+func TestRunEncodeOnceTerminalFailureForIncompatibleSource(t *testing.T) {
+	requireFFmpeg(t)
+	source := filepath.Join(t.TempDir(), "source.mp4")
+	generateTinyMedia(t, source)
+	sourceBytes, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatal("default profile missing")
+	}
+	profile.Video.Mode = packageprofile.VideoModeCopy
+	profile.Video.CodecRequired = "hevc"
+
+	var failBody struct {
+		Kind   string `json:"kind"`
+		Reason string `json:"reason"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/encoder/claim":
+			body, _ := json.Marshal(map[string]any{
+				"packageId":        "pkg_1",
+				"mediaId":          "m1",
+				"mediaPath":        "/srv/media/source.mp4",
+				"renditionProfile": profile.Name,
+				"profile":          profile,
+			})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+		case "/api/encoder/media/m1":
+			_, _ = w.Write(sourceBytes)
+		case "/api/encoder/jobs/pkg_1/fail":
+			if err := json.NewDecoder(r.Body).Decode(&failBody); err != nil {
+				t.Fatalf("decode fail body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"newStatus":"failed"}`))
+		case "/api/encoder/jobs/pkg_1/complete":
+			t.Fatalf("unexpected complete request")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	var out bytes.Buffer
+	err = run(t.Context(), []string{"run-once"}, testEnv(map[string]string{
+		envAdminURL: srv.URL,
+		envAPIKey:   "lcenc_test",
+		envWorkDir:  t.TempDir(),
+	}), &out)
+	if err == nil || !strings.Contains(err.Error(), "source video codec") {
+		t.Fatalf("run err=%v, want source video codec failure\noutput:\n%s", err, out.String())
+	}
+	if failBody.Kind != "terminal" {
+		t.Fatalf("fail kind=%q, want terminal; body=%+v", failBody.Kind, failBody)
+	}
+	if !strings.Contains(failBody.Reason, "source video codec") {
+		t.Fatalf("fail reason=%q, want codec validation detail", failBody.Reason)
+	}
+}
+
+func TestRunEncodeOnceTerminalFailureForMissingRemoteMedia(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatal("default profile missing")
+	}
+
+	var failBody struct {
+		Kind   string `json:"kind"`
+		Reason string `json:"reason"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/encoder/claim":
+			body, _ := json.Marshal(map[string]any{
+				"packageId":        "pkg_1",
+				"mediaId":          "m1",
+				"mediaPath":        "/srv/media/missing.mp4",
+				"renditionProfile": profile.Name,
+				"profile":          profile,
+			})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+		case "/api/encoder/media/m1":
+			http.Error(w, "media file not found", http.StatusNotFound)
+		case "/api/encoder/jobs/pkg_1/fail":
+			if err := json.NewDecoder(r.Body).Decode(&failBody); err != nil {
+				t.Fatalf("decode fail body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"newStatus":"failed"}`))
+		case "/api/encoder/jobs/pkg_1/complete":
+			t.Fatalf("unexpected complete request")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	var out bytes.Buffer
+	err := run(t.Context(), []string{"run-once"}, testEnv(map[string]string{
+		envAdminURL: srv.URL,
+		envAPIKey:   "lcenc_test",
+		envWorkDir:  t.TempDir(),
+	}), &out)
+	if err == nil || !strings.Contains(err.Error(), "download media returned 404") {
+		t.Fatalf("run err=%v, want download 404 failure\noutput:\n%s", err, out.String())
+	}
+	if failBody.Kind != "terminal" {
+		t.Fatalf("fail kind=%q, want terminal; body=%+v", failBody.Kind, failBody)
+	}
+	if !strings.Contains(failBody.Reason, "download media returned 404") {
+		t.Fatalf("fail reason=%q, want download 404 detail", failBody.Reason)
+	}
+}
+
+func TestRunEncodeOnceTransientFailureForCompleteUpload(t *testing.T) {
+	requireFFmpeg(t)
+	source := filepath.Join(t.TempDir(), "source.mp4")
+	generateTinyMedia(t, source)
+	sourceBytes, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatal("default profile missing")
+	}
+
+	var failBody struct {
+		Kind   string `json:"kind"`
+		Reason string `json:"reason"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/encoder/claim":
+			body, _ := json.Marshal(map[string]any{
+				"packageId":        "pkg_1",
+				"mediaId":          "m1",
+				"mediaPath":        "/srv/media/source.mp4",
+				"renditionProfile": profile.Name,
+				"profile":          profile,
+			})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+		case "/api/encoder/media/m1":
+			_, _ = w.Write(sourceBytes)
+		case "/api/encoder/jobs/pkg_1/complete":
+			_, _ = io.Copy(io.Discard, r.Body)
+			http.Error(w, "temporary object store error", http.StatusBadGateway)
+		case "/api/encoder/jobs/pkg_1/fail":
+			if err := json.NewDecoder(r.Body).Decode(&failBody); err != nil {
+				t.Fatalf("decode fail body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"newStatus":"pending"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	var out bytes.Buffer
+	err = run(t.Context(), []string{"run-once"}, testEnv(map[string]string{
+		envAdminURL: srv.URL,
+		envAPIKey:   "lcenc_test",
+		envWorkDir:  t.TempDir(),
+	}), &out)
+	if err == nil || !strings.Contains(err.Error(), "complete returned 502") {
+		t.Fatalf("run err=%v, want complete upload failure\noutput:\n%s", err, out.String())
+	}
+	if failBody.Kind != "transient" {
+		t.Fatalf("fail kind=%q, want transient; body=%+v", failBody.Kind, failBody)
+	}
+}
+
 // TestRunEncodeLoopParallel verifies that the loop maintains multiple in-flight
 // jobs when the server's concurrency is > 1. It does this by blocking job 1's
 // source download until job 2 is claimed: if the loop were serial, job 2 would

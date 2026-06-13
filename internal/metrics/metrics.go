@@ -27,6 +27,10 @@ var (
 		Name: "linearcast_package_repair_requeues_total",
 		Help: "Ready packages moved back to pending for repair by source.",
 	}, []string{"source"})
+	PackageUnknownDuration = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "linearcast_package_unknown_duration",
+		Help: "Ready packages whose packaged/source duration is unknown, so the truncation audit could not run, as of the last integrity sweep.",
+	})
 	PackagedArtifactNotFoundTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "linearcast_packaged_artifact_not_found_total",
 		Help: "Packaged artifact 404 responses by bounded artifact type.",

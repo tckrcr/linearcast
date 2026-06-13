@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strings"
 )
 
 // UpsertMediaPackage inserts or updates one normalized/package metadata row.
@@ -316,6 +317,103 @@ func UnreferencedPackages(ctx context.Context, conn *sql.DB) ([]UnreferencedPack
 		return []UnreferencedPackage{}, nil
 	}
 	return rows, nil
+}
+
+// OrphanedEncodePackages returns package rows whose media is referenced by no
+// *enabled* channel — neither pooled (channel_media) nor scheduled
+// (schedule_entries) on a channel that is currently enabled. These are encodes
+// no live channel needs: the defense-in-depth backstop for the "every media
+// should trace to an active channel" invariant, catching leftovers from
+// channels deleted without reclaiming and rungs of an ABR ladder no active
+// channel still uses. A media pooled only on a *disabled* channel is included
+// here (its channel is parked, not active); callers that want to protect parked
+// channels cross-check MediaIDsReferenced, which is enabled-agnostic.
+func OrphanedEncodePackages(ctx context.Context, conn *sql.DB) ([]UnreferencedPackage, error) {
+	rows, err := queryRows(ctx, conn, scanUnreferencedPackage, `
+		SELECT mp.id, mp.media_id, mp.rendition_profile, mp.status,
+		       mp.package_root, mp.packaged_duration_ms
+		FROM media_packages mp
+		WHERE NOT EXISTS (
+			SELECT 1 FROM channel_media cm
+			JOIN channels c ON c.id = cm.channel_id
+			WHERE cm.media_id = mp.media_id AND c.enabled = 1
+		) AND NOT EXISTS (
+			SELECT 1 FROM schedule_entries se
+			JOIN channels c ON c.id = se.channel_id
+			WHERE se.media_id = mp.media_id AND c.enabled = 1
+		)
+		ORDER BY mp.media_id, mp.rendition_profile`)
+	if err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		return []UnreferencedPackage{}, nil
+	}
+	return rows, nil
+}
+
+// MediaIDsReferenced returns the subset of ids that are still referenced by a
+// channel — either scheduled (schedule_entries) or in a channel's media pool
+// (channel_media). Callers use it to decide which media's encodes are safe to
+// reclaim: a media absent from the returned set is used by no channel. The
+// schedule_entries half matches the UnreferencedPackages definition; the
+// channel_media half additionally protects media pooled on a surviving channel
+// but not yet scheduled.
+func MediaIDsReferenced(ctx context.Context, conn *sql.DB, ids []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(ids))
+	unique := make([]string, 0, len(ids))
+	seen := map[string]struct{}{}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return out, nil
+	}
+
+	const chunkSize = 900
+	for start := 0; start < len(unique); start += chunkSize {
+		end := start + chunkSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		chunk := unique[start:end]
+
+		var placeholders strings.Builder
+		for i := range chunk {
+			if i > 0 {
+				placeholders.WriteByte(',')
+			}
+			placeholders.WriteByte('?')
+		}
+		ph := placeholders.String()
+		query := `SELECT media_id FROM schedule_entries WHERE media_id IN (` + ph + `)
+			UNION
+			SELECT media_id FROM channel_media WHERE media_id IN (` + ph + `)`
+
+		args := make([]any, 0, len(chunk)*2)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+
+		referenced, err := queryRows(ctx, conn, scanString, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range referenced {
+			out[id] = true
+		}
+	}
+	return out, nil
 }
 
 func scanFutureScheduleEntry(row scanner) (ScheduleEntry, error) {

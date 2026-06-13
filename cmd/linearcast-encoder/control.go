@@ -126,7 +126,14 @@ func downloadMedia(ctx context.Context, client *http.Client, cfg config, mediaID
 }
 
 func failClaim(ctx context.Context, client *http.Client, cfg config, packageID, reason string) error {
-	body := strings.NewReader(`{"kind":"transient","reason":` + quoteJSON(reason) + `}`)
+	return failClaimWithKind(ctx, client, cfg, packageID, "transient", reason)
+}
+
+func failClaimWithKind(ctx context.Context, client *http.Client, cfg config, packageID, kind, reason string) error {
+	if kind != "terminal" {
+		kind = "transient"
+	}
+	body := strings.NewReader(`{"kind":` + quoteJSON(kind) + `,"reason":` + quoteJSON(reason) + `}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AdminURL+"/api/encoder/jobs/"+url.PathEscape(packageID)+"/fail", body)
 	if err != nil {
 		return err

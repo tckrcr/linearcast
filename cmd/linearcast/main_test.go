@@ -755,6 +755,50 @@ func TestOnDemandManifestEmitsSessionSegmentsWithoutReadyPackage(t *testing.T) {
 	}
 }
 
+func TestOnDemandSessionHandlerServesRetainedSegmentAfterRestart(t *testing.T) {
+	conn := newPlaybackTestDB(t)
+	nowMs := int64(120_000)
+	insertOnDemandPlaybackFixture(t, conn, nowMs, false)
+
+	sessions := newPlaybackTestSessions(t, nowMs, func(ctx context.Context, spec packager.LiveSessionSpec) (ondemand.Process, error) {
+		writePlaybackLivePlaylist(t, spec.OutDir, []int64{6000, 6000})
+		return newPlaybackFakeProcess(ctx), nil
+	})
+	defer sessions.Shutdown()
+	a := playbackTestApp(conn, sessions)
+
+	items, err := a.packagedManifestItemsForPlayback(context.Background(), "ch", "h264-main-1080p", nowMs)
+	if err != nil {
+		t.Fatalf("manifest items: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatalf("expected session segment")
+	}
+	parts := strings.Split(items[0].SegmentURI, "/")
+	if len(parts) < 2 {
+		t.Fatalf("unexpected session URI: %s", items[0].SegmentURI)
+	}
+	sessionID := parts[len(parts)-2]
+	name := parts[len(parts)-1]
+
+	sessions.RestartChannel("ch")
+
+	req := httptest.NewRequest(http.MethodGet, items[0].SegmentURI, nil)
+	req.SetPathValue("channelID", "ch")
+	req.SetPathValue("sessionID", sessionID)
+	req.SetPathValue("name", name)
+	res := httptest.NewRecorder()
+
+	a.handleSessionSegment(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want retained stale session segment", res.Code, res.Body.String())
+	}
+	if got := res.Body.String(); got != "segment" {
+		t.Fatalf("body=%q, want retained segment bytes", got)
+	}
+}
+
 func TestOnDemandManifestDoesNotRepeatSingleStartupSegment(t *testing.T) {
 	conn := newPlaybackTestDB(t)
 	entryStartMs := int64(120_000)

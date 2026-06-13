@@ -239,8 +239,8 @@ func TestSetBurnSubtitleLanguageRestartsWithoutFailureBudget(t *testing.T) {
 	if got := m.BurnSubtitleLanguage("ch1"); got != "eng" {
 		t.Fatalf("burn language = %q, want eng", got)
 	}
-	if _, ok := m.blacklist["e1"]; ok {
-		t.Fatalf("voluntary restart should not blacklist entry")
+	if until := m.blockedUntil["e1"]; until != 0 {
+		t.Fatalf("voluntary restart should not cooldown entry, blockedUntil=%d", until)
 	}
 	clock.Set(6_000)
 	if err := m.EnsureSession(context.Background(), "ch1", entry, "/media.mkv", testProfile(), 6000); err != nil {
@@ -248,6 +248,91 @@ func TestSetBurnSubtitleLanguageRestartsWithoutFailureBudget(t *testing.T) {
 	}
 	if len(procs) != 2 {
 		t.Fatalf("spawn count = %d, want 2", len(procs))
+	}
+}
+
+func TestDetachedSessionArtifactsRemainReadableUntilRetentionExpires(t *testing.T) {
+	clock := &fakeClock{now: 0}
+	var procs []*fakeProcess
+	m := newTestManager(t, clock, func(ctx context.Context, spec packager.LiveSessionSpec) (Process, error) {
+		p := newFakeProcess()
+		procs = append(procs, p)
+		go func() {
+			<-ctx.Done()
+			p.finish(ctx.Err())
+		}()
+		writeLivePlaylist(t, spec.OutDir, []int64{6000, 6000}, false)
+		return p, nil
+	})
+	defer m.Shutdown()
+
+	entry := testEntry("e1", "ch1", 0, 0, 120_000)
+	if err := m.EnsureSession(context.Background(), "ch1", entry, "/media.mkv", testProfile(), 6000); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	s1 := onlySession(t, m, "ch1", "e1")
+	m.tailOnce(s1)
+	oldID := s1.id
+	oldSeg := s1.segments[0]
+
+	m.RestartChannel("ch1")
+	if _, ok := m.InitPath("ch1", oldID); !ok {
+		t.Fatalf("detached init should remain readable during retention")
+	}
+	if path, ok := m.SegmentPath("ch1", oldID, oldSeg.Index); !ok || path != oldSeg.Path {
+		t.Fatalf("detached segment path=(%q,%v), want %q,true", path, ok, oldSeg.Path)
+	}
+	if _, err := os.Stat(oldSeg.Path); err != nil {
+		t.Fatalf("retained segment missing on disk: %v", err)
+	}
+
+	clock.Set(31_000)
+	m.sweep(clock.Now())
+	if _, ok := m.SegmentPath("ch1", oldID, oldSeg.Index); ok {
+		t.Fatalf("detached segment should expire after retention window")
+	}
+	if _, err := os.Stat(oldSeg.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retained session dir should be removed after expiry, stat err=%v", err)
+	}
+
+	for _, p := range procs {
+		p.finish(nil)
+	}
+}
+
+func TestRestartBudgetCooldownExpires(t *testing.T) {
+	clock := &fakeClock{now: 0}
+	var procs []*fakeProcess
+	m := newTestManager(t, clock, func(ctx context.Context, spec packager.LiveSessionSpec) (Process, error) {
+		p := newFakeProcess()
+		procs = append(procs, p)
+		go func() {
+			<-ctx.Done()
+			p.finish(ctx.Err())
+		}()
+		writeLivePlaylist(t, spec.OutDir, []int64{6000}, false)
+		return p, nil
+	})
+	m.restartBudget = 1
+	m.restartCooldownMs = 10_000
+	defer m.Shutdown()
+
+	entry := testEntry("e1", "ch1", 0, 0, 120_000)
+	if err := m.EnsureSession(context.Background(), "ch1", entry, "/media.mkv", testProfile(), 6000); err != nil {
+		t.Fatalf("ensure 1: %v", err)
+	}
+	procs[0].finish(errors.New("boom"))
+	<-onlySession(t, m, "ch1", "e1").done
+	if err := m.EnsureSession(context.Background(), "ch1", entry, "/media.mkv", testProfile(), 6000); err == nil {
+		t.Fatalf("expected budget cooldown error")
+	}
+
+	clock.Set(10_001)
+	if err := m.EnsureSession(context.Background(), "ch1", entry, "/media.mkv", testProfile(), 6000); err != nil {
+		t.Fatalf("ensure after cooldown: %v", err)
+	}
+	if len(procs) != 2 {
+		t.Fatalf("spawn count=%d, want 2", len(procs))
 	}
 }
 

@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { ChannelArtwork } from "./ChannelArtwork";
+import { Dialog } from "./Dialog";
 import {
   describeProbeResult,
   getMediaPackageProfileList,
@@ -189,6 +190,7 @@ function AdminWorkspace({
   });
   const [allowedProfiles, setAllowedProfiles] = useState<string[]>([]);
   const [profileDetails, setProfileDetails] = useState<Record<string, PackageProfile>>({});
+  const [deleteTarget, setDeleteTarget] = useState<ChannelSummary | null>(null);
   // When the schedule panel is open in edit mode this holds the channel to
   // preload; null means the panel is building a brand-new channel.
   const [scheduleChannelId, setScheduleChannelId] = useState<string | null>(null);
@@ -227,6 +229,17 @@ function AdminWorkspace({
 
   const selectedEnabled = enabledChannels.find((c) => c.id === selected) ?? null;
   const selectedDisabled = disabledChannels.find((c) => c.id === selected) ?? null;
+
+  function closeDeleteDialog() {
+    setDeleteTarget(null);
+  }
+
+  function confirmDeleteChannel(reclaimEncodes: boolean) {
+    if (!deleteTarget) return;
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    void deleteChannel(target.id, target.displayName, reclaimEncodes);
+  }
 
   // Auto-load allowed profiles on mount.
   useEffect(() => {
@@ -481,12 +494,39 @@ function AdminWorkspace({
               busy={rowBusy[selectedDisabled.id] ?? false}
               status={rowStatus[selectedDisabled.id] ?? ""}
               onEnable={() => void setEnabled(selectedDisabled.id, selectedDisabled.displayName, true)}
-              onDelete={() => void deleteChannel(selectedDisabled.id, selectedDisabled.displayName)}
+              onDelete={() => setDeleteTarget(selectedDisabled)}
             />
           )}
           </Suspense>
         </main>
       </div>
+      <Dialog
+        open={deleteTarget !== null}
+        onClose={closeDeleteDialog}
+        title={`Delete ${deleteTarget?.displayName || deleteTarget?.id || "channel"}`}
+      >
+        <div className="delete-channel-dialog">
+          <p>
+            Delete this disabled channel, its playlist membership, and its
+            schedule? Source media stays in the library. You can also reclaim
+            packaged encodes that are no longer used by another channel.
+          </p>
+          <div className="delete-channel-dialog-actions">
+            <button type="button" className="link-button" onClick={closeDeleteDialog}>
+              Cancel
+            </button>
+            <button type="button" onClick={() => confirmDeleteChannel(false)}>
+              Delete channel, keep encodes
+            </button>
+            <button type="button" className="danger" onClick={() => confirmDeleteChannel(true)}>
+              Delete channel and reclaim encodes
+            </button>
+          </div>
+          <p className="muted delete-channel-dialog-note">
+            Shared media is skipped; this never deletes source media files.
+          </p>
+        </div>
+      </Dialog>
     </div>
   );
 }

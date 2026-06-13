@@ -216,6 +216,86 @@ func TestCheckReadyPackageIntegrityRequeuesTruncatedDurations(t *testing.T) {
 	}
 }
 
+func TestInspectMediaPackages(t *testing.T) {
+	path := newWorkerTestDB(t)
+	conn, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer conn.Close()
+
+	root := t.TempDir()
+	goodRoot := filepath.Join(root, "good")
+	missRoot := filepath.Join(root, "miss")
+	if err := os.MkdirAll(goodRoot, 0o755); err != nil {
+		t.Fatalf("mkdir good: %v", err)
+	}
+	if err := os.MkdirAll(missRoot, 0o755); err != nil {
+		t.Fatalf("mkdir miss: %v", err)
+	}
+	writePackageFiles(t, goodRoot, true)  // every segment present
+	writePackageFiles(t, missRoot, false) // seg1.m4s absent
+
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('good', '/tmp/good.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		       ('miss', '/tmp/miss.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		       ('pend', '/tmp/pend.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	pkgDur := int64(12000)
+	for _, pkg := range []db.MediaPackage{
+		{ID: "pkg-good", MediaID: "good", RenditionProfile: db.DefaultPackageProfile, Status: db.PackageStatusReady, PackageRoot: &goodRoot, InitSegmentPath: strptr(filepath.Join(goodRoot, "init.mp4")), PackagedDurationMs: &pkgDur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		{ID: "pkg-miss", MediaID: "miss", RenditionProfile: db.DefaultPackageProfile, Status: db.PackageStatusReady, PackageRoot: &missRoot, InitSegmentPath: strptr(filepath.Join(missRoot, "init.mp4")), PackagedDurationMs: &pkgDur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		// Non-ready package: listed for a single-media query but skipped (Checked=false) and absent from the sweep.
+		{ID: "pkg-pend", MediaID: "pend", RenditionProfile: db.DefaultPackageProfile, Status: db.PackageStatusPending, CreatedAtMs: 1, UpdatedAtMs: 1},
+	} {
+		if err := db.UpsertMediaPackage(context.Background(), conn, pkg); err != nil {
+			t.Fatalf("upsert %s: %v", pkg.ID, err)
+		}
+	}
+
+	// Single-media: the intact ladder reports OK with both segments present.
+	good, err := InspectMediaPackages(context.Background(), conn, "good")
+	if err != nil {
+		t.Fatalf("inspect good: %v", err)
+	}
+	if len(good) != 1 || !good[0].OK || !good[0].InitPresent || good[0].SegmentCount != 2 || len(good[0].MissingSegments) != 0 {
+		t.Fatalf("good inspection=%+v, want 1 OK package, init present, 2 segments, none missing", good)
+	}
+
+	// Single-media: the package missing seg1.m4s is flagged with that exact URI.
+	miss, err := InspectMediaPackages(context.Background(), conn, "miss")
+	if err != nil {
+		t.Fatalf("inspect miss: %v", err)
+	}
+	if len(miss) != 1 || miss[0].OK || miss[0].SegmentCount != 2 ||
+		len(miss[0].MissingSegments) != 1 || miss[0].MissingSegments[0] != "seg1.m4s" {
+		t.Fatalf("miss inspection=%+v, want 1 not-OK package missing seg1.m4s", miss)
+	}
+	if !miss[0].InitPresent || !miss[0].ManifestPresent {
+		t.Fatalf("miss inspection=%+v, want init+manifest present", miss[0])
+	}
+
+	// Single-media: a non-ready package is listed but not file-checked.
+	pend, err := InspectMediaPackages(context.Background(), conn, "pend")
+	if err != nil {
+		t.Fatalf("inspect pend: %v", err)
+	}
+	if len(pend) != 1 || pend[0].Checked || pend[0].Status != string(db.PackageStatusPending) {
+		t.Fatalf("pend inspection=%+v, want 1 unchecked pending package", pend)
+	}
+
+	// Sweep: only ready packages, so the pending one is excluded.
+	all, err := InspectMediaPackages(context.Background(), conn, "")
+	if err != nil {
+		t.Fatalf("inspect all: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("sweep len=%d, want 2 ready packages", len(all))
+	}
+}
+
 func writePackageFiles(t *testing.T, root string, includeAllSegments bool) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(root, "init.mp4"), []byte("init"), 0o644); err != nil {

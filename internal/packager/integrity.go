@@ -180,27 +180,158 @@ func validateReadyPackageFiles(pkg db.MediaPackage) error {
 		return fmt.Errorf("init segment %s: %w", *pkg.InitSegmentPath, err)
 	}
 
-	if pkg.PackageRoot == nil || *pkg.PackageRoot == "" {
-		return fmt.Errorf("missing package_root")
-	}
-	playlist := filepath.Join(*pkg.PackageRoot, "stream.m3u8")
-	if err := requireRegularFile(playlist); err != nil {
-		return fmt.Errorf("manifest %s: %w", playlist, err)
-	}
-	segments, err := ParseHLSManifest(playlist)
+	root, segments, err := readyPackageManifestSegments(pkg)
 	if err != nil {
-		return fmt.Errorf("parse manifest %s: %w", playlist, err)
-	}
-	if len(segments) == 0 {
-		return fmt.Errorf("manifest %s contains no segments", playlist)
+		return err
 	}
 	for _, seg := range segments {
-		segmentPath := filepath.Join(*pkg.PackageRoot, filepath.FromSlash(seg.URI))
+		segmentPath := filepath.Join(root, filepath.FromSlash(seg.URI))
 		if err := requireRegularFile(segmentPath); err != nil {
 			return fmt.Errorf("segment %s: %w", segmentPath, err)
 		}
 	}
 	return nil
+}
+
+// readyPackageManifestSegments resolves a ready package's manifest and returns
+// its package root plus every segment the manifest lists, in order. It is the
+// shared enumeration used by both validateReadyPackageFiles (the fail-fast
+// requeue guard) and InspectMediaPackages (the read-only diagnostic) so the two
+// can never disagree about which files a ready package is expected to have.
+func readyPackageManifestSegments(pkg db.MediaPackage) (string, []HLSSegment, error) {
+	if pkg.PackageRoot == nil || *pkg.PackageRoot == "" {
+		return "", nil, fmt.Errorf("missing package_root")
+	}
+	root := *pkg.PackageRoot
+	playlist := filepath.Join(root, "stream.m3u8")
+	if err := requireRegularFile(playlist); err != nil {
+		return "", nil, fmt.Errorf("manifest %s: %w", playlist, err)
+	}
+	segments, err := ParseHLSManifest(playlist)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse manifest %s: %w", playlist, err)
+	}
+	if len(segments) == 0 {
+		return "", nil, fmt.Errorf("manifest %s contains no segments", playlist)
+	}
+	return root, segments, nil
+}
+
+// PackageInspection is a read-only per-package integrity report: filesystem
+// presence of every expected artifact plus packaged-vs-source duration status.
+// Unlike CheckReadyPackageIntegrity it never requeues, and unlike
+// validateReadyPackageFiles it enumerates every missing segment rather than
+// stopping at the first. Checked is false for non-ready packages, where the
+// file/duration fields are not meaningful.
+type PackageInspection struct {
+	PackageID       string
+	MediaID         string
+	Profile         string
+	Status          string
+	Checked         bool
+	InitPresent     bool
+	ManifestPresent bool
+	SegmentCount    int
+	MissingSegments []string
+	// FileError records a structural problem that stopped enumeration: a
+	// missing package_root, a missing/unparseable manifest, or an empty one.
+	FileError       string
+	PackagedMs      int64
+	SourceMs        int64
+	ShortfallMs     int64
+	DurationUnknown bool
+	Truncated       bool
+	// OK is true only for a ready package with every file present, a known
+	// duration, and no truncation.
+	OK bool
+}
+
+// InspectMediaPackages returns a read-only integrity report for the packages of
+// mediaID, or for every ready package when mediaID is empty. It mirrors the
+// maint package-integrity check without mutating anything: every expected
+// on-disk artifact is checked, every missing segment is reported, and each
+// ready package is compared against its source duration via the same
+// evalPackageDuration path CheckReadyPackageIntegrity uses to requeue. When
+// mediaID is set, all of that media's packages are listed (including non-ready
+// renditions, marked Checked=false) so the full ladder is visible.
+func InspectMediaPackages(ctx context.Context, conn *sql.DB, mediaID string) ([]PackageInspection, error) {
+	var packages []db.MediaPackage
+	var err error
+	if mediaID != "" {
+		packages, err = db.MediaPackagesForMedia(ctx, conn, mediaID)
+	} else {
+		packages, err = db.ReadyMediaPackages(ctx, conn)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list packages: %w", err)
+	}
+	durations, err := sourceDurations(ctx, conn, packages)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]PackageInspection, 0, len(packages))
+	for _, pkg := range packages {
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
+		insp := PackageInspection{
+			PackageID: pkg.ID,
+			MediaID:   pkg.MediaID,
+			Profile:   pkg.RenditionProfile,
+			Status:    string(pkg.Status),
+		}
+		if pkg.Status != db.PackageStatusReady {
+			out = append(out, insp)
+			continue
+		}
+		insp.Checked = true
+
+		fileRep := inspectPackageFiles(pkg)
+		insp.InitPresent = fileRep.InitPresent
+		insp.ManifestPresent = fileRep.ManifestPresent
+		insp.SegmentCount = fileRep.SegmentCount
+		insp.MissingSegments = fileRep.MissingSegments
+		insp.FileError = fileRep.FileError
+
+		ds, flagged := evalPackageDuration(pkg, durations)
+		insp.PackagedMs = ds.PackagedMs
+		insp.SourceMs = ds.SourceMs
+		insp.ShortfallMs = ds.ShortfallMs
+		if flagged {
+			insp.DurationUnknown = ds.UnknownSource
+			insp.Truncated = !ds.UnknownSource
+		}
+
+		insp.OK = insp.InitPresent && insp.ManifestPresent &&
+			insp.FileError == "" && len(insp.MissingSegments) == 0 &&
+			!insp.DurationUnknown && !insp.Truncated
+		out = append(out, insp)
+	}
+	return out, nil
+}
+
+// inspectPackageFiles checks a ready package's on-disk artifacts read-only,
+// collecting every missing segment instead of failing at the first. It shares
+// readyPackageManifestSegments with validateReadyPackageFiles.
+func inspectPackageFiles(pkg db.MediaPackage) PackageInspection {
+	var rep PackageInspection
+	rep.InitPresent = pkg.InitSegmentPath != nil && *pkg.InitSegmentPath != "" &&
+		requireRegularFile(*pkg.InitSegmentPath) == nil
+
+	root, segments, err := readyPackageManifestSegments(pkg)
+	if err != nil {
+		rep.FileError = err.Error()
+		return rep
+	}
+	rep.ManifestPresent = true
+	rep.SegmentCount = len(segments)
+	for _, seg := range segments {
+		if requireRegularFile(filepath.Join(root, filepath.FromSlash(seg.URI))) != nil {
+			rep.MissingSegments = append(rep.MissingSegments, seg.URI)
+		}
+	}
+	return rep
 }
 
 func requireRegularFile(path string) error {

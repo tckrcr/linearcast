@@ -483,6 +483,27 @@
   font-size: 12px;
 }
 
+.delete-channel-dialog {
+  display: grid;
+  gap: 12px;
+  max-width: 520px;
+}
+
+.delete-channel-dialog p {
+  margin: 0;
+}
+
+.delete-channel-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.delete-channel-dialog-note {
+  font-size: 12px;
+}
+
 /* Policy editor row */
 
 .policy-editor-row {

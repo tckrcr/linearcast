@@ -641,16 +641,43 @@ func (a *App) handleChannelDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture the media pool before the channel (and its schedule entries /
+	// membership) are gone, so the post-delete reference check correctly means
+	// "still used by some other channel". Reclaim is opt-in to preserve the
+	// longstanding delete behavior; ?force=true deletes even media still
+	// referenced by another channel.
+	reclaim := r.URL.Query().Get("reclaim-encodes") == "true"
+	force := r.URL.Query().Get("force") == "true"
+	var mediaIDs []string
+	if reclaim {
+		mediaIDs, err = db.ChannelMediaOrdered(r.Context(), a.dbConn, channelID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			return
+		}
+	}
+
 	deleted, err := db.DeleteChannel(r.Context(), a.dbConn, channelID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
 	}
-	writeJSON(w, map[string]any{
+
+	resp := map[string]any{
 		"channelID": channelID,
 		"deleted":   deleted > 0,
-		"note":      "channel row, playlist membership, and schedule entries were deleted; media packages were kept.",
-	})
+		"note":      "channel row, playlist membership, and schedule entries were deleted; packaged media was kept.",
+	}
+	if reclaim {
+		rec, err := a.reclaimMediaEncodes(r.Context(), mediaIDs, "", force, false)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "reclaim_error", err.Error())
+			return
+		}
+		resp["reclaim"] = rec
+		resp["note"] = "channel deleted; encodes reclaimed for media no longer used by another channel (force deletes referenced media too)."
+	}
+	writeJSON(w, resp)
 }
 
 func (a *App) handleChannelClone(w http.ResponseWriter, r *http.Request) {

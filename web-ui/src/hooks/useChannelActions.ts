@@ -16,6 +16,7 @@ import {
   updateChannelUpstreamHLS as apiUpdateChannelUpstreamHLS,
 } from "../api";
 import { ApiError } from "../api/client";
+import { formatBytes } from "../format";
 import type { PackageProfile, PolicyDraft, ProfileReadiness, RowBusy, RowStatus } from "../types";
 
 const DEFAULT_PREFILL_HOURS = "24";
@@ -175,22 +176,25 @@ export function useChannelActions({
     }
   }
 
-  async function deleteChannel(channelID: string, displayName: string) {
-    if (
-      !window.confirm(
-        `Delete disabled channel "${displayName || channelID}"?\n\nThis removes the channel row, playlist membership, and schedule entries. Packaged media is kept.`,
-      )
-    )
-      return;
+  async function deleteChannel(channelID: string, displayName: string, reclaimEncodes: boolean) {
     setBusy(channelID, true);
-    setStatus(channelID, "deleting…");
+    setStatus(channelID, reclaimEncodes ? "deleting + reclaiming…" : "deleting…");
     try {
-      await apiDeleteChannel(channelID);
+      const res = await apiDeleteChannel(channelID, { reclaimEncodes });
       setRowStatus((prev) => {
         const next = { ...prev };
         delete next[channelID];
         return next;
       });
+      if (reclaimEncodes && res.reclaim) {
+        const r = res.reclaim;
+        const skipped = r.skippedRows
+          ? `; kept ${r.skippedRows} encode package(s) still used by another channel`
+          : "";
+        window.alert(
+          `Deleted "${displayName || channelID}".\n\nReclaimed ${r.deletedRows} encode package(s) (${formatBytes(r.totalBytes)})${skipped}. Source media files were not deleted.`,
+        );
+      }
       refreshChannels();
       if (selected === channelID) setSelected("tools");
     } catch (err) {

@@ -149,6 +149,7 @@ func (w *Worker) runIntegrityCheck(ctx context.Context, source string) {
 		log.Printf("WARN package integrity check source=%s: %v", source, err)
 		return
 	}
+	metrics.PackageUnknownDuration.Set(float64(res.DurationSkipped))
 	if res.FileReset > 0 {
 		metrics.PackageRepairRequeuesTotal.WithLabelValues("integrity_" + source).Add(float64(res.FileReset))
 		log.Printf("package integrity reset rows count=%d source=%s", res.FileReset, source)
