@@ -83,12 +83,13 @@ runtime state. It does not prove that a channel has playable media.
 smoke. It builds nothing — it expects `linearcast:local` to exist (run `docker
 compose build` first) — then boots the stack under an isolated, run-id-suffixed
 compose project (`container_name`/`ports` reset via
-`deploy/docker-compose.ci.yml`), joins the compose network, runs
-`release-smoke.sh` against the service by name, dumps `compose logs` on failure,
-and always tears down. Both `.gitea/workflows/test.yml` (develop pushes + PRs to
-`main`) and `.gitea/workflows/image.yml` (the `main` publish) call it on the same
-`linearcast:local` artifact, so the image published to the gitea registry is
-proven to boot before it is pushed.
+`deploy/docker-compose.ci.yml`), runs `release-smoke.sh`, dumps `compose logs` on
+failure, and always tears down. Containerized CI jobs join the compose network
+and probe the service by name; native CI jobs, including GitHub-hosted runners,
+publish ephemeral localhost ports for the smoke. Both `.gitea/workflows/test.yml`
+(develop pushes + PRs to `main`) and `.gitea/workflows/image.yml` (the `main`
+publish) call it on the same `linearcast:local` artifact, so the image published
+to the gitea registry is proven to boot before it is pushed.
 
 ## Encode Smoke
 
