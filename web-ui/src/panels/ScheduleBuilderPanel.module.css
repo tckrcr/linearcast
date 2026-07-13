@@ -61,7 +61,7 @@
 .sb-mode-btn.is-active {
   background: var(--accent-soft);
   color: var(--accent);
-  border-color: rgba(90, 169, 255, 0.4);
+  border-color: var(--accent-border);
 }
 
 .sb-slot-label {
@@ -82,6 +82,20 @@
   font-size: 14px;
   font-weight: 500;
   color: var(--text);
+}
+
+.sb-warning {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: 8px;
+  background: var(--warn-bg);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.sb-warning strong {
+  color: var(--warn);
 }
 
 .sb-profile-btns {
@@ -108,7 +122,7 @@
 .sb-profile-btn.is-active {
   background: var(--accent-soft);
   color: var(--accent);
-  border-color: rgba(90, 169, 255, 0.4);
+  border-color: var(--accent-border);
 }
 
 .sb-content-btns {
@@ -137,7 +151,7 @@
 .sb-content-btn.is-active {
   background: var(--accent-soft);
   color: var(--accent);
-  border-color: rgba(90, 169, 255, 0.4);
+  border-color: var(--accent-border);
 }
 
 .sb-picker-expanded {
@@ -240,9 +254,24 @@
   opacity: 1;
 }
 
-.sb-entry-title {
+.sb-entry-main {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sb-entry-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sb-entry-sub {
+  min-width: 0;
+  font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -326,7 +355,7 @@
 }
 
 .sb-show-card:hover {
-  border-color: rgba(90, 169, 255, 0.45);
+  border-color: var(--accent-border);
   background: var(--bg-secondary, var(--bg));
 }
 
@@ -337,7 +366,7 @@
   overflow: hidden;
   border-radius: 5px;
   border: 1px solid rgba(255, 255, 255, 0.08);
-  background: #14191f;
+  background: #1f1f1f;
 }
 
 .sb-show-poster-art {
@@ -466,45 +495,6 @@
   white-space: nowrap;
 }
 
-.sb-show-halves {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.sb-show-half {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-secondary, var(--bg));
-  font-size: 12px;
-}
-
-.sb-show-half-label {
-  font-weight: 800;
-  font-family: var(--mono);
-}
-
-.sb-show-half-sub {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.sb-show-half button {
-  padding: 3px 9px;
-  font-size: 12px;
-  line-height: 1.2;
-}
-
 .sb-import-row {
   display: flex;
   align-items: center;
@@ -526,8 +516,4 @@
     white-space: normal;
   }
 
-  .sb-show-halves {
-    grid-template-columns: 1fr;
-  }
 }
-

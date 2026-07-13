@@ -10,12 +10,17 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/liveproxy"
 )
 
-// upstreamProbeClient is used only for advisory reachability checks of live
-// channel upstreams. It mirrors the playback proxy's GET-based fetch but with a
-// shorter timeout since the probe is interactive.
-var upstreamProbeClient = &http.Client{Timeout: 6 * time.Second}
+// upstreamProbeClient is used only for advisory reachability checks of the
+// Spotify URL upstream. It mirrors the playback proxy's GET-based fetch but with
+// a shorter timeout since the probe is interactive. Like external-HLS playback
+// it permits any resolved address: the Spotify URL is an operator-set,
+// private-by-nature service (e.g. a LAN Spotify→HLS bridge), so a probe that
+// refused loopback/LAN would reject the real use case. See
+// cmd/linearcast/runtime.go.
+var upstreamProbeClient = liveproxy.NewGuardedClient(6*time.Second, liveproxy.AllowAllAddresses)
 
 func validUpstreamHLSURL(raw string) bool {
 	u, err := url.Parse(raw)
@@ -40,7 +45,7 @@ type probeUpstreamResponse struct {
 // handleChannelProbeUpstream checks whether an upstream HLS URL is reachable.
 // It is strictly advisory: it never creates or gates a channel. A failed probe
 // still returns 200 with reachable=false so the UI can warn without blocking,
-// matching the design intent that live channels are not URL-gated.
+// matching the design intent that Spotify URLs are not reachability-gated.
 func (a *App) handleChannelProbeUpstream(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var req probeUpstreamRequest
@@ -53,18 +58,23 @@ func (a *App) handleChannelProbeUpstream(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid_upstream_hls_url", "upstreamHlsUrl must be an http or https URL")
 		return
 	}
-	writeJSON(w, probeUpstreamHLS(r.Context(), req.UpstreamHLSURL))
+	// The interactive probe uses the guarded (deny-private) client so a paste of
+	// a loopback/LAN URL is rejected the same way playback would refuse it.
+	writeJSON(w, probeUpstreamHLSWith(r.Context(), upstreamProbeClient, req.UpstreamHLSURL))
 }
 
-// probeUpstreamHLS performs a single GET against the upstream and reports what
-// it found. Transport errors are returned as reachable=false rather than as an
-// HTTP error so the caller can surface an advisory warning.
-func probeUpstreamHLS(ctx context.Context, rawURL string) probeUpstreamResponse {
+// probeUpstreamHLSWith performs a single GET against the upstream and reports
+// what it found. Transport errors are returned as reachable=false rather than
+// as an HTTP error so the caller can surface an advisory warning. The client is
+// passed in so the interactive probe (guarded, deny-private) and the background
+// heartbeat (shared App client, matching fetchExternalNowPlaying) can share this
+// logic.
+func probeUpstreamHLSWith(ctx context.Context, client *http.Client, rawURL string) probeUpstreamResponse {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return probeUpstreamResponse{Error: err.Error()}
 	}
-	resp, err := upstreamProbeClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return probeUpstreamResponse{Error: err.Error()}
 	}

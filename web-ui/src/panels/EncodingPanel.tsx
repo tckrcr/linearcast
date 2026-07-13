@@ -1,6 +1,8 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   cancelMediaPackages,
+  deleteMediaPackages,
   deleteEncoder,
   encoderDownloadURL,
   getEncoderDownloads,
@@ -10,11 +12,12 @@ import {
   registerEncoder,
   requestMediaPackages,
   revokeEncoder,
+  stopChannelEncoder,
   updateEncoderConcurrency,
   updateLocalWorker,
 } from "../api";
 import { Dialog } from "../Dialog";
-import { formatMs } from "../format";
+import { formatBytes, formatMs } from "../format";
 import { usePolling } from "../hooks/usePolling";
 import type {
   EncoderDownloadsResponse,
@@ -24,15 +27,14 @@ import type {
   LocalWorkerItem,
   MediaPackageCandidateList,
   MediaPackageRequestResult,
+  OnDemandEncodingItem,
   PackageProfile,
+  SizeEstimate,
 } from "../types";
 import styles from "./EncodingPanel.module.css";
 
 const ALL_PROFILES = "all";
 
-function isABRProfile(profile: PackageProfile | undefined): boolean {
-  return (profile?.tags ?? []).includes("abr");
-}
 type EncoderPlatform = "darwin-arm64" | "darwin-amd64" | "windows-amd64" | "linux-amd64" | "linux-arm64";
 
 const ENCODER_PLATFORM_OPTIONS: Array<{ platform: EncoderPlatform; label: string }> = [
@@ -98,10 +100,13 @@ export function EncodingPanel() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [submitBusy, setSubmitBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
+  const [reclaimingId, setReclaimingId] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [lastResult, setLastResult] = useState<MediaPackageRequestResult | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [encoders, setEncoders] = useState<Array<EncoderListItem | LocalWorkerItem>>([]);
+  const [onDemandEncodings, setOnDemandEncodings] = useState<OnDemandEncodingItem[]>([]);
+  const [killingEncoding, setKillingEncoding] = useState<string | null>(null);
   const [encoderName, setEncoderName] = useState("");
   const [encoderBusy, setEncoderBusy] = useState(false);
   const [encoderStatus, setEncoderStatus] = useState("");
@@ -125,7 +130,7 @@ export function EncodingPanel() {
       .then((next) => {
         if (next.profiles.length === 0) return;
         const details = Object.fromEntries(next.profileDetails.map((item) => [item.name, item]));
-        const visible = next.profiles.filter((p) => !isABRProfile(details[p]));
+        const visible = next.profiles;
         setProfiles(visible);
         setProfileDetails(details);
         setProfile((current) => current === ALL_PROFILES || visible.includes(current) ? current : next.defaultProfile || visible[0]);
@@ -215,6 +220,7 @@ export function EncodingPanel() {
       }
       list.push(...(next.encoders ?? []));
       setEncoders(list);
+      setOnDemandEncodings(next.onDemandEncodings ?? []);
       if (!silent) setEncoderStatus("");
     } catch (err) {
       if (signal?.aborted) return;
@@ -223,12 +229,49 @@ export function EncodingPanel() {
     }
   }, []);
 
+  const handleKillEncoding = useCallback(async (channelId: string) => {
+    setKillingEncoding(channelId);
+    try {
+      await stopChannelEncoder(channelId);
+      void loadEncoders(false);
+    } catch (err) {
+      setEncoderStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setKillingEncoding(null);
+    }
+  }, [loadEncoders]);
+
   useEffect(() => { void loadEncoders(false); }, [loadEncoders]);
   usePolling({
     intervalMs: 10_000,
     maxIntervalMs: 60_000,
     task: (signal) => loadEncoders(true, signal),
   });
+
+  useEffect(() => {
+    const es = new EventSource("/api/admin/encoder-events");
+    es.onmessage = (e: MessageEvent<string>) => {
+      try {
+        const ev = JSON.parse(e.data) as { packageId: string; progressPct?: number; leaseExpiresMs: number };
+        setEncoders((prev) =>
+          prev.map((enc) => {
+            if (!enc.jobs?.some((j) => j.packageId === ev.packageId)) return enc;
+            return {
+              ...enc,
+              jobs: enc.jobs.map((j) =>
+                j.packageId === ev.packageId
+                  ? { ...j, progressPct: ev.progressPct, leaseExpiresMs: ev.leaseExpiresMs }
+                  : j,
+              ),
+            };
+          }),
+        );
+      } catch {
+        // malformed event — ignore
+      }
+    };
+    return () => es.close();
+  }, []);
 
   const loadEncoderDownloads = useCallback(() => {
     setDownloadsErr("");
@@ -281,6 +324,7 @@ export function EncodingPanel() {
   const selectableRows = visibleRows.filter((m) => m.selectable);
   const selectedCount = selectedIds.size;
   const countLabel = candidateCountLabel(statusFilter);
+  const estimateNote = sizeEstimateNote(profile, data);
   const counts = (data?.statusCounts ?? []).reduce<Record<string, number>>((acc, row) => {
     acc[row.status] = row.count;
     return acc;
@@ -346,6 +390,28 @@ export function EncodingPanel() {
     }
   }
 
+  async function reclaimPackages(mediaId: string, title: string) {
+    if (reclaimingId || profile === ALL_PROFILES) return;
+    const scope = profile.trim();
+    if (!window.confirm(`Delete "${title}" packages for profile "${scope}"? Encoded files will be removed from disk.`)) return;
+    setReclaimingId(mediaId);
+    setStatus(`reclaiming packages for "${title}"…`);
+    try {
+      const result = await deleteMediaPackages(mediaId, scope);
+      const freed = formatBytes(result.totalBytes);
+      if (result.skippedRows > 0) {
+        setStatus(`reclaimed ${result.deletedRows} package${result.deletedRows === 1 ? "" : "s"} (${freed}); ${result.skippedRows} skipped — in use by a channel`);
+      } else {
+        setStatus(`reclaimed ${result.deletedRows} package${result.deletedRows === 1 ? "" : "s"} (${freed})`);
+      }
+      loadCandidates(true);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setReclaimingId(null);
+    }
+  }
+
   async function submitEncoder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = encoderName.trim();
@@ -404,7 +470,12 @@ export function EncodingPanel() {
     <div className="admin-panel encoding-panel">
       <section className="admin-panel-section encoder-admin-section">
         <div className="section-headline">
-          <h2>Encoders</h2>
+          <div className="section-headline-main">
+            <h2>Encoders</h2>
+            <p className="section-purpose">
+              The local encoder plus any registered remote workers that package media.
+            </p>
+          </div>
           <button type="button" disabled={encoderBusy} onClick={() => loadEncoders(false)}>
             refresh
           </button>
@@ -438,6 +509,7 @@ export function EncodingPanel() {
             setNewEncoder(null);
           }}
         />
+        <div className={styles["encoder-table-wrap"]}>
         <table className={styles["encoder-table"]}>
           <thead>
             <tr>
@@ -544,6 +616,7 @@ export function EncodingPanel() {
             )}
           </tbody>
         </table>
+        </div>
         {revokedCount > 0 && (
           <div className={styles["encoder-revoked-toggle"]}>
             <button type="button" className="link-button" onClick={() => setShowRevoked((v) => !v)}>
@@ -554,11 +627,71 @@ export function EncodingPanel() {
           </div>
         )}
         {encoderStatus && <p className="channel-status-msg muted">{encoderStatus}</p>}
+        {onDemandEncodings.length > 0 && (
+          <div className={styles["encoder-table-wrap"]}>
+            <table className={styles["encoder-table"]}>
+              <thead>
+                <tr>
+                  <th>channel encoding</th>
+                  <th>status</th>
+                  <th>channel</th>
+                  <th>media</th>
+                  <th>profile</th>
+                  <th>segments</th>
+                  <th>elapsed</th>
+                  <th>last progress</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {onDemandEncodings.map((encoding) => {
+                  const title = encoding.mediaTitle || encoding.mediaId;
+                  const channel = encoding.channelName || encoding.channelId;
+                  const killing = killingEncoding === encoding.channelId;
+                  return (
+                    <tr key={encoding.encodingId}>
+                      <td>
+                        <span className={styles["encoder-name"]}>On-demand encoding</span>
+                        <span className={`muted ${styles["encoder-id"]}`}>{encoding.encodingId}</span>
+                      </td>
+                      <td>
+                        <span className={`episode-pkg ${encoding.processRunning ? "episode-pkg-ready" : "episode-pkg-missing"}`}>
+                          {encoding.state}
+                        </span>
+                      </td>
+                      <td>{channel}</td>
+                      <td className={styles["encoder-detail-cell"]} title={title}>{title}</td>
+                      <td>{encoding.profile}</td>
+                      <td>{encoding.segmentCount}</td>
+                      <td>{formatMs(now - encoding.spawnedAtMs)}</td>
+                      <td>{formatMs(now - encoding.lastProgressMs)}</td>
+                      <td>
+                        <button
+                          className="btn btn-danger btn-sm"
+                          onClick={() => void handleKillEncoding(encoding.channelId)}
+                          disabled={killing}
+                          title="Kill encoder (channel gated 15 min)"
+                        >
+                          {killing ? "…" : "✕"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       <section className="admin-panel-section encoding-status-section">
         <div className="section-headline">
-          <h2>Encoding status</h2>
+          <div className="section-headline-main">
+            <h2>Encoding status</h2>
+            <p className="section-purpose">
+              Queue health and per-job progress. Cancel pending work or retry failures here.
+            </p>
+          </div>
           <div className={styles["encoding-head-actions"]}>
             <button
               type="button"
@@ -608,30 +741,43 @@ export function EncodingPanel() {
             tone={(counts.processing ?? 0) > 0 ? "active" : undefined}
           />
         </div>
-        {activeJobs.length > 0 && (
-          <table className={styles["encoding-active-table"]}>
-            <thead>
-              <tr>
-                <th>encoding</th>
-                <th>duration</th>
-                <th>elapsed</th>
-              </tr>
-            </thead>
-            <tbody>
-              {activeJobs.map((job) => {
-                const elapsedMs = job.updatedAtMs != null ? now - job.updatedAtMs : null;
-                const title = job.title || job.path.split("/").pop() || job.mediaId;
-                return (
-                  <tr key={job.mediaId}>
-                    <td className={styles["encoding-active-title"]}>{title}</td>
-                    <td className={styles["encoding-active-num"]}>{formatMs(job.durationMs)}</td>
-                    <td className={styles["encoding-active-num"]}>{formatMs(elapsedMs)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
+        {activeJobs.length > 0 && (() => {
+          const progressByMediaId = new Map<string, number>();
+          for (const enc of encoders) {
+            for (const j of enc.jobs ?? []) {
+              if (j.progressPct != null) progressByMediaId.set(j.mediaId, j.progressPct);
+            }
+          }
+          return (
+            <table className={styles["encoding-active-table"]}>
+              <thead>
+                <tr>
+                  <th>encoding</th>
+                  <th>duration</th>
+                  <th>elapsed</th>
+                  <th>progress</th>
+                </tr>
+              </thead>
+              <tbody>
+                {activeJobs.map((job) => {
+                  const elapsedMs = job.updatedAtMs != null ? now - job.updatedAtMs : null;
+                  const title = job.title || job.path.split("/").pop() || job.mediaId;
+                  const pct = progressByMediaId.get(job.mediaId);
+                  return (
+                    <tr key={job.mediaId}>
+                      <td className={styles["encoding-active-title"]}>{title}</td>
+                      <td className={styles["encoding-active-num"]}>{formatMs(job.durationMs)}</td>
+                      <td className={styles["encoding-active-num"]}>{formatMs(elapsedMs)}</td>
+                      <td className={styles["encoding-active-num"]}>
+                        {pct != null ? `${pct}%` : <span className="muted">—</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          );
+        })()}
         {lastResult && (
           <div className={styles["encoding-run-summary"]}>
             <span>queued {lastResult.queued.length}</span>
@@ -661,7 +807,7 @@ export function EncodingPanel() {
             <span>search</span>
             <input
               value={filter}
-              placeholder="title, path, group, status…"
+              placeholder="title, group, status..."
               onChange={(e) => setFilter(e.target.value)}
             />
           </label>
@@ -696,6 +842,7 @@ export function EncodingPanel() {
               ? `${visibleRows.length}/${rows.length} loaded, ${data.count} ${countLabel} for ${data.profile === ALL_PROFILES ? "all profiles" : data.profile}`
               : "loading media"}
           </span>
+          {estimateNote && <span className="muted">· {estimateNote}</span>}
         </div>
 
         <ul className={styles["encoding-media-list"]}>
@@ -703,6 +850,7 @@ export function EncodingPanel() {
             const title = media.title || media.path.split("/").pop() || media.mediaId;
             const checked = selectedIds.has(media.mediaId);
             const statusLabel = packageStatusLabel(media.packageStatus, media.packageProfile || data?.profile || profile, profileDetails);
+            const sizeLabel = packageSizeLabel(media);
             return (
               <li key={media.mediaId} className={`${styles["encoding-media-row"]} status-${media.packageStatus}`}>
                 <label className={styles["encoding-media-check"]}>
@@ -715,7 +863,7 @@ export function EncodingPanel() {
                 </label>
                 <div className={styles["encoding-media-main"]}>
                   <span className={styles["encoding-media-title"]}>{title}</span>
-                  <span className="muted encoding-media-path">{media.path}</span>
+                  <span className={styles["encoding-media-path"]} title={media.path}>{media.path}</span>
                   {media.packageError && <span className="danger encoding-media-error">{media.packageError}</span>}
                 </div>
                 <div className={styles["encoding-media-meta"]}>
@@ -726,6 +874,20 @@ export function EncodingPanel() {
                     {statusLabel.text}
                   </span>
                   <span>{formatMs(media.durationMs)}</span>
+                  {sizeLabel && (
+                    <span className="muted" title={sizeLabel.title}>{sizeLabel.text}</span>
+                  )}
+                  {(media.packageStatus === "ready" || media.packageStatus === "failed") && (
+                    <button
+                      type="button"
+                      className="danger"
+                      disabled={profile === ALL_PROFILES || reclaimingId != null}
+                      title={profile === ALL_PROFILES ? "select a specific profile to reclaim packages" : "delete encoded packages from disk"}
+                      onClick={() => void reclaimPackages(media.mediaId, title)}
+                    >
+                      {reclaimingId === media.mediaId ? "reclaiming…" : "reclaim"}
+                    </button>
+                  )}
                 </div>
               </li>
             );
@@ -751,6 +913,67 @@ export function EncodingPanel() {
       </section>
     </div>
   );
+}
+
+// sizeEstimateLabel renders a media's estimated package size. Copy/target/CBR
+// profiles give a firm "≈ N" expected size; CRF profiles (no empirical bitrate
+// yet) can only bound it, shown as "≤ N" from the profile's max-bitrate ceiling.
+// Returns null when there is nothing to show (no estimate, or an uncapped CRF
+// profile with no known size).
+function sizeEstimateLabel(est: SizeEstimate | undefined): { text: string; title: string } | null {
+  if (!est) return null;
+  if (est.expectedKnown && est.expectedBytes > 0) {
+    let title: string;
+    switch (est.mode) {
+      case "copy":
+        title = "expected size (copy: video remuxed at source bitrate)";
+        break;
+      case "target":
+      case "cbr":
+        title = "expected size (target bitrate)";
+        break;
+      default:
+        // crf / capped-crf: measured from this profile's finished packages.
+        title = est.maxBytes > 0
+          ? `estimated from this profile's encoded packages (ceiling ≤ ${formatBytes(est.maxBytes)})`
+          : "estimated from this profile's encoded packages";
+    }
+    return { text: `≈ ${formatBytes(est.expectedBytes)}`, title };
+  }
+  if (est.maxBytes > 0) {
+    return {
+      text: `≤ ${formatBytes(est.maxBytes)}`,
+      title: "worst-case ceiling (CRF output size depends on content; capped at the profile's max bitrate)",
+    };
+  }
+  return null;
+}
+
+function packageSizeLabel(media: { packageStatus: string; packageBytes?: number; sizeEstimate?: SizeEstimate }): { text: string; title: string } | null {
+  if (media.packageStatus === "ready" && media.packageBytes != null) {
+    return {
+      text: formatBytes(media.packageBytes),
+      title: "actual encoded package size",
+    };
+  }
+  return sizeEstimateLabel(media.sizeEstimate);
+}
+
+// sizeEstimateNote summarizes the basis of the size column for the selected
+// profile, so a missing expected size is explained rather than silent. CRF
+// profiles say how many finished packages back the estimate (or that there are
+// none yet, hence ceiling-only).
+function sizeEstimateNote(profile: string, data: MediaPackageCandidateList | null): string | null {
+  if (!data || profile === ALL_PROFILES) return null;
+  const mode = data.media.find((m) => m.sizeEstimate)?.sizeEstimate?.mode;
+  if (!mode) return null;
+  if (mode === "copy") return "size ≈ exact (copy: source bitrate)";
+  if (mode === "target" || mode === "cbr") return "size ≈ from target bitrate";
+  // crf / capped-crf
+  const n = data.estimateSamples ?? 0;
+  return n > 0
+    ? `size ≈ measured from ${n} finished package${n === 1 ? "" : "s"}`
+    : "size ≤ ceiling only — no finished packages yet to estimate from";
 }
 
 function profileOptionLabel(name: string, detail?: PackageProfile) {
@@ -898,22 +1121,44 @@ function EncoderActionsMenu({
   onDelete: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  // The dropdown is rendered in a portal with fixed positioning so it escapes
+  // the encoder table's horizontal-scroll container, which would otherwise clip
+  // it and grow a stray vertical scrollbar. Coords are right-anchored to the
+  // toggle button.
+  const [coords, setCoords] = useState<{ top: number; right: number } | null>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
+    const button = toggleRef.current;
+    if (!button) return;
+    const reposition = () => {
+      const rect = button.getBoundingClientRect();
+      setCoords({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+    };
+    reposition();
     function onClick(event: MouseEvent) {
-      if (ref.current && !ref.current.contains(event.target as Node)) {
-        setOpen(false);
-      }
+      const target = event.target as Node;
+      if (toggleRef.current?.contains(target)) return;
+      if (dropdownRef.current?.contains(target)) return;
+      setOpen(false);
     }
     document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
+    window.addEventListener("resize", reposition);
+    // Capture scroll on any ancestor (e.g. the table wrap) so the menu tracks.
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      document.removeEventListener("mousedown", onClick);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
   }, [open]);
 
   return (
-    <div className="encoder-actions-menu" ref={ref}>
+    <div className={styles["encoder-actions-menu"]}>
       <button
+        ref={toggleRef}
         type="button"
         className={styles["encoder-actions-toggle"]}
         disabled={busy}
@@ -923,18 +1168,24 @@ function EncoderActionsMenu({
       >
         ⋮
       </button>
-      {open && (
-        <div className={styles["encoder-actions-dropdown"]}>
-          {!encoder.revokedAtMs && (
-            <button type="button" className="danger" disabled={busy} onClick={() => { setOpen(false); onRevoke(); }}>
-              Revoke key
+      {open && coords &&
+        createPortal(
+          <div
+            ref={dropdownRef}
+            className={styles["encoder-actions-dropdown"]}
+            style={{ top: coords.top, right: coords.right }}
+          >
+            {!encoder.revokedAtMs && (
+              <button type="button" className="danger" disabled={busy} onClick={() => { setOpen(false); onRevoke(); }}>
+                Revoke key
+              </button>
+            )}
+            <button type="button" className="danger" disabled={busy} onClick={() => { setOpen(false); onDelete(); }}>
+              Delete
             </button>
-          )}
-          <button type="button" className="danger" disabled={busy} onClick={() => { setOpen(false); onDelete(); }}>
-            Delete
-          </button>
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
@@ -1005,7 +1256,7 @@ function EncoderRegisteredDialog({
   const [selectedOS, setSelectedOS] = useState<EncoderPlatform>(detectedOS);
 
   // Reset the OS selector to the freshly detected default each time the dialog
-  // (re)opens, so a previous session's pick doesn't stick around.
+  // (re)opens, so a previous encoding's pick doesn't stick around.
   useEffect(() => {
     if (open) setSelectedOS(detectedOS);
     // eslint-disable-next-line react-hooks/exhaustive-deps

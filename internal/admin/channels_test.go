@@ -99,8 +99,8 @@ func TestHandleChannelDeleteReclaimEncodes(t *testing.T) {
 		}
 		return filepath.Clean(full)
 	}
-	sharedRoot := makeDir("shared/h264-main-1080p")
-	soloRoot := makeDir("solo/h264-main-1080p")
+	sharedRoot := makeDir("shared/h264-1080p-8mbps")
+	soloRoot := makeDir("solo/h264-1080p-8mbps")
 
 	mustExec := func(query string, args ...any) {
 		t.Helper()
@@ -112,8 +112,8 @@ func TestHandleChannelDeleteReclaimEncodes(t *testing.T) {
 	// 'shared', so 'shared' must be skipped while 'solo' (only on 'ch') is reclaimed.
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
 		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-main-1080p', 0),
-		       ('keep', 'Keep', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0)`)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-1080p-8mbps', 0),
+		       ('keep', 'Keep', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('shared', '/tmp/shared.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
@@ -124,8 +124,8 @@ func TestHandleChannelDeleteReclaimEncodes(t *testing.T) {
 		('ch', 'solo', 'shared', 1),
 		('keep', 'shared', NULL, 0)`)
 	mustExec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, package_root, created_at_ms, updated_at_ms)
-		VALUES ('pkg-shared', 'shared', 'h264-main-1080p', 'ready', ?, 0, 0),
-		       ('pkg-solo', 'solo', 'h264-main-1080p', 'ready', ?, 0, 0)`, sharedRoot, soloRoot)
+		VALUES ('pkg-shared', 'shared', 'h264-1080p-8mbps', 'ready', ?, 0, 0),
+		       ('pkg-solo', 'solo', 'h264-1080p-8mbps', 'ready', ?, 0, 0)`, sharedRoot, soloRoot)
 
 	app := New(Config{DB: conn, CacheDir: cacheDir, Now: func() time.Time { return time.UnixMilli(0).UTC() }})
 
@@ -202,7 +202,7 @@ func TestHandleChannelCloneCreatesConfigCopyWithoutSchedule(t *testing.T) {
 		t.Fatalf("clone row missing")
 	}
 	if clone.Ordering != "alphabetical" || clone.SourceDirectory != "/tmp" ||
-		clone.RequiredPackageProfile != "h264-main-1080p" ||
+		clone.RequiredPackageProfile != "h264-1080p-8mbps" ||
 		clone.PackagePrefillMs == nil || *clone.PackagePrefillMs != 86400000 {
 		t.Fatalf("clone config mismatch: %+v", clone)
 	}
@@ -228,7 +228,7 @@ func TestHandleCreateChannelWithUpstreamHLSURL(t *testing.T) {
 	app, conn := testAdminApp(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/channels", bytes.NewBufferString(`{
 		"displayName":"Spotify",
-		"upstreamHlsUrl":"http://192.168.1.100:8080/hls/stream.m3u8"
+		"upstreamHlsUrl":"http://stream.example.test/hls/stream.m3u8"
 	}`))
 	res := httptest.NewRecorder()
 
@@ -241,7 +241,7 @@ func TestHandleCreateChannelWithUpstreamHLSURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup channel: %v", err)
 	}
-	if ch == nil || ch.UpstreamHLSURL == nil || *ch.UpstreamHLSURL != "http://192.168.1.100:8080/hls/stream.m3u8" {
+	if ch == nil || ch.UpstreamHLSURL == nil || *ch.UpstreamHLSURL != "http://stream.example.test/hls/stream.m3u8" {
 		t.Fatalf("channel upstream hls mismatch: %+v", ch)
 	}
 	if ch.RequiredPackageProfile != "" || ch.SourceDirectory != "" || ch.MediaKind != db.MediaKindMusic {
@@ -251,15 +251,15 @@ func TestHandleCreateChannelWithUpstreamHLSURL(t *testing.T) {
 	assertCount(t, conn, `SELECT COUNT(*) FROM schedule_entries WHERE channel_id = 'spotify'`, 0)
 }
 
-func TestHandleChannelHiddenFromGuideToggle(t *testing.T) {
+func TestHandleChannelPatchHiddenFromGuideToggle(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertDeleteFixture(t, conn, true)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/channels/ch/hide-from-guide", nil)
+	req := httptest.NewRequest(http.MethodPatch, "/api/channels/ch", bytes.NewBufferString(`{"hiddenFromGuide":true}`))
 	req.SetPathValue("channelID", "ch")
 	res := httptest.NewRecorder()
 
-	app.handleChannelHideFromGuide(res, req)
+	app.handleChannelPatch(res, req)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("hide status=%d body=%s", res.Code, res.Body.String())
@@ -272,11 +272,11 @@ func TestHandleChannelHiddenFromGuideToggle(t *testing.T) {
 		t.Fatalf("channel was not hidden: %+v", ch)
 	}
 
-	req = httptest.NewRequest(http.MethodPost, "/api/channels/ch/show-in-guide", nil)
+	req = httptest.NewRequest(http.MethodPatch, "/api/channels/ch", bytes.NewBufferString(`{"hiddenFromGuide":false}`))
 	req.SetPathValue("channelID", "ch")
 	res = httptest.NewRecorder()
 
-	app.handleChannelShowInGuide(res, req)
+	app.handleChannelPatch(res, req)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("show status=%d body=%s", res.Code, res.Body.String())
@@ -287,6 +287,60 @@ func TestHandleChannelHiddenFromGuideToggle(t *testing.T) {
 	}
 	if ch == nil || ch.HiddenFromGuide {
 		t.Fatalf("channel was not shown: %+v", ch)
+	}
+}
+
+func TestHandleChannelPatchEnabledToggle(t *testing.T) {
+	app, conn := testAdminApp(t)
+	insertDeleteFixture(t, conn, true)
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/channels/ch", bytes.NewBufferString(`{"enabled":false}`))
+	req.SetPathValue("channelID", "ch")
+	res := httptest.NewRecorder()
+
+	app.handleChannelPatch(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("disable status=%d body=%s", res.Code, res.Body.String())
+	}
+	ch, err := db.ChannelByID(context.Background(), conn, "ch")
+	if err != nil {
+		t.Fatalf("lookup after disable: %v", err)
+	}
+	if ch == nil || ch.Enabled {
+		t.Fatalf("channel was not disabled: %+v", ch)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "/api/channels/ch", bytes.NewBufferString(`{"enabled":true}`))
+	req.SetPathValue("channelID", "ch")
+	res = httptest.NewRecorder()
+
+	app.handleChannelPatch(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s", res.Code, res.Body.String())
+	}
+	ch, err = db.ChannelByID(context.Background(), conn, "ch")
+	if err != nil {
+		t.Fatalf("lookup after enable: %v", err)
+	}
+	if ch == nil || !ch.Enabled {
+		t.Fatalf("channel was not enabled: %+v", ch)
+	}
+}
+
+func TestHandleChannelPatchRejectsEmptyBody(t *testing.T) {
+	app, conn := testAdminApp(t)
+	insertDeleteFixture(t, conn, true)
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/channels/ch", bytes.NewBufferString(`{}`))
+	req.SetPathValue("channelID", "ch")
+	res := httptest.NewRecorder()
+
+	app.handleChannelPatch(res, req)
+
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want bad request", res.Code, res.Body.String())
 	}
 }
 

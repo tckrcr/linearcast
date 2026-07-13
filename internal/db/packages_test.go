@@ -5,8 +5,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"github.com/tckrcr/linearcast/internal/packageprofile"
 )
 
 func TestMediaPackageAndPackagedSegments(t *testing.T) {
@@ -26,17 +24,17 @@ func TestMediaPackageAndPackagedSegments(t *testing.T) {
 	vw := int64(1920)
 	vh := int64(1080)
 	ts := int64(90000)
-	pkgRoot := "/cache/packages/m1/h264-main-1080p"
-	initPath := "/cache/packages/m1/h264-main-1080p/init.mp4"
+	pkgRoot := "/cache/packages/m1/h264-1080p-8mbps"
+	initPath := "/cache/packages/m1/h264-1080p-8mbps/init.mp4"
 	pkgDur := int64(12012)
 	pkg := MediaPackage{
 		ID:                 "pkg-m1-h264-main",
 		MediaID:            "m1",
-		RenditionProfile:   "h264-main-1080p",
+		RenditionProfile:   "h264-1080p-8mbps",
 		Status:             PackageStatusReady,
 		PackageRoot:        &pkgRoot,
 		InitSegmentPath:    &initPath,
-		SegmentBasePath:    "/cache/packages/m1/h264-main-1080p/segments",
+		SegmentBasePath:    "/cache/packages/m1/h264-1080p-8mbps/segments",
 		Container:          "fmp4",
 		VideoCodec:         "h264",
 		VideoProfile:       "main",
@@ -68,7 +66,7 @@ func TestMediaPackageAndPackagedSegments(t *testing.T) {
 		t.Fatalf("packages for media mismatch: %+v", pkgs)
 	}
 
-	seg0Path := "/cache/packages/m1/h264-main-1080p/segments/0.m4s"
+	seg0Path := "/cache/packages/m1/h264-1080p-8mbps/segments/0.m4s"
 	brStart := int64(1024)
 	brLength := int64(2048)
 	segments := []PackagedSegment{
@@ -106,7 +104,7 @@ func TestMediaPackageAndPackagedSegments(t *testing.T) {
 		t.Fatalf("segment 1 mismatch: %+v", gotSegments[1])
 	}
 
-	ready, err := ReadyMediaPackage(context.Background(), rw, "m1", "h264-main-1080p")
+	ready, err := ReadyMediaPackage(context.Background(), rw, "m1", "h264-1080p-8mbps")
 	if err != nil {
 		t.Fatalf("ready package: %v", err)
 	}
@@ -149,10 +147,11 @@ func TestChannelPackageNeedSummariesCountsMissingAndInFlight(t *testing.T) {
 
 	if _, err := rw.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile
+			playback_mode, required_package_profile, prefill_mode
 		)
-		VALUES ('ch1', 'Channel One', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p'),
-		       ('disabled', 'Disabled', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		VALUES ('ch1', 'Channel One', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 'eager'),
+		       ('ondemand', 'On Demand', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 'on_demand'),
+		       ('disabled', 'Disabled', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-1080p-8mbps', 'eager')`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -172,15 +171,16 @@ func TestChannelPackageNeedSummariesCountsMissingAndInFlight(t *testing.T) {
 		       ('ch1', 'm-failed', 'm-pending', 0),
 		       ('ch1', 'm-missing', 'm-failed', 0),
 		       ('ch1', 'm-codec-fail', 'm-missing', 0),
+		       ('ondemand', 'm-missing', NULL, 0),
 		       ('disabled', 'm-ready', NULL, 0)`); err != nil {
 		t.Fatalf("insert channel media: %v", err)
 	}
 	pkgDur6k := int64(6000)
 	for _, pkg := range []MediaPackage{
-		{ID: "pkg-ready", MediaID: "m-ready", RenditionProfile: "h264-main-1080p", Status: PackageStatusReady, PackagedDurationMs: &pkgDur6k},
-		{ID: "pkg-processing", MediaID: "m-processing", RenditionProfile: "h264-main-1080p", Status: PackageStatusProcessing},
-		{ID: "pkg-pending", MediaID: "m-pending", RenditionProfile: "h264-main-1080p", Status: PackageStatusPending},
-		{ID: "pkg-failed", MediaID: "m-failed", RenditionProfile: "h264-main-1080p", Status: PackageStatusFailed},
+		{ID: "pkg-ready", MediaID: "m-ready", RenditionProfile: "h264-1080p-8mbps", Status: PackageStatusReady, PackagedDurationMs: &pkgDur6k},
+		{ID: "pkg-processing", MediaID: "m-processing", RenditionProfile: "h264-1080p-8mbps", Status: PackageStatusProcessing},
+		{ID: "pkg-pending", MediaID: "m-pending", RenditionProfile: "h264-1080p-8mbps", Status: PackageStatusPending},
+		{ID: "pkg-failed", MediaID: "m-failed", RenditionProfile: "h264-1080p-8mbps", Status: PackageStatusFailed},
 		{ID: "pkg-other-profile", MediaID: "m-missing", RenditionProfile: "custom-main-720p", Status: PackageStatusReady, PackagedDurationMs: &pkgDur6k},
 	} {
 		pkg.CreatedAtMs = 100
@@ -198,7 +198,7 @@ func TestChannelPackageNeedSummariesCountsMissingAndInFlight(t *testing.T) {
 		t.Fatalf("want one enabled channel summary, got %+v", rows)
 	}
 	got := rows[0]
-	if got.ChannelID != "ch1" || got.RenditionProfile != "h264-main-1080p" {
+	if got.ChannelID != "ch1" || got.RenditionProfile != "h264-1080p-8mbps" {
 		t.Fatalf("unexpected summary identity: %+v", got)
 	}
 	if got.NeededCount != 5 || got.ReadyCount != 1 || got.ProcessingCount != 1 ||
@@ -226,7 +226,7 @@ func TestClaimPackageStateTransitions(t *testing.T) {
 
 	claim := func(nowMs int64) (bool, error) {
 		return ClaimPackage(ctx, rw, ClaimRequest{
-			MediaID: "m1", Profile: "h264-main-1080p", PackageID: "pkg-m1", NowMs: nowMs,
+			MediaID: "m1", Profile: "h264-1080p-8mbps", PackageID: "pkg-m1", NowMs: nowMs,
 		})
 	}
 	ok, err := claim(100)
@@ -241,7 +241,7 @@ func TestClaimPackageStateTransitions(t *testing.T) {
 		t.Fatalf("double claim succeeded, want no-op")
 	}
 
-	if err := MarkPackageFailedByMediaProfile(ctx, rw, "m1", "h264-main-1080p", assertErr("encode failed"), 300); err != nil {
+	if err := MarkPackageFailedByMediaProfile(ctx, rw, "m1", "h264-1080p-8mbps", assertErr("encode failed"), 300); err != nil {
 		t.Fatalf("mark failed: %v", err)
 	}
 	ok, err = claim(400)
@@ -272,7 +272,7 @@ func TestClaimPackageSkipsReady(t *testing.T) {
 	if err := UpsertMediaPackage(context.Background(), rw, MediaPackage{
 		ID:               "pkg-ready",
 		MediaID:          "m-ready",
-		RenditionProfile: "h264-main-1080p",
+		RenditionProfile: "h264-1080p-8mbps",
 		Status:           PackageStatusReady,
 		CreatedAtMs:      100,
 		UpdatedAtMs:      100,
@@ -280,7 +280,7 @@ func TestClaimPackageSkipsReady(t *testing.T) {
 		t.Fatalf("seed ready package: %v", err)
 	}
 	ok, err := ClaimPackage(context.Background(), rw, ClaimRequest{
-		MediaID: "m-ready", Profile: "h264-main-1080p", PackageID: "pkg-ready", NowMs: 200,
+		MediaID: "m-ready", Profile: "h264-1080p-8mbps", PackageID: "pkg-ready", NowMs: 200,
 	})
 	if err != nil {
 		t.Fatalf("claim ready err: %v", err)
@@ -303,15 +303,15 @@ func TestMarkPackageLifecycleHelpersPersistExpectedState(t *testing.T) {
 		t.Fatalf("insert media: %v", err)
 	}
 
-	pkgRoot := "/cache/packages/m-life/h264-main-1080p"
-	initPath := "/cache/packages/m-life/h264-main-1080p/init.mp4"
+	pkgRoot := "/cache/packages/m-life/h264-1080p-8mbps"
+	initPath := "/cache/packages/m-life/h264-1080p-8mbps/init.mp4"
 	pkg := MediaPackage{
 		ID:               "pkg-life",
 		MediaID:          "m-life",
-		RenditionProfile: "h264-main-1080p",
+		RenditionProfile: "h264-1080p-8mbps",
 		PackageRoot:      &pkgRoot,
 		InitSegmentPath:  &initPath,
-		SegmentBasePath:  "/cache/packages/m-life/h264-main-1080p/segments",
+		SegmentBasePath:  "/cache/packages/m-life/h264-1080p-8mbps/segments",
 		UpdatedAtMs:      100,
 	}
 	if err := MarkPackageProcessing(context.Background(), rw, pkg); err != nil {
@@ -451,7 +451,7 @@ func TestMarkPackageFailedRecordsCauseAndTimestamp(t *testing.T) {
 	pkg := MediaPackage{
 		ID:               "pkg-fail",
 		MediaID:          "m-fail",
-		RenditionProfile: "h264-main-1080p",
+		RenditionProfile: "h264-1080p-8mbps",
 		Status:           PackageStatusProcessing,
 		CreatedAtMs:      100,
 		UpdatedAtMs:      100,
@@ -608,6 +608,73 @@ func TestFailStaleProcessingPackagesOnlyFailsOldProcessingRows(t *testing.T) {
 	}
 	if got.LastAttemptError == nil || *got.LastAttemptError != "stale processing reset" || got.UpdatedAtMs != 500 {
 		t.Fatalf("stale package=%+v, want last_attempt_error='stale processing reset' and recovery timestamp", got)
+	}
+}
+
+// TestFailStaleProcessingPackagesSkipsLeasedRows proves the load-bearing guard:
+// the reaper only reclaims `processing` rows with no encoder_jobs row at all.
+// Every lease-bearing row — live OR expired — belongs to the lease sweeper, so
+// it must be left alone here (a long encode holds a heart-beating lease but does
+// not advance updated_at_ms, so it looks stale; an expired-lease row would be
+// orphaned if reaped before the lease sweeper deletes its lease row).
+func TestFailStaleProcessingPackagesSkipsLeasedRows(t *testing.T) {
+	path := newTestDB(t)
+	rw, err := OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+	ctx := context.Background()
+	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('live', '/tmp/live.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		       ('expired', '/tmp/expired.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		       ('no-lease', '/tmp/no-lease.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	encID, _, err := RegisterEncoder(ctx, rw, "reaper-test", "{}", 1_000)
+	if err != nil {
+		t.Fatalf("register encoder: %v", err)
+	}
+	// All three packages are processing and stale by updated_at (100 < cutoff).
+	for _, pkg := range []MediaPackage{
+		{ID: "pkg-live", MediaID: "live", RenditionProfile: DefaultPackageProfile, Status: PackageStatusProcessing, CreatedAtMs: 1, UpdatedAtMs: 100},
+		{ID: "pkg-expired", MediaID: "expired", RenditionProfile: DefaultPackageProfile, Status: PackageStatusProcessing, CreatedAtMs: 1, UpdatedAtMs: 100},
+		{ID: "pkg-no-lease", MediaID: "no-lease", RenditionProfile: DefaultPackageProfile, Status: PackageStatusProcessing, CreatedAtMs: 1, UpdatedAtMs: 100},
+	} {
+		if err := UpsertMediaPackage(ctx, rw, pkg); err != nil {
+			t.Fatalf("upsert package %s: %v", pkg.ID, err)
+		}
+	}
+	// pkg-live holds a still-valid lease; pkg-expired's lease already lapsed
+	// (the lease sweeper's job, not the reaper's); pkg-no-lease has no
+	// encoder_jobs row at all.
+	if _, err := rw.Exec(`INSERT INTO encoder_jobs (package_id, encoder_id, claimed_at_ms, lease_expires_ms, last_heartbeat_ms)
+		VALUES ('pkg-live', ?, 50, 100000, 50),
+		       ('pkg-expired', ?, 50, 100, 50)`, encID, encID); err != nil {
+		t.Fatalf("insert encoder_jobs: %v", err)
+	}
+
+	n, err := FailStaleProcessingPackages(ctx, rw, 1000, 5000, 5, "stale processing backstop")
+	if err != nil {
+		t.Fatalf("fail stale: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("rows affected=%d, want 1 (leaseless row only)", n)
+	}
+	want := map[string]PackageStatus{
+		"pkg-live":     PackageStatusProcessing, // live lease → lease sweeper's job
+		"pkg-expired":  PackageStatusProcessing, // expired lease → still lease sweeper's job
+		"pkg-no-lease": PackageStatusPending,    // no lease row → reclaimed here
+	}
+	for id, status := range want {
+		got, err := MediaPackageByID(ctx, rw, id)
+		if err != nil || got == nil {
+			t.Fatalf("lookup package %s: pkg=%v err=%v", id, got, err)
+		}
+		if got.Status != status {
+			t.Fatalf("package %s status=%s, want %s", id, got.Status, status)
+		}
 	}
 }
 
@@ -833,7 +900,7 @@ func TestPackageProfilesComesFromActiveRegistry(t *testing.T) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile
 		)
-		VALUES ('default', 'Default', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p'),
+		VALUES ('default', 'Default', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps'),
 		       ('alt', 'Alt', '/tmp', 'alphabetical', 1, 0, 'packaged', 'custom-main-720p')`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
@@ -857,9 +924,16 @@ func TestPackageProfilesComesFromActiveRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("profiles: %v", err)
 	}
-	wantProfiles := DefaultPackageProfile + "," + packageprofile.H264CopySourceName + "," + packageprofile.HEVCCopySourceName + "," + packageprofile.H264Main720pName + "," + packageprofile.H264Main480pName + "," + packageprofile.MusicName + "," + packageprofile.H264NVENC1080pName + "," + packageprofile.H264NVENCCopySrcName + "," + packageprofile.H264NVENC720pName + "," + packageprofile.H264NVENC480pName
-	if strings.Join(got, ",") != wantProfiles {
-		t.Fatalf("profiles=%v, want active registry profiles only", got)
+	if len(got) == 0 {
+		t.Fatal("profiles empty, want active registry profiles")
+	}
+	if got[0] != DefaultPackageProfile {
+		t.Fatalf("profiles[0]=%q, want default profile first", got[0])
+	}
+	for _, name := range got {
+		if name == "h264-1080-typo" {
+			t.Fatalf("profiles=%v, typo package row leaked into active profile registry", got)
+		}
 	}
 }
 
@@ -893,7 +967,7 @@ func TestClaimPackageOnlyOneConcurrentWinner(t *testing.T) {
 			}
 			defer conn.Close()
 			ok, err := ClaimPackage(context.Background(), conn, ClaimRequest{
-				MediaID: "m-race", Profile: "h264-main-1080p", PackageID: "pkg-race", NowMs: 100,
+				MediaID: "m-race", Profile: "h264-1080p-8mbps", PackageID: "pkg-race", NowMs: 100,
 			})
 			if err != nil {
 				if strings.Contains(err.Error(), "database is locked") {

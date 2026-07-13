@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -18,7 +19,24 @@ import (
 )
 
 const pdtLayout = "2006-01-02T15:04:05.000Z"
-const onDemandPlaybackLagMs int64 = 18_000
+const defaultOnDemandPlaybackLagMs int64 = 18_000
+
+// defaultOnDemandWarmupMs is how far playback trails the live encoder's seek
+// point. The encoder seeks to (now - playback lag) and runs forward at ~1x; serving
+// playback this much further back keeps the requested media position inside
+// already-closed segments instead of riding the not-yet-flushed live edge, which
+// a real-time transcode (unlike a near-free copy) can never stay ahead of. It is
+// the encoder's head-start buffer, not extra seek lag — only the served position
+// moves, the encoder still starts at the live edge.
+const defaultOnDemandWarmupMs int64 = 15_000
+
+// onDemandReadyCoverageMs is how much playable coverage (in ms) must exist from
+// the served position before an on-demand channel is declared ready, so the
+// player joins with a cushion instead of riding the live edge and stalling on
+// the first segment while the next is still encoding. Near the entry's end the
+// coverage remaining may be less; accept what is there so a program's tail
+// still serves.
+const onDemandReadyCoverageMs int64 = 4000
 
 type packagedManifestItem struct {
 	Package               db.MediaPackage
@@ -34,29 +52,12 @@ type packagedManifestItem struct {
 }
 
 type manifestItemOptions struct {
-	AllowOnDemandSessions bool
-}
-
-func (a *app) handlePackagedManifest(w http.ResponseWriter, r *http.Request) {
-	channelID := r.PathValue("channelID")
-	rt := a.lookupChannelOr404(r.Context(), w, channelID)
-	if rt == nil {
-		return
-	}
-	if rt.PlaybackMode != db.PlaybackModePackaged {
-		http.NotFound(w, r)
-		return
-	}
-	profile := a.packagedProfile
-	if rt := a.channel(channelID); rt != nil && rt.RequiredPackageProfile != "" {
-		profile = rt.RequiredPackageProfile
-	}
-	a.writePackagedManifest(w, r, channelID, profile)
+	AllowOnDemandEncodings bool
 }
 
 func (a *app) writePackagedManifest(w http.ResponseWriter, r *http.Request, channelID, profile string) {
-	if a.sessions != nil {
-		a.sessions.Touch(channelID)
+	if a.encodings != nil {
+		a.encodings.Touch(channelID)
 	}
 	started := time.Now()
 	result := "ready"
@@ -70,6 +71,8 @@ func (a *app) writePackagedManifest(w http.ResponseWriter, r *http.Request, chan
 		if errors.Is(err, ondemand.ErrAtCapacity) {
 			metrics.OnDemandAtCapacity503Total.Inc()
 			w.Header().Set("Retry-After", "2")
+		} else if retryAfter, ok := ondemand.RetryAfterSeconds(err, time.Now().UTC().UnixMilli()); ok {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
 		} else if strings.Contains(err.Error(), "warming") {
 			metrics.OnDemandWarming503Total.Inc()
 			w.Header().Set("Retry-After", "2")
@@ -126,10 +129,11 @@ func (a *app) packagedManifestItems(ctx context.Context, channelID, profile stri
 }
 
 func (a *app) packagedManifestItemsForPlayback(ctx context.Context, channelID, profile string, nowMs int64) ([]packagedManifestItem, error) {
-	return a.packagedManifestItemsWithOptions(ctx, channelID, profile, nowMs, manifestItemOptions{AllowOnDemandSessions: true})
+	return a.packagedManifestItemsWithOptions(ctx, channelID, profile, nowMs, manifestItemOptions{AllowOnDemandEncodings: true})
 }
 
 func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, profile string, nowMs int64, opts manifestItemOptions) ([]packagedManifestItem, error) {
+	rt := a.channel(channelID)
 	entries, err := db.ScheduleWindow(ctx, a.dbConn, channelID, nowMs, nowMs+manifestAheadMs)
 	if err != nil {
 		return nil, fmt.Errorf("schedule window: %w", err)
@@ -142,7 +146,6 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 	wallMs := nowMs
 	deadlineMs := nowMs + manifestAheadMs
 	recordedCurrentEntry := false
-	rt := a.channel(channelID)
 	for wallMs < deadlineMs && len(items) < packagedManifestLimit {
 		entry := db.FindScheduleEntry(entries, wallMs)
 		if entry == nil {
@@ -152,7 +155,7 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 		if err != nil {
 			return nil, fmt.Errorf("ready package media=%s profile=%s: %w", entry.MediaID, profile, err)
 		}
-		if rt != nil && rt.PrefillMode == "on_demand" && a.sessions != nil && a.sessions.BurnSubtitleLanguage(channelID) != "" {
+		if rt != nil && rt.PrefillMode != "eager" && a.encodings != nil && a.encodings.BurnSubtitleLanguage(channelID) != "" {
 			pkg = nil
 		}
 		if !recordedCurrentEntry && wallMs == nowMs {
@@ -162,10 +165,10 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 			recordedCurrentEntry = true
 		}
 		if pkg == nil {
-			if opts.AllowOnDemandSessions && rt != nil && rt.PrefillMode == "on_demand" {
+			if opts.AllowOnDemandEncodings && rt != nil && rt.PrefillMode != "eager" {
 				progressed, err := a.appendOnDemandManifestItems(ctx, &items, channelID, profile, *entry, wallMs, deadlineMs)
 				if err != nil {
-					// A later entry failing to admit a session (at capacity, spawn
+					// A later entry failing to admit an encoding (at capacity, spawn
 					// error) must not 503 a manifest that already has playable
 					// segments — truncate and let the next refresh extend it.
 					if len(items) > 0 {
@@ -175,7 +178,7 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 				}
 				if !progressed {
 					if len(items) == 0 {
-						return nil, fmt.Errorf("on-demand session warming media=%s profile=%s", entry.MediaID, profile)
+						return nil, fmt.Errorf("on-demand channel encoding warming media=%s profile=%s", entry.MediaID, profile)
 					}
 					break
 				}
@@ -204,7 +207,7 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 		}
 		progressed := false
 		entryMediaEnd := entry.OffsetMs + entry.DurationMs
-		onDemandChannel := rt != nil && rt.PrefillMode == "on_demand"
+		onDemandChannel := rt != nil && rt.PrefillMode != "eager"
 		sourceKey := pkg.ID
 		sequenceBase := int64(0)
 		discontinuitySequence := int64(0)
@@ -215,8 +218,8 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 			if err != nil {
 				return nil, err
 			}
-			if a.sessions != nil {
-				discontinuitySequence += a.sessions.ExtraDiscontinuities(channelID)
+			if a.encodings != nil {
+				discontinuitySequence += a.encodings.ExtraDiscontinuities(channelID)
 			}
 		} else {
 			sequenceBase, err = a.packagedManifestSequenceBase(ctx, channelID, profile, entry.StartMs)
@@ -253,8 +256,8 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 				Package:               *pkg,
 				Segment:               seg,
 				SourceKey:             sourceKey,
-				InitURI:               fmt.Sprintf("/channel/%s/%s/init/%s/init.mp4", channelID, packagedPath, pkg.ID),
-				SegmentURI:            fmt.Sprintf("/channel/%s/%s/segments/%s/%d.m4s", channelID, packagedPath, pkg.ID, seg.SegmentNumber),
+				InitURI:               fmt.Sprintf("init/%s/init.mp4", pkg.ID),
+				SegmentURI:            fmt.Sprintf("segments/%s/%d.m4s", pkg.ID, seg.SegmentNumber),
 				DurationMs:            seg.DurationMs,
 				Sequence:              sequence,
 				DiscontinuitySequence: discontinuitySequence,
@@ -279,8 +282,8 @@ func (a *app) packagedManifestItemsWithOptions(ctx context.Context, channelID, p
 }
 
 func (a *app) appendOnDemandManifestItems(ctx context.Context, items *[]packagedManifestItem, channelID, profile string, entry db.ScheduleEntry, wallMs, deadlineMs int64) (bool, error) {
-	if a.sessions == nil {
-		return false, fmt.Errorf("on-demand sessions unavailable")
+	if a.encodings == nil {
+		return false, fmt.Errorf("on-demand channel encodings unavailable")
 	}
 	p, err := db.GetPackageProfile(ctx, a.dbConn, profile)
 	if err != nil {
@@ -296,27 +299,47 @@ func (a *app) appendOnDemandManifestItems(ctx context.Context, items *[]packaged
 	if media == nil {
 		return false, fmt.Errorf("media %s not found", entry.MediaID)
 	}
-	opts := ondemand.SessionOptions{BurnSubtitleStreamIndex: a.burnSubtitleStreamIndexForMedia(ctx, channelID, media.ID)}
-	if err := a.sessions.EnsureSessionWithOptions(ctx, channelID, entry, media.Path, *p, scheduler.TargetSegmentMs, opts); err != nil {
-		if errors.Is(err, ondemand.ErrAtCapacity) {
-			return false, err
-		}
-		return false, fmt.Errorf("ensure on-demand session channel=%s entry=%s media=%s profile=%s: %w", channelID, entry.ID, entry.MediaID, profile, err)
+	playbackLagMs, warmupMs, err := a.onDemandTiming()
+	if err != nil {
+		return false, err
 	}
-	playbackWallMs := wallMs - onDemandPlaybackLagMs
+	playbackWallMs := wallMs - playbackLagMs
 	if playbackWallMs < entry.StartMs {
 		playbackWallMs = entry.StartMs
 	}
-	mediaPosMs := entry.OffsetMs + (playbackWallMs - entry.StartMs)
-	segs := a.sessions.SegmentsFrom(channelID, entry.ID, mediaPosMs, packagedManifestLimit-len(*items))
+	opts := ondemand.EncodingOptions{
+		BurnSubtitleStreamIndex: a.burnSubtitleStreamIndexForMedia(ctx, channelID, media.ID, *p),
+		// Request the same WebVTT subtitle outputs as the master-ready gate. If this
+		// steady-state path omitted them, reserveEncoding would see an option mismatch
+		// against the subtitle-enabled encoding and respawn a subtitle-less one on
+		// every poll, churning the encoding and dropping the CC track.
+		SubtitleStreamIndexes: subtitleStreamIndexesOf(a.englishSubtitleStreams(ctx, media.ID, media.Path)),
+		StartWallMs:           playbackWallMs,
+	}
+	if err := a.encodings.EnsureEncodingWithOptions(ctx, channelID, entry, media.Path, *p, scheduler.TargetSegmentMs, opts); err != nil {
+		if errors.Is(err, ondemand.ErrAtCapacity) {
+			return false, err
+		}
+		return false, fmt.Errorf("ensure on-demand channel encoding channel=%s entry=%s media=%s profile=%s: %w", channelID, entry.ID, entry.MediaID, profile, err)
+	}
+	servePosWallMs := playbackWallMs - warmupMs
+	if servePosWallMs < entry.StartMs {
+		servePosWallMs = entry.StartMs
+	}
+	mediaPosMs := entry.OffsetMs + (servePosWallMs - entry.StartMs)
+	segs := a.encodings.SegmentsFrom(channelID, entry.ID, mediaPosMs, packagedManifestLimit-len(*items))
 	if len(segs) == 0 {
-		return false, nil
+		segs = a.encodings.LatestSegments(channelID, entry.ID, packagedManifestLimit-len(*items))
+		if len(segs) == 0 {
+			return false, nil
+		}
+		log.Printf("INFO on-demand channel encoding behind serve position; serving latest segment tail channel_id=%s entry_id=%s media_pos_ms=%d tail_segments=%d", channelID, entry.ID, mediaPosMs, len(segs))
 	}
 	discSeq, err := a.onDemandDiscontinuitySequence(ctx, channelID, entry.StartMs)
 	if err != nil {
 		return false, err
 	}
-	discSeq += a.sessions.ExtraDiscontinuities(channelID)
+	discSeq += a.encodings.ExtraDiscontinuities(channelID)
 	entryMediaEnd := entry.OffsetMs + entry.DurationMs
 	emitted := false
 	for _, seg := range segs {
@@ -328,22 +351,22 @@ func (a *app) appendOnDemandManifestItems(ctx context.Context, items *[]packaged
 		}
 		// Number segments by the manager-assigned base sequence plus the
 		// segment's ordinal index. BaseSeq is anchored to the wall-clock grid and
-		// advanced past any prior session for the entry, so numbering stays
+		// advanced past any prior encoding for the entry, so numbering stays
 		// gap-free across copy-mode's irregular durations and monotonic across
-		// session restarts — no media sequence number ever maps to two different
-		// segments. For a first session with uniform 6s segments this matches
+		// encoding restarts — no media sequence number ever maps to two different
+		// segments. For a first encoding with uniform target-sized segments this matches
 		// onDemandMediaSequence(entry, seg.MediaStartMs).
 		seq := seg.BaseSeq + seg.Index
 		if !emitted && len(*items) > 0 {
 			prev := (*items)[len(*items)-1]
-			if prev.SourceKey != entry.ID+"/"+seg.SessionID && seq != prev.Sequence+1 {
+			if prev.SourceKey != entry.ID+"/"+seg.EncodingID && seq != prev.Sequence+1 {
 				*items = nil
 			}
 		}
 		*items = append(*items, packagedManifestItem{
-			SourceKey:             entry.ID + "/" + seg.SessionID,
-			InitURI:               fmt.Sprintf("/channel/%s/%s/%s/init.mp4", channelID, sessionPath, seg.SessionID),
-			SegmentURI:            fmt.Sprintf("/channel/%s/%s/%s/%d.m4s", channelID, sessionPath, seg.SessionID, seg.Index),
+			SourceKey:             entry.ID + "/" + seg.EncodingID,
+			InitURI:               fmt.Sprintf("../../%s/%s/init.mp4", encodingPath, seg.EncodingID),
+			SegmentURI:            fmt.Sprintf("../../%s/%s/%d.m4s", encodingPath, seg.EncodingID, seg.Index),
 			DurationMs:            seg.DurationMs,
 			Sequence:              seq,
 			DiscontinuitySequence: discSeq,
@@ -457,20 +480,26 @@ func (a *app) handlePackagedInit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
-	if pkg == nil || pkg.Status != db.PackageStatusReady || pkg.InitSegmentPath == nil {
+	if pkg == nil || pkg.Status != db.PackageStatusReady || pkg.RenditionProfile != r.PathValue("profile") || pkg.InitSegmentPath == nil {
 		metrics.PackagedArtifactNotFoundTotal.WithLabelValues("init").Inc()
 		http.NotFound(w, r)
 		return
 	}
-	if missingPackagedFile(*pkg.InitSegmentPath) {
+	initPath, ok := safePackagedArtifactPath(pkg, *pkg.InitSegmentPath)
+	if !ok {
 		metrics.PackagedArtifactNotFoundTotal.WithLabelValues("init").Inc()
-		a.requeueReadyPackageForMissingArtifact(r, r.PathValue("channelID"), pkg.ID, *pkg.InitSegmentPath, "playback_404")
+		http.NotFound(w, r)
+		return
+	}
+	if missingPackagedFile(initPath) {
+		metrics.PackagedArtifactNotFoundTotal.WithLabelValues("init").Inc()
+		a.requeueReadyPackageForMissingArtifact(r, r.PathValue("channelID"), pkg.ID, initPath, "playback_404")
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "public, max-age=300")
-	http.ServeFile(w, r, *pkg.InitSegmentPath)
+	http.ServeFile(w, r, initPath)
 }
 
 func (a *app) handlePackagedSegment(w http.ResponseWriter, r *http.Request) {
@@ -490,37 +519,56 @@ func (a *app) handlePackagedSegment(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	seg, err := db.PackagedSegmentByNumber(r.Context(), a.dbConn, r.PathValue("packageID"), segmentNumber)
+	packageID := r.PathValue("packageID")
+	pkg, err := db.MediaPackageByID(r.Context(), a.dbConn, packageID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if pkg == nil || pkg.Status != db.PackageStatusReady || pkg.RenditionProfile != r.PathValue("profile") {
+		metrics.PackagedArtifactNotFoundTotal.WithLabelValues("segment").Inc()
+		http.NotFound(w, r)
+		return
+	}
+	seg, err := db.PackagedSegmentByNumber(r.Context(), a.dbConn, packageID, segmentNumber)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
 	if seg == nil || seg.Path == nil {
 		metrics.PackagedArtifactNotFoundTotal.WithLabelValues("segment").Inc()
-		a.requeueReadyPackageForMissingArtifact(r, r.PathValue("channelID"), r.PathValue("packageID"), "packaged segment "+name, "playback_404")
+		a.requeueReadyPackageForMissingArtifact(r, r.PathValue("channelID"), packageID, "packaged segment "+name, "playback_404")
 		http.NotFound(w, r)
 		return
 	}
-	if missingPackagedFile(*seg.Path) {
+	segPath, ok := safePackagedArtifactPath(pkg, *seg.Path)
+	if !ok {
 		metrics.PackagedArtifactNotFoundTotal.WithLabelValues("segment").Inc()
-		a.requeueReadyPackageForMissingArtifact(r, r.PathValue("channelID"), r.PathValue("packageID"), *seg.Path, "playback_404")
+		http.NotFound(w, r)
+		return
+	}
+	if missingPackagedFile(segPath) {
+		metrics.PackagedArtifactNotFoundTotal.WithLabelValues("segment").Inc()
+		a.requeueReadyPackageForMissingArtifact(r, r.PathValue("channelID"), packageID, segPath, "playback_404")
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "video/iso.segment")
 	w.Header().Set("Cache-Control", "public, max-age=300")
-	http.ServeFile(w, r, *seg.Path)
+	http.ServeFile(w, r, segPath)
 }
 
-func (a *app) handleSessionInit(w http.ResponseWriter, r *http.Request) {
-	if a.lookupChannelOr404(r.Context(), w, r.PathValue("channelID")) == nil {
+func (a *app) handleEncodingInit(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelID")
+	if a.lookupChannelOr404(r.Context(), w, channelID) == nil {
 		return
 	}
-	if a.sessions == nil {
+	mgr := a.encodingManagerForChannel(channelID)
+	if mgr == nil {
 		http.NotFound(w, r)
 		return
 	}
-	path, ok := a.sessions.InitPath(r.PathValue("channelID"), r.PathValue("sessionID"))
+	path, ok := mgr.InitPath(channelID, r.PathValue("encodingID"))
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -530,11 +578,13 @@ func (a *app) handleSessionInit(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
-func (a *app) handleSessionSegment(w http.ResponseWriter, r *http.Request) {
-	if a.lookupChannelOr404(r.Context(), w, r.PathValue("channelID")) == nil {
+func (a *app) handleEncodingSegment(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelID")
+	if a.lookupChannelOr404(r.Context(), w, channelID) == nil {
 		return
 	}
-	if a.sessions == nil {
+	mgr := a.encodingManagerForChannel(channelID)
+	if mgr == nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -548,7 +598,7 @@ func (a *app) handleSessionSegment(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	path, ok := a.sessions.SegmentPath(r.PathValue("channelID"), r.PathValue("sessionID"), index)
+	path, ok := mgr.SegmentPath(channelID, r.PathValue("encodingID"), index)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -569,16 +619,46 @@ func missingPackagedFile(path string) bool {
 	return info.IsDir()
 }
 
+func safePackagedArtifactPath(pkg *db.MediaPackage, artifactPath string) (string, bool) {
+	if pkg == nil || pkg.PackageRoot == nil || strings.TrimSpace(*pkg.PackageRoot) == "" || strings.TrimSpace(artifactPath) == "" {
+		return "", false
+	}
+	root, err := filepath.Abs(*pkg.PackageRoot)
+	if err != nil {
+		return "", false
+	}
+	path, err := filepath.Abs(artifactPath)
+	if err != nil || !pathWithin(root, path) {
+		return "", false
+	}
+	if _, err := os.Stat(path); err == nil {
+		realRoot, rootErr := filepath.EvalSymlinks(root)
+		realPath, pathErr := filepath.EvalSymlinks(path)
+		if rootErr != nil || pathErr != nil || !pathWithin(realRoot, realPath) {
+			return "", false
+		}
+	}
+	return path, true
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." {
+		return err == nil
+	}
+	return rel != ".." && !strings.HasPrefix(rel, "../") && !filepath.IsAbs(rel)
+}
+
 func (a *app) requeueReadyPackageForMissingArtifact(r *http.Request, channelID, packageID, missingPath, source string) {
 	reason := fmt.Sprintf("packaged artifact missing during playback: %s", missingPath)
 	changed, err := db.MarkReadyPackagePendingForReencode(r.Context(), a.dbConn, packageID, time.Now().UTC().UnixMilli(), reason)
 	if err != nil {
-		log.Printf("WARN package reactive repair failed channel=%s package=%s missing=%q err=%v", channelID, packageID, missingPath, err)
+		log.Printf("WARN package reactive repair failed source=%s channel_id=%s package_id=%s missing=%q err=%q", source, channelID, packageID, missingPath, err.Error())
 		return
 	}
 	if changed {
 		metrics.PackageRepairRequeuesTotal.WithLabelValues(source).Inc()
-		log.Printf("package reactive repair queued channel=%s package=%s missing=%q", channelID, packageID, missingPath)
+		log.Printf("package reactive repair queued source=%s channel_id=%s package_id=%s missing=%q", source, channelID, packageID, missingPath)
 	}
 }
 

@@ -80,9 +80,9 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 10px 18px;
+  padding: 12px 20px;
   border-bottom: 1px solid var(--border);
-  background: var(--bg-elev);
+  background: #151515;
   flex-shrink: 0;
 }
 
@@ -109,16 +109,11 @@
 }
 
 .admin-page-title {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   color: var(--text-muted);
-}
-
-.admin-page-updated {
-  font-family: var(--mono);
-  font-size: 12px;
 }
 
 .admin-page-session {
@@ -209,7 +204,7 @@
   width: 220px;
   flex-shrink: 0;
   border-right: 1px solid var(--border);
-  background: var(--bg-elev);
+  background: #141414;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -231,7 +226,7 @@
   font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   color: var(--text-dim);
 }
 
@@ -264,9 +259,10 @@
 }
 
 .admin-sidebar-item.is-selected {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: #2a2a2a;
+  color: var(--text);
   border-color: transparent;
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 .admin-sidebar-item.is-disabled {
@@ -352,7 +348,7 @@
   min-width: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  background: var(--bg);
+  background: #0f0f0f;
 }
 
 .admin-panel {
@@ -386,10 +382,155 @@
   color: var(--text-muted);
 }
 
+/* ---------- Canonical section head: title + optional purpose + action ----------
+   Every admin section opens with a `.section-headline`. The title (and an
+   optional one-line `.section-purpose` beneath it) sit left in
+   `.section-headline-main`; any action controls sit right. */
+
+.section-headline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+/* When a purpose makes the title block two lines tall, top-align the action
+   cluster with the title rather than floating it in the vertical middle. */
+.section-headline:has(.section-headline-main) {
+  align-items: flex-start;
+}
+
+.section-headline h2,
+.section-headline h3 {
+  margin: 0;
+}
+
+.section-headline button {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.section-headline-main {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+/* Right-side action cluster when a section head carries more than one control. */
+.section-headline-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+/* Purpose text: one short line explaining what the section is for. Works both
+   inside `.section-headline-main` and standalone right under a bare heading. */
+.section-purpose {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+  color: var(--text-muted);
+  max-width: 72ch;
+}
+
+/* A heading with no action row still wants its purpose tucked beneath it.
+   The h2 carries a 14px bottom margin; pull the purpose up so the title and its
+   description read as one group (~7px) with normal spacing to the content below. */
+.admin-panel-section h2 + .section-purpose {
+  margin-top: -7px;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 760px) {
+  .section-headline {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .section-headline-actions {
+    justify-content: flex-start;
+  }
+}
+
+.admin-field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.admin-field-help {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  color: var(--text-muted);
+  background: var(--bg-elev-2);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+}
+
+.admin-field-help:hover,
+.admin-field-help:focus {
+  color: var(--text);
+  border-color: var(--accent);
+  outline: none;
+}
+
+.admin-field-help::after {
+  content: attr(data-help);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  width: max-content;
+  max-width: min(280px, 70vw);
+  transform: translateX(-50%);
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-elev-2);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.35;
+  white-space: normal;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.admin-field-help:hover::after,
+.admin-field-help:focus::after {
+  opacity: 1;
+}
+
+@media (max-width: 760px) {
+  .admin-field-help::after {
+    left: auto;
+    right: 0;
+    transform: none;
+  }
+}
+
 /* Channel panel header */
 
 .channel-panel-header {
-  background: var(--bg-elev);
+  background: #161616;
   display: grid;
   grid-template-columns: 96px minmax(0, 1fr);
   gap: 6px 14px;
@@ -403,7 +544,7 @@
   border-radius: 6px;
   object-fit: cover;
   border: 1px solid var(--border-strong);
-  background: #111820;
+  background: #202020;
 }
 
 .channel-panel-title {
@@ -530,13 +671,4 @@
 .policy-editor-row input {
   font-family: var(--mono);
   font-size: 12px;
-}
-
-/* Reuse admin-form from drawer in panel context */
-.admin-panel .admin-form {
-  max-width: 500px;
-}
-
-.admin-panel .admin-import {
-  max-width: 500px;
 }

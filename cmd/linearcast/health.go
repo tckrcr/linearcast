@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/routes"
 	"github.com/tckrcr/linearcast/internal/scheduler"
 )
 
@@ -36,16 +37,13 @@ func (a *app) handleReady(w http.ResponseWriter, r *http.Request) {
 		if !has {
 			continue
 		}
-		if rt.PlaybackMode == db.PlaybackModePlexRelay {
-			continue
-		}
 		if _, err := a.packagedManifestItems(r.Context(), rt.ID, rt.RequiredPackageProfile, time.Now().UTC().UnixMilli()); err != nil {
 			http.Error(w, fmt.Sprintf("channel %s packaged manifest not ready: %v", rt.ID, err), http.StatusServiceUnavailable)
 			return
 		}
 		profile := rt.RequiredPackageProfile
 		if profile == "" {
-			profile = "h264-main-1080p"
+			profile = db.DefaultPackageProfile
 		}
 		coverageMs, _ := db.ChannelPackageCoverageMs(r.Context(), a.dbConn, rt.ID, profile)
 		if coverageMs < readyCoverageThresholdMs {
@@ -58,13 +56,14 @@ func (a *app) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 type nowCurrent struct {
-	MediaID         string `json:"mediaID"`
-	Title           string `json:"title,omitempty"`
-	SchedulingGroup string `json:"schedulingGroup,omitempty"`
-	StartMs         int64  `json:"startMs"`
-	EndMs           int64  `json:"endMs"`
-	ElapsedMs       int64  `json:"elapsedMs"`
-	RemainingMs     int64  `json:"remainingMs"`
+	MediaID        string `json:"mediaID"`
+	Title          string `json:"title,omitempty"`
+	CollectionName string `json:"collectionName,omitempty"`
+	StartMs        int64  `json:"startMs"`
+	EndMs          int64  `json:"endMs"`
+	ElapsedMs      int64  `json:"elapsedMs"`
+	RemainingMs    int64  `json:"remainingMs"`
+	DirectPlayURL  string `json:"directPlayURL"`
 }
 
 type nowNext struct {
@@ -117,15 +116,16 @@ func (a *app) handleNow(w http.ResponseWriter, r *http.Request) {
 	if current != nil {
 		media, _ := db.MediaByID(r.Context(), a.dbConn, current.MediaID)
 		cur := &nowCurrent{
-			MediaID:     current.MediaID,
-			StartMs:     current.StartMs,
-			EndMs:       current.StartMs + current.DurationMs,
-			ElapsedMs:   nowMs - current.StartMs,
-			RemainingMs: current.StartMs + current.DurationMs - nowMs,
+			MediaID:       current.MediaID,
+			StartMs:       current.StartMs,
+			EndMs:         current.StartMs + current.DurationMs,
+			ElapsedMs:     nowMs - current.StartMs,
+			RemainingMs:   current.StartMs + current.DurationMs - nowMs,
+			DirectPlayURL: directPlayURL(r, channelID),
 		}
 		if media != nil {
 			cur.Title = media.Title
-			cur.SchedulingGroup = media.SchedulingGroup
+			cur.CollectionName = media.CollectionName
 		}
 		resp.Current = cur
 		resp.Status = "playing"
@@ -153,10 +153,22 @@ func (a *app) handleNow(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func directPlayURL(r *http.Request, channelID string) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if fwd := r.Header.Get("X-Forwarded-Proto"); fwd == "https" {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host + routes.DirectPlay(channelID)
+}
+
 type channelStatus struct {
 	ID                     string `json:"id"`
 	DisplayName            string `json:"displayName"`
 	PlaybackMode           string `json:"playbackMode"`
+	PrefillMode            string `json:"prefillMode"`
 	RequiredPackageProfile string `json:"requiredPackageProfile"`
 	HasSchedule            bool   `json:"hasSchedule"`
 	PackageReady           bool   `json:"packageReady"`
@@ -186,15 +198,14 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 			ID:                     rt.ID,
 			DisplayName:            rt.DisplayName,
 			PlaybackMode:           string(rt.PlaybackMode),
+			PrefillMode:            rt.PrefillMode,
 			RequiredPackageProfile: rt.RequiredPackageProfile,
 		}
 
 		has, _ := db.ChannelHasSchedule(r.Context(), a.dbConn, rt.ID)
 		cs.HasSchedule = has
 		if has {
-			if rt.PlaybackMode == db.PlaybackModePlexRelay {
-				cs.PackageReady = true
-			} else if _, err := a.packagedManifestItems(r.Context(), rt.ID, rt.RequiredPackageProfile, nowMs); err != nil {
+			if _, err := a.packagedManifestItems(r.Context(), rt.ID, rt.RequiredPackageProfile, nowMs); err != nil {
 				cs.PackageError = err.Error()
 			} else {
 				cs.PackageReady = true

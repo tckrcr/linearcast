@@ -1,4 +1,6 @@
--- linearcast schema v5.
+-- linearcast schema v1 (end-state baseline; the historical migration chain was
+-- collapsed into this file — see plan.md). Databases predating the collapse are
+-- dropped and recreated from this schema, never migrated across it.
 -- See docs/database.md.
 
 PRAGMA journal_mode = WAL;
@@ -9,7 +11,7 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '5');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
 
 -- ordering values are validated in Go (alphabetical, block). No CHECK here
 -- so v3-introduced values can land without a table rebuild.
@@ -35,37 +37,62 @@ CREATE TABLE IF NOT EXISTS channels (
     prefill_mode TEXT NOT NULL DEFAULT 'eager',
     CHECK (enabled IN (0, 1)),
     CHECK (hidden_from_guide IN (0, 1)),
-    CHECK (playback_mode IN ('generated', 'packaged', 'plex_relay')),
+    CHECK (playback_mode IN ('generated', 'packaged')),
     CHECK (package_prefill_ms IS NULL OR package_prefill_ms > 0),
     CHECK (encoder_policy IS NULL OR encoder_policy IN ('any', 'remote_only', 'remote_preferred', 'local_only')),
     CHECK (media_kind IN ('video', 'music')),
     CHECK (schedule_mode IN ('back_to_back', 'slot_grid')),
     CHECK (slot_duration_ms IS NULL OR (slot_duration_ms > 0 AND slot_duration_ms % 6000 = 0)),
-    CHECK (prefill_mode IN ('eager', 'on_demand'))
+    -- 'buffered' is a removed prefill mode. It stays in this CHECK on purpose: the
+    -- app no longer creates buffered channels (admin validation + normalizeChannelWrite
+    -- block it), and dropping it from the constraint would force a full table-rebuild
+    -- migration for zero gain. Left as a harmless backstop for existing rows.
+    CHECK (prefill_mode IN ('eager', 'on_demand', 'buffered'))
 );
 
 -- user_preference is reserved for future continuity-ordering work
 -- (e.g. MCU/Star Wars marathon sequences); populated as NULL today.
+CREATE TABLE IF NOT EXISTS collections (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    genres_json   TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (kind, name),
+    CHECK (kind IN ('show', 'movie', 'album', 'artist', 'custom')),
+    CHECK (source IN ('manual', 'filename', 'plex', 'jellyfin'))
+);
+
 CREATE TABLE IF NOT EXISTS media (
     id                  TEXT PRIMARY KEY,
     path                TEXT NOT NULL UNIQUE,
     directory           TEXT NOT NULL,
     title               TEXT,
     scheduling_group    TEXT,
+    collection_id       TEXT REFERENCES collections(id) ON DELETE SET NULL,
+    season_number       INTEGER,
+    episode_number      INTEGER,
     user_preference     INTEGER,
     duration_ms         INTEGER NOT NULL,
     container           TEXT NOT NULL,
     video_codec         TEXT NOT NULL,
     video_height        INTEGER NOT NULL,
+    video_bitrate_bps   INTEGER NOT NULL DEFAULT 0,
     audio_codec         TEXT NOT NULL,
     codec_check_passed  INTEGER NOT NULL,
     codec_check_reason  TEXT,
     ingested_at_ms      INTEGER NOT NULL,
     media_kind          TEXT,
     source_ref          TEXT,
+    description         TEXT,
+    thumb_path          TEXT,
+    content_rating      TEXT,
     video_width         INTEGER,
     color_transfer      TEXT,
     color_primaries     TEXT,
+    codec_tag_string    TEXT,
     CHECK (codec_check_passed IN (0, 1)),
     CHECK (duration_ms > 0),
     CHECK (media_kind IS NULL OR media_kind IN ('video', 'music'))
@@ -81,6 +108,8 @@ CREATE TABLE IF NOT EXISTS schedule_entries (
     offset_ms     INTEGER NOT NULL,
     duration_ms   INTEGER NOT NULL,
     created_at_ms INTEGER NOT NULL,
+    anchor_schedule_entry_id TEXT,
+    entry_kind    TEXT NOT NULL DEFAULT 'primary',
     PRIMARY KEY (id),
     UNIQUE (channel_id, start_ms),
     FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
@@ -88,8 +117,19 @@ CREATE TABLE IF NOT EXISTS schedule_entries (
     CHECK (start_ms % 6000 = 0),
     CHECK (duration_ms % 6000 = 0),
     CHECK (offset_ms >= 0),
-    CHECK (duration_ms > 0)
+    CHECK (duration_ms > 0),
+    CHECK (entry_kind IN ('primary', 'filler'))
 );
+
+-- schedule_entries linked-list chain metadata: anchor_schedule_entry_id is the
+-- predecessor pointer (NULL marks the head). Single head per channel, single
+-- successor per anchor.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_entries_head
+    ON schedule_entries(channel_id)
+    WHERE anchor_schedule_entry_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_entries_anchor
+    ON schedule_entries(channel_id, anchor_schedule_entry_id)
+    WHERE anchor_schedule_entry_id IS NOT NULL;
 
 -- channel_media: per-channel curated playlist. The scheduler reads from
 -- this table (not from media.directory + channels.source_directory) when
@@ -106,10 +146,14 @@ CREATE TABLE IF NOT EXISTS channel_media (
     FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE
 );
 
--- Unique partial indexes on anchor_media_id (single head per channel, single
--- successor per anchor) are created by migrateV2toV3, not here. Keeping them
--- out of schema.sql avoids referencing anchor_media_id before migrateV1toV2
--- has added the column on a pre-v2 database.
+-- Unique partial indexes on anchor_media_id: a single head per channel (NULL
+-- anchor) and a single successor per anchor.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_media_anchor
+    ON channel_media(channel_id, anchor_media_id)
+    WHERE anchor_media_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_media_head
+    ON channel_media(channel_id)
+    WHERE anchor_media_id IS NULL;
 
 -- filler_assets are global reusable packaged media clips such as bumpers,
 -- station IDs, and padding/test-pattern clips. They are attached to channels
@@ -159,6 +203,7 @@ CREATE TABLE IF NOT EXISTS media_packages (
     audio_profile         TEXT,
     timescale             INTEGER,
     packaged_duration_ms  INTEGER,
+    package_bytes         INTEGER,
     error                 TEXT,
     last_attempt_error    TEXT,
     attempts              INTEGER NOT NULL DEFAULT 0,
@@ -169,6 +214,7 @@ CREATE TABLE IF NOT EXISTS media_packages (
     CHECK (status IN ('pending', 'processing', 'ready', 'failed')),
     CHECK (timescale IS NULL OR timescale > 0),
     CHECK (packaged_duration_ms IS NULL OR packaged_duration_ms > 0),
+    CHECK (package_bytes IS NULL OR package_bytes >= 0),
     CHECK (video_width IS NULL OR video_width > 0),
     CHECK (video_height IS NULL OR video_height > 0),
     CHECK (attempts >= 0)
@@ -198,6 +244,39 @@ CREATE TABLE IF NOT EXISTS packaged_segments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_packaged_segments_position ON packaged_segments(package_id, media_start_ms);
+
+-- package_tracks: subtitle/audio tracks produced as part of one encoded package.
+-- Text subtitle streams store package-owned WebVTT sidecars under the package
+-- root. Rows cascade with media_packages so encode reclamation removes the
+-- database metadata along with package files. Bitmap rows are package-scoped
+-- inventory for sources that cannot be extracted to WebVTT and therefore carry
+-- path IS NULL.
+CREATE TABLE IF NOT EXISTS package_tracks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id   TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN ('subtitle', 'audio')),
+    stream_index INTEGER NOT NULL DEFAULT -1,
+    language     TEXT,
+    title        TEXT,
+    codec        TEXT,
+    source       TEXT NOT NULL DEFAULT 'embedded_text'
+                     CHECK(source IN ('embedded_text', 'embedded_bitmap', 'manual')),
+    default_flag     INTEGER NOT NULL DEFAULT 0 CHECK(default_flag IN (0, 1)),
+    forced           INTEGER NOT NULL DEFAULT 0 CHECK(forced IN (0, 1)),
+    hearing_impaired INTEGER NOT NULL DEFAULT 0 CHECK(hearing_impaired IN (0, 1)),
+    path             TEXT,
+    FOREIGN KEY (package_id) REFERENCES media_packages(id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_package_tracks_embedded
+    ON package_tracks(package_id, kind, stream_index)
+    WHERE source IN ('embedded_text', 'embedded_bitmap');
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_package_tracks_external
+    ON package_tracks(package_id, language, source)
+    WHERE source NOT IN ('embedded_text', 'embedded_bitmap') AND kind = 'subtitle';
+
+CREATE INDEX IF NOT EXISTS idx_package_tracks_package ON package_tracks(package_id, kind);
 
 -- play_history: one durable row per schedule entry observed by the playback
 -- runtime. Future scheduling/guide features use this as the "has aired" log.
@@ -232,6 +311,7 @@ CREATE TABLE IF NOT EXISTS package_profiles (
 );
 
 CREATE INDEX IF NOT EXISTS idx_package_profiles_builtin ON package_profiles(is_builtin);
+CREATE INDEX IF NOT EXISTS idx_package_profiles_disabled ON package_profiles(disabled);
 
 -- admin_write_log: control-plane observability for operator write actions.
 -- Records what was asked, not whether downstream jobs completed.
@@ -250,49 +330,6 @@ CREATE TABLE IF NOT EXISTS admin_write_log (
 
 CREATE INDEX IF NOT EXISTS idx_admin_write_log_created ON admin_write_log(created_at_ms DESC);
 
-
--- media_tracks: subtitle (and future audio) tracks extracted from source
--- media at package time. Subtitle tracks store a WebVTT sidecar at path.
--- source discriminates the provenance: embedded_text (text sub extracted from
--- the source file by ffmpeg into a VTT sidecar), embedded_bitmap (bitmap sub —
--- PGS/VOBSUB — known to exist in the source but not extractable to text, so
--- path IS NULL; an inventory row that makes the track visible for later burn-in
--- or external fetch), opensubtitles (downloaded from OS API), or manual.
--- A path=NULL opensubtitles row is a "no good match" sentinel that prevents
--- re-querying the API on every backfill run. forced marks a forced-display
--- subtitle (foreign-dialogue) track; load-bearing for the future forced
--- bitmap burn-in slice.
-CREATE TABLE IF NOT EXISTS media_tracks (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    media_id     TEXT NOT NULL,
-    kind         TEXT NOT NULL CHECK(kind IN ('subtitle', 'audio')),
-    stream_index INTEGER NOT NULL DEFAULT -1,
-    language     TEXT,
-    codec        TEXT,
-    source       TEXT NOT NULL DEFAULT 'embedded_text'
-                     CHECK(source IN ('embedded_text', 'embedded_bitmap', 'opensubtitles', 'manual')),
-    default_flag INTEGER NOT NULL DEFAULT 0 CHECK(default_flag IN (0, 1)),
-    forced       INTEGER NOT NULL DEFAULT 0 CHECK(forced IN (0, 1)),
-    path         TEXT,
-    FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE
-);
-
--- Embedded tracks (text or bitmap) are unique per source stream: one row per
--- (media, kind, stream_index). Both embedded sources share this index so a
--- bitmap inventory row and a text sidecar cannot collide on the same stream.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_media_tracks_embedded
-    ON media_tracks(media_id, kind, stream_index)
-    WHERE source IN ('embedded_text', 'embedded_bitmap');
-
--- External tracks (opensubtitles/manual) are unique per (media, language,
--- source); they carry stream_index = -1. Embedded sources are excluded here so
--- two same-language bitmap streams stay distinct under the embedded index above.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_media_tracks_external
-    ON media_tracks(media_id, language, source)
-    WHERE source NOT IN ('embedded_text', 'embedded_bitmap') AND kind = 'subtitle';
-
-CREATE INDEX IF NOT EXISTS idx_media_tracks_media ON media_tracks(media_id, kind);
-
 -- settings: user/runtime configuration stored as JSON-encoded values.
 -- Separate from meta (schema infrastructure) — different lifecycle.
 CREATE TABLE IF NOT EXISTS settings (
@@ -303,20 +340,12 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT OR IGNORE INTO settings (key, value) VALUES
     ('subtitle_language_preference', '["eng"]'),
     ('subtitle_auto_enable',         'false'),
-    ('encoder_mode',                 '"local"'),
-    ('local_worker_concurrency',     '1'),
-    ('default_packaged_profile',     '"h264-main-1080p"'),
+    ('default_packaged_profile',     '"h264-1080p-8mbps"'),
     ('scheduler_horizon_hours',      '24'),
     ('scheduler_low_water_hours',    '23'),
     ('scheduler_tick_seconds',       '300'),
     ('encoder_sweep_interval_seconds', '30'),
-    ('encoder_max_attempts',           '5'),
-    ('on_demand_grace_seconds',        '120'),
-    ('on_demand_max_concurrent',       '4'),
-    ('on_demand_evict_idle_seconds',   '10'),
-    ('on_demand_stall_timeout_seconds','45'),
-    ('on_demand_restart_budget',       '3'),
-    ('on_demand_keepalive_ceiling_sec','900');
+    ('encoder_max_attempts',           '5');
 
 -- local media sources: persistent filesystem-backed media roots. These are
 -- intentionally separate from Plex/Jellyfin singleton settings.
@@ -380,6 +409,31 @@ CREATE TABLE IF NOT EXISTS encoder_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_encoder_jobs_lease ON encoder_jobs(lease_expires_ms);
 CREATE INDEX IF NOT EXISTS idx_encoder_jobs_encoder ON encoder_jobs(encoder_id);
+
+-- on_demand_encodings: ephemeral live ffmpeg channel encodings owned by linearcast.
+-- Rows exist only while an encoding is active/stopping/failed in the playback
+-- process. linearcast clears stale rows on startup and removes rows on teardown.
+CREATE TABLE IF NOT EXISTS on_demand_encodings (
+    encoding_id          TEXT PRIMARY KEY,
+    channel_id          TEXT NOT NULL,
+    schedule_entry_id   TEXT NOT NULL,
+    media_id            TEXT NOT NULL,
+    profile             TEXT NOT NULL,
+    state               TEXT NOT NULL,
+    process_running     INTEGER NOT NULL,
+    spawned_at_ms       INTEGER NOT NULL,
+    first_segment_at_ms INTEGER NOT NULL,
+    last_progress_ms    INTEGER NOT NULL,
+    segment_count       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL,
+    last_error          TEXT,
+    CHECK (state IN ('starting', 'serving', 'ended', 'failed', 'stopping')),
+    CHECK (process_running IN (0, 1)),
+    CHECK (segment_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_on_demand_encodings_channel ON on_demand_encodings(channel_id);
+CREATE INDEX IF NOT EXISTS idx_on_demand_encodings_updated ON on_demand_encodings(updated_at_ms);
 
 -- subtitle_scan_cache: persists the most recent library subtitle scan result.
 -- A single row is kept; on_conflict replaces it with the latest scan.

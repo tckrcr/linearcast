@@ -7,6 +7,14 @@ import (
 	"github.com/tckrcr/linearcast/internal/db"
 )
 
+func (a *app) handleOnDemandRestart(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelID")
+	if a.encodings != nil {
+		a.encodings.RestartChannel(channelID)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *app) lookupChannelOr404(ctx context.Context, w http.ResponseWriter, channelID string) *channelRuntime {
 	if channelID == "" {
 		http.NotFound(w, nil)
@@ -32,7 +40,7 @@ func (a *app) lookupChannelOr404(ctx context.Context, w http.ResponseWriter, cha
 		ID:                     row.ID,
 		DisplayName:            row.DisplayName,
 		PlaybackMode:           row.PlaybackMode,
-		RequiredPackageProfile: packagedProfileForChannel(*row, a.packagedProfile),
+		RequiredPackageProfile: a.resolveChannelProfile(row.ID, packagedProfileForChannel(*row, a.packagedProfile), nil),
 		PrefillMode:            row.PrefillMode,
 	}
 	a.mu.Lock()

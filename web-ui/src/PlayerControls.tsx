@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type Hls from "hls.js";
+import type { Events, MediaPlaylist } from "hls.js";
 import type { SubtitleSettings } from "./types";
 
-type SubTrack = { index: number; label: string; language: string };
-type BurnTrack = { language: string; label: string; streamIndex: number; forced: boolean };
-type BurnTrackResponse = { activeLanguage?: string; tracks?: BurnTrack[] };
+type SubTrack = { index: number; label: string; language: string; source: "hls" | "native" };
+type BurnTrack = { language: string; mode?: "burn"; label: string; streamIndex: number; forced: boolean };
+type BurnTrackResponse = { activeLanguage?: string; mode?: "burn"; unavailable?: string; tracks?: BurnTrack[] };
 
 type Props = {
   channelID: string;
@@ -14,6 +16,8 @@ type Props = {
   abrAvailable: boolean;
   onMutedChange: (muted: boolean) => void;
   onAbrModeChange: (mode: "best" | "saver") => void;
+  onBurnSubtitleSwitch: <T>(update: () => Promise<T>) => Promise<T>;
+  hlsRef: React.RefObject<Hls | null>;
 };
 
 type State = {
@@ -28,6 +32,10 @@ const initialState: State = {
   seekEnd: 0,
 };
 
+const HLS_SUBTITLE_TRACKS_UPDATED = "hlsSubtitleTracksUpdated" as Events.SUBTITLE_TRACKS_UPDATED;
+const HLS_SUBTITLE_TRACK_SWITCH = "hlsSubtitleTrackSwitch" as Events.SUBTITLE_TRACK_SWITCH;
+const HLS_SUBTITLE_TRACKS_CLEARED = "hlsSubtitleTracksCleared" as Events.SUBTITLE_TRACKS_CLEARED;
+
 export function PlayerControls({
   channelID,
   videoRef,
@@ -37,10 +45,13 @@ export function PlayerControls({
   abrAvailable,
   onMutedChange,
   onAbrModeChange,
+  onBurnSubtitleSwitch,
+  hlsRef,
 }: Props) {
   const [state, setState] = useState<State>(initialState);
   const [fullscreen, setFullscreen] = useState(false);
-  const [subTracks, setSubTracks] = useState<SubTrack[]>([]);
+  const [hlsSubTracks, setHlsSubTracks] = useState<SubTrack[]>([]);
+  const [nativeSubTracks, setNativeSubTracks] = useState<SubTrack[]>([]);
   const [activeSubIdx, setActiveSubIdx] = useState<number>(-1);
   const [burnTracks, setBurnTracks] = useState<BurnTrack[]>([]);
   const [activeBurnLang, setActiveBurnLang] = useState<string>("");
@@ -84,15 +95,16 @@ export function PlayerControls({
     const video = videoRef.current;
     if (!video) return;
     function sync(e?: Event) {
+      if (hlsRef.current && hlsSubTracks.length > 0) return;
       const list = video!.textTracks;
       const tracks: SubTrack[] = [];
       for (let i = 0; i < list.length; i++) {
         const t = list[i];
         if (t.kind === "subtitles" || t.kind === "captions") {
-          tracks.push({ index: i, label: t.label || t.language || `Track ${i + 1}`, language: t.language });
+          tracks.push({ index: i, label: t.label || t.language || `Track ${i + 1}`, language: t.language, source: "native" });
         }
       }
-      setSubTracks(tracks);
+      setNativeSubTracks(tracks);
       let active = -1;
       for (let i = 0; i < list.length; i++) {
         if (list[i].mode === "showing") { active = i; break; }
@@ -105,8 +117,10 @@ export function PlayerControls({
         for (const pref of prefs) {
           const match = tracks.find(t => t.language.toLowerCase() === pref.toLowerCase());
           if (match != null) {
-            for (let i = 0; i < list.length; i++) {
-              list[i].mode = i === match.index ? "showing" : "hidden";
+            if (!selectHlsSubtitleTrack(hlsRef.current, match)) {
+              for (let i = 0; i < list.length; i++) {
+                list[i].mode = i === match.index ? "showing" : "hidden";
+              }
             }
             setActiveSubIdx(match.index);
             autoSelectDone.current = true;
@@ -126,7 +140,48 @@ export function PlayerControls({
       list.removeEventListener("removetrack", sync);
       autoSelectDone.current = false;
     };
-  }, [videoRef, subSettings]);
+  }, [videoRef, subSettings, hlsRef, hlsSubTracks.length]);
+
+  useEffect(() => {
+    let attached: Hls | null = null;
+    function sync() {
+      const hls = attached;
+      if (!hls) return;
+      const tracks = hls.subtitleTracks.map((t: MediaPlaylist, index: number) => ({
+        index,
+        label: t.name || t.lang || `Track ${index + 1}`,
+        language: t.lang || "",
+        source: "hls" as const,
+      }));
+      setHlsSubTracks(tracks);
+      setActiveSubIdx(hls.subtitleDisplay ? hls.subtitleTrack : -1);
+    }
+    function detach() {
+      if (!attached) return;
+      attached.off(HLS_SUBTITLE_TRACKS_UPDATED, sync);
+      attached.off(HLS_SUBTITLE_TRACK_SWITCH, sync);
+      attached.off(HLS_SUBTITLE_TRACKS_CLEARED, sync);
+      attached = null;
+      setHlsSubTracks([]);
+    }
+    function attachCurrent() {
+      const current = hlsRef.current;
+      if (current === attached) return;
+      detach();
+      if (!current) return;
+      attached = current;
+      attached.on(HLS_SUBTITLE_TRACKS_UPDATED, sync);
+      attached.on(HLS_SUBTITLE_TRACK_SWITCH, sync);
+      attached.on(HLS_SUBTITLE_TRACKS_CLEARED, sync);
+      sync();
+    }
+    attachCurrent();
+    const timer = window.setInterval(attachCurrent, 250);
+    return () => {
+      window.clearInterval(timer);
+      detach();
+    };
+  }, [hlsRef]);
 
   useEffect(() => {
     if (!subMenuOpen) return;
@@ -153,7 +208,7 @@ export function PlayerControls({
       return;
     }
     const ac = new AbortController();
-    fetch(`/hls/channel/${encodeURIComponent(channelID)}/subtitles`, { cache: "no-store", signal: ac.signal })
+    fetch(`/hls/channels/${encodeURIComponent(channelID)}/subtitles`, { cache: "no-store", signal: ac.signal })
       .then(r => r.ok ? r.json() : null)
       .then((data: BurnTrackResponse | null) => {
         setBurnTracks(data?.tracks ?? []);
@@ -166,26 +221,42 @@ export function PlayerControls({
   const selectSubTrack = useCallback((idx: number) => {
     const video = videoRef.current;
     if (!video) return;
+    const hls = hlsRef.current;
+    const subTracks = hlsSubTracks.length > 0 ? hlsSubTracks : nativeSubTracks;
+    clearTextTrackCues(video.textTracks);
+    if (idx < 0) {
+      if (hls) {
+        hls.subtitleTrack = -1;
+        hls.subtitleDisplay = false;
+      }
+    } else {
+      const track = subTracks.find((t) => t.index === idx);
+      if (track && selectHlsSubtitleTrack(hls, track)) {
+        setActiveSubIdx(idx);
+        return;
+      }
+    }
     const list = video.textTracks;
     for (let i = 0; i < list.length; i++) {
       list[i].mode = i === idx ? "showing" : "hidden";
     }
     setActiveSubIdx(idx);
-  }, [videoRef]);
+  }, [hlsRef, hlsSubTracks, nativeSubTracks, videoRef]);
 
   const setBurnSubtitle = useCallback((language: string) => {
     if (!channelID) return;
-    fetch(`/hls/channel/${encodeURIComponent(channelID)}/subtitles`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ language }),
-    })
-      .then(r => r.ok ? r.json() : Promise.reject(new Error("subtitle update failed")))
+    onBurnSubtitleSwitch(() =>
+      fetch(`/hls/channels/${encodeURIComponent(channelID)}/subtitles`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ language }),
+      }).then(r => r.ok ? r.json() : Promise.reject(new Error("subtitle update failed")))
+    )
       .then((data: BurnTrackResponse) => {
         setActiveBurnLang(data.activeLanguage ?? language);
       })
       .catch(() => {});
-  }, [channelID]);
+  }, [channelID, onBurnSubtitleSwitch]);
 
   const turnSubtitlesOff = useCallback(() => {
     selectSubTrack(-1);
@@ -200,6 +271,22 @@ export function PlayerControls({
     setActiveBurnLang(language);
     setBurnSubtitle(language);
   }, [selectSubTrack, setBurnSubtitle]);
+
+  const preferredLanguages = subSettings?.subtitleLanguagePreference.map((l) => l.toLowerCase()) ?? [];
+  const languageAllowed = useCallback((language: string) => {
+    return isSubtitleLanguageAllowed(language, preferredLanguages);
+  }, [preferredLanguages]);
+  const subTracks = hlsSubTracks.length > 0 ? hlsSubTracks : nativeSubTracks;
+  const visibleSubTracks = subTracks.filter((t) => languageAllowed(t.language));
+  // Prefer WebVTT tracks when hls.js exposes them; burn-in requires a stream
+  // restart and is only useful when no selectable WebVTT track exists.
+  const manualBurnTracks =
+    visibleSubTracks.length > 0
+      ? []
+      : burnTracks.filter((t) => !t.forced && languageAllowed(t.language));
+  const activeManualBurnLang = manualBurnTracks.some((t) => t.language === activeBurnLang) ? activeBurnLang : "";
+
+  const subtitlesOff = activeSubIdx < 0 && !activeManualBurnLang;
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -240,55 +327,55 @@ export function PlayerControls({
       </div>
 
       <div className="tv-controls-right">
-      {(subTracks.length > 0 || burnTracks.length > 0) && (
+      {(visibleSubTracks.length > 0 || manualBurnTracks.length > 0) && (
         <div className="tv-controls-sub" ref={subMenuRef}>
           {subMenuOpen && (
             <div className="tv-controls-sub-menu" role="menu">
               <button
                 type="button"
                 role="menuitem"
-                className={`tv-controls-sub-option${activeSubIdx < 0 && !activeBurnLang ? " is-active" : ""}`}
+                className={`tv-controls-sub-option${subtitlesOff ? " is-active" : ""}`}
                 onClick={() => { turnSubtitlesOff(); setSubMenuOpen(false); }}
               >
                 Off
               </button>
-              {subTracks.map(t => (
+              {visibleSubTracks.map(t => (
                 <button
                   key={t.index}
                   type="button"
                   role="menuitem"
-                  className={`tv-controls-sub-option${activeSubIdx === t.index && !activeBurnLang ? " is-active" : ""}`}
-                  onClick={() => { setActiveBurnLang(""); setBurnSubtitle(""); selectSubTrack(t.index); setSubMenuOpen(false); }}
+                  className={`tv-controls-sub-option${activeSubIdx === t.index && !activeManualBurnLang ? " is-active" : ""}`}
+                  onClick={() => { selectSubTrack(t.index); setSubMenuOpen(false); }}
                 >
-                  {t.label}
+                  {t.label || `${t.language} WebVTT`}
                 </button>
               ))}
-              {burnTracks.map(t => (
+              {manualBurnTracks.map(t => (
                 <button
                   key={`burn-${t.language}-${t.streamIndex}`}
                   type="button"
                   role="menuitem"
-                  className={`tv-controls-sub-option${activeBurnLang === t.language ? " is-active" : ""}`}
+                  className={`tv-controls-sub-option${activeManualBurnLang === t.language ? " is-active" : ""}`}
                   onClick={() => { selectBurnTrack(t.language); setSubMenuOpen(false); }}
                 >
-                  {t.label}
+                  {t.label || `${t.language} burned-in`}
                 </button>
               ))}
             </div>
           )}
           <button
             type="button"
-            className={`tv-controls-btn${activeSubIdx >= 0 || activeBurnLang ? " is-active" : ""}`}
+            className={`tv-controls-btn${subtitlesOff ? "" : " is-active"}`}
             aria-label="Subtitles"
             aria-expanded={subMenuOpen}
             aria-haspopup="menu"
-            title={activeBurnLang ? burnTracks.find(t => t.language === activeBurnLang)?.label ?? "Subtitles on" : activeSubIdx >= 0 ? subTracks.find(t => t.index === activeSubIdx)?.label ?? "Subtitles on" : "Subtitles off"}
+            title={activeManualBurnLang ? manualBurnTracks.find(t => t.language === activeManualBurnLang)?.label ?? "Subtitles on" : activeSubIdx >= 0 ? visibleSubTracks.find(t => t.index === activeSubIdx)?.label ?? "Subtitles on" : "Subtitles off"}
             onClick={() => {
-              const totalTracks = subTracks.length + burnTracks.length;
+              const totalTracks = visibleSubTracks.length + manualBurnTracks.length;
               if (totalTracks === 1) {
-                if (activeSubIdx >= 0 || activeBurnLang) turnSubtitlesOff();
-                else if (subTracks.length === 1) selectSubTrack(subTracks[0].index);
-                else selectBurnTrack(burnTracks[0].language);
+                if (!subtitlesOff) turnSubtitlesOff();
+                else if (visibleSubTracks.length === 1) selectSubTrack(visibleSubTracks[0].index);
+                else if (manualBurnTracks.length === 1) selectBurnTrack(manualBurnTracks[0].language);
               } else {
                 setSubMenuOpen(o => !o);
               }
@@ -312,6 +399,9 @@ export function PlayerControls({
       )}
 
       <button
+        type="button"
+        className="tv-controls-btn"
+        onClick={() => onMutedChange(!muted)}
         aria-label={muted ? "Unmute" : "Mute"}
       >
         {muted ? "🔇" : "🔊"}
@@ -328,4 +418,30 @@ export function PlayerControls({
       </div>
     </div>
   );
+}
+
+function selectHlsSubtitleTrack(hls: Hls | null, track: SubTrack): boolean {
+  if (!hls || track.source !== "hls") return false;
+  const subtitleIndex = track.index;
+  if (subtitleIndex < 0) return false;
+  hls.subtitleDisplay = true;
+  hls.subtitleTrack = subtitleIndex;
+  return true;
+}
+
+export function isSubtitleLanguageAllowed(language: string, preferredLanguages: string[]): boolean {
+  if (preferredLanguages.length === 0) return true;
+  return preferredLanguages.includes(language.trim().toLowerCase());
+}
+
+function clearTextTrackCues(list: TextTrackList) {
+  for (let i = 0; i < list.length; i++) {
+    const track = list[i];
+    const cues = track.cues;
+    if (!cues) continue;
+    for (let j = cues.length - 1; j >= 0; j--) {
+      const cue = cues[j];
+      if (cue) track.removeCue(cue);
+    }
+  }
 }

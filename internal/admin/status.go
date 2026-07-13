@@ -26,7 +26,7 @@ type channelNow struct {
 	MediaKind             string              `json:"mediaKind"`
 	ScheduleMode          string              `json:"scheduleMode"`
 	SlotDurationMs        *int64              `json:"slotDurationMs,omitempty"`
-	PrefillMode           string              `json:"prefillMode,omitempty"`
+	PrefillMode string `json:"prefillMode,omitempty"`
 	Status                string              `json:"status"`
 	Current               *mediaWindow        `json:"current"`
 	Next                  *mediaWindow        `json:"next"`
@@ -45,17 +45,17 @@ type channelNow struct {
 }
 
 type mediaWindow struct {
-	MediaID         string `json:"mediaID"`
-	Title           string `json:"title,omitempty"`
-	Path            string `json:"path,omitempty"`
-	SchedulingGroup string `json:"schedulingGroup,omitempty"`
-	PackageStatus   string `json:"packageStatus,omitempty"`
-	PackageError    string `json:"packageError,omitempty"`
-	StartMs         int64  `json:"startMs"`
-	EndMs           int64  `json:"endMs"`
-	DurationMs      int64  `json:"durationMs"`
-	ElapsedMs       int64  `json:"elapsedMs,omitempty"`
-	RemainingMs     int64  `json:"remainingMs,omitempty"`
+	MediaID        string `json:"mediaID"`
+	Title          string `json:"title,omitempty"`
+	Path           string `json:"path,omitempty"`
+	CollectionName string `json:"collectionName,omitempty"`
+	PackageStatus  string `json:"packageStatus,omitempty"`
+	PackageError   string `json:"packageError,omitempty"`
+	StartMs        int64  `json:"startMs"`
+	EndMs          int64  `json:"endMs"`
+	DurationMs     int64  `json:"durationMs"`
+	ElapsedMs      int64  `json:"elapsedMs,omitempty"`
+	RemainingMs    int64  `json:"remainingMs,omitempty"`
 }
 
 type playingResponse struct {
@@ -245,7 +245,7 @@ func (a *App) channelNowForRow(ctx context.Context, nowMs int64, ch db.Channel, 
 		MediaKind:       string(db.NormalizeMediaKind(ch.MediaKind)),
 		ScheduleMode:    ch.ScheduleMode,
 		SlotDurationMs:  ch.SlotDurationMs,
-		PrefillMode:     ch.PrefillMode,
+		PrefillMode: ch.PrefillMode,
 		Status:          "unknown",
 	}
 	if cache.Format != "" || cache.CacheSize > 0 || cache.LookaheadDepthSegments != nil {
@@ -260,7 +260,7 @@ func (a *App) channelNowForRow(ctx context.Context, nowMs int64, ch db.Channel, 
 		}
 		resp.IsExternal = true
 		resp.UpstreamHLSURL = *ch.UpstreamHLSURL
-		resp.Status = "live"
+		resp.Status = a.externalChannelStatus(ctx, ch)
 		return resp, nil
 	}
 	profile := ch.RequiredPackageProfile
@@ -274,7 +274,7 @@ func (a *App) channelNowForRow(ctx context.Context, nowMs int64, ch db.Channel, 
 	if err != nil {
 		return resp, err
 	}
-	entries, err := db.ScheduleWindow(ctx, a.dbConn, ch.ID, nowMs-segmentMs, nowMs+24*60*60*1000)
+	entries, err := db.ScheduleWindow(ctx, a.dbConn, ch.ID, nowMs-db.ScheduleGridMs, nowMs+24*60*60*1000)
 	if err != nil {
 		return resp, err
 	}
@@ -351,7 +351,7 @@ func (a *App) buildMediaWindow(ctx context.Context, entry *db.ScheduleEntry, now
 	if media != nil {
 		w.Path = media.Path
 		w.Title = media.Title
-		w.SchedulingGroup = media.SchedulingGroup
+		w.CollectionName = media.CollectionName
 	}
 	if profile != "" {
 		pkgs, err := db.MediaPackagesForMedia(ctx, a.dbConn, entry.MediaID)

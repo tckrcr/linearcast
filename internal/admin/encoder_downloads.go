@@ -10,7 +10,7 @@ import (
 
 // encoderDownloadEntry describes one cross-compiled encoder binary the admin
 // server is willing to serve. Filenames are fixed by the build pipeline
-// (Dockerfile + scripts/deploy-linearcast.sh) so the UI can list them.
+// (the Dockerfile build stage) so the UI can list them.
 type encoderDownloadEntry struct {
 	// Platform is the stable URL slug (e.g. "darwin-arm64"). The download
 	// handler resolves this to the on-disk filename.

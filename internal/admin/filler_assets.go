@@ -27,7 +27,7 @@ type channelFillerAssetItem struct {
 	ChannelEnabled     bool   `json:"channelEnabled"`
 	Path               string `json:"path"`
 	Title              string `json:"title,omitempty"`
-	SchedulingGroup    string `json:"schedulingGroup,omitempty"`
+	CollectionName     string `json:"collectionName,omitempty"`
 	DurationMs         int64  `json:"durationMs"`
 	PackageID          string `json:"packageId,omitempty"`
 	PackageStatus      string `json:"packageStatus"`
@@ -65,8 +65,8 @@ func channelFillerAssetResponse(a db.ChannelFillerAsset) channelFillerAssetItem 
 	if a.Title != "" {
 		item.Title = a.Title
 	}
-	if a.SchedulingGroup != "" {
-		item.SchedulingGroup = a.SchedulingGroup
+	if a.CollectionName != "" {
+		item.CollectionName = a.CollectionName
 	}
 	if a.PackageID != nil {
 		item.PackageID = *a.PackageID
@@ -81,7 +81,7 @@ func channelFillerAssetResponse(a db.ChannelFillerAsset) channelFillerAssetItem 
 	return item
 }
 
-func (a *App) handleScheduleBuilderFillerCandidates(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleFillerAssetCandidates(w http.ResponseWriter, r *http.Request) {
 	profile := strings.TrimSpace(r.URL.Query().Get("profile"))
 	candidates, err := db.FillerAssetsForScheduleBuilder(r.Context(), a.dbConn, profile)
 	if err != nil {

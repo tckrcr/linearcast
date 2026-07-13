@@ -305,7 +305,7 @@ func TestEligibleReadyPackagedChannelMedia(t *testing.T) {
 	if err := UpsertMediaPackage(context.Background(), rw, MediaPackage{
 		ID:                 "pkg-ready",
 		MediaID:            "ready",
-		RenditionProfile:   "h264-main-1080p",
+		RenditionProfile:   "h264-1080p-8mbps",
 		Status:             PackageStatusReady,
 		PackagedDurationMs: &dur1,
 		CreatedAtMs:        0,
@@ -317,7 +317,7 @@ func TestEligibleReadyPackagedChannelMedia(t *testing.T) {
 	if err := UpsertMediaPackage(context.Background(), rw, MediaPackage{
 		ID:                 "pkg-pending",
 		MediaID:            "pending",
-		RenditionProfile:   "h264-main-1080p",
+		RenditionProfile:   "h264-1080p-8mbps",
 		Status:             PackageStatusPending,
 		PackagedDurationMs: &dur2,
 		CreatedAtMs:        0,
@@ -326,7 +326,7 @@ func TestEligibleReadyPackagedChannelMedia(t *testing.T) {
 		t.Fatalf("upsert pending package: %v", err)
 	}
 
-	eligible, err := EligibleReadyPackagedChannelMedia(context.Background(), rw, "ch1", "h264-main-1080p")
+	eligible, err := EligibleReadyPackagedChannelMedia(context.Background(), rw, "ch1", "h264-1080p-8mbps")
 	if err != nil {
 		t.Fatalf("eligible packaged: %v", err)
 	}

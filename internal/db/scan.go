@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 )
 
@@ -60,26 +61,48 @@ func scanChannel(row scanner) (*Channel, error) {
 // for joined queries). Pass "" for unqualified columns.
 func mediaColumns(prefix string) string {
 	return prefix + "id, " + prefix + "path, " + prefix + "directory, " + prefix + "title, " +
-		prefix + "scheduling_group, " + prefix + "user_preference, " + prefix + "duration_ms, " +
+		prefix + "scheduling_group, " + prefix + "collection_id, " + prefix + "season_number, " + prefix + "episode_number, " + prefix + "user_preference, " + prefix + "duration_ms, " +
 		prefix + "container, " + prefix + "video_codec, " + prefix + "video_width, " +
-		prefix + "video_height, " + prefix + "color_transfer, " + prefix + "color_primaries, " +
+		prefix + "video_height, " + prefix + "video_bitrate_bps, " + prefix + "color_transfer, " + prefix + "color_primaries, " +
 		prefix + "audio_codec, " + prefix + "codec_check_passed, " + prefix + "codec_check_reason, " +
-		prefix + "ingested_at_ms, " + prefix + "media_kind, " + prefix + "source_ref"
+		prefix + "ingested_at_ms, " + prefix + "media_kind, " + prefix + "source_ref, " +
+		prefix + "description, " + prefix + "thumb_path, " + prefix + "content_rating, " +
+		"NULL, " +
+		prefix + "codec_tag_string"
 }
 
 func mediaSelectSQL() string {
 	return `SELECT ` + mediaColumns("") + ` FROM media`
 }
 
+func mediaSelectWithCollectionSQL() string {
+	return `SELECT ` + mediaColumnsWithCollection("m.", "c.") + ` FROM media m LEFT JOIN collections c ON c.id = m.collection_id`
+}
+
+func mediaColumnsWithCollection(mediaPrefix, collectionPrefix string) string {
+	groupExpr := "COALESCE(CASE WHEN " + collectionPrefix + "id IS NULL THEN NULL WHEN " + collectionPrefix + "kind = 'movie' THEN 'movie:' || " + collectionPrefix + "name ELSE " + collectionPrefix + "name END, " + mediaPrefix + "scheduling_group)"
+	return mediaPrefix + "id, " + mediaPrefix + "path, " + mediaPrefix + "directory, " + mediaPrefix + "title, " +
+		groupExpr + ", " + mediaPrefix + "collection_id, " + mediaPrefix + "season_number, " + mediaPrefix + "episode_number, " + mediaPrefix + "user_preference, " + mediaPrefix + "duration_ms, " +
+		mediaPrefix + "container, " + mediaPrefix + "video_codec, " + mediaPrefix + "video_width, " +
+		mediaPrefix + "video_height, " + mediaPrefix + "video_bitrate_bps, " + mediaPrefix + "color_transfer, " + mediaPrefix + "color_primaries, " +
+		mediaPrefix + "audio_codec, " + mediaPrefix + "codec_check_passed, " + mediaPrefix + "codec_check_reason, " +
+		mediaPrefix + "ingested_at_ms, " + mediaPrefix + "media_kind, " + mediaPrefix + "source_ref, " +
+		mediaPrefix + "description, " + mediaPrefix + "thumb_path, " + mediaPrefix + "content_rating, " +
+		collectionPrefix + "genres_json, " +
+		mediaPrefix + "codec_tag_string"
+}
+
 func scanMedia(row scanner) (*Media, error) {
 	var m Media
 	var passed int64
-	var title, group, colorTransfer, colorPrimaries, codecReason, mediaKind, sourceRef sql.NullString
-	var userPref, videoWidth sql.NullInt64
-	if err := row.Scan(&m.ID, &m.Path, &m.Directory, &title, &group,
-		&userPref, &m.DurationMs, &m.Container, &m.VideoCodec, &videoWidth,
-		&m.VideoHeight, &colorTransfer, &colorPrimaries,
-		&m.AudioCodec, &passed, &codecReason, &m.IngestedAtMs, &mediaKind, &sourceRef); err != nil {
+	var title, group, colorTransfer, colorPrimaries, codecReason, mediaKind, sourceRef, description, thumbPath, contentRating, genresJSON, codecTag sql.NullString
+	var collectionID sql.NullString
+	var seasonNumber, episodeNumber, userPref, videoWidth sql.NullInt64
+	if err := row.Scan(&m.ID, &m.Path, &m.Directory, &title, &group, &collectionID,
+		&seasonNumber, &episodeNumber, &userPref, &m.DurationMs, &m.Container, &m.VideoCodec, &videoWidth,
+		&m.VideoHeight, &m.VideoBitrateBps, &colorTransfer, &colorPrimaries,
+		&m.AudioCodec, &passed, &codecReason, &m.IngestedAtMs, &mediaKind, &sourceRef,
+		&description, &thumbPath, &contentRating, &genresJSON, &codecTag); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -87,13 +110,29 @@ func scanMedia(row scanner) (*Media, error) {
 	}
 	m.CodecCheckPassed = passed == 1
 	m.Title = title.String
-	m.SchedulingGroup = group.String
+	m.CollectionName = group.String
+	m.CollectionID = collectionID.String
 	m.VideoWidth = videoWidth.Int64
 	m.ColorTransfer = colorTransfer.String
 	m.ColorPrimaries = colorPrimaries.String
 	m.CodecCheckReason = codecReason.String
 	m.MediaKind = MediaKind(mediaKind.String)
 	m.SourceRef = sourceRef.String
+	m.Description = description.String
+	m.ThumbPath = thumbPath.String
+	m.ContentRating = contentRating.String
+	if genresJSON.Valid && genresJSON.String != "" {
+		_ = json.Unmarshal([]byte(genresJSON.String), &m.Genres)
+	}
+	m.CodecTagString = codecTag.String
+	if seasonNumber.Valid {
+		v := seasonNumber.Int64
+		m.SeasonNumber = &v
+	}
+	if episodeNumber.Valid {
+		v := episodeNumber.Int64
+		m.EpisodeNumber = &v
+	}
 	if userPref.Valid {
 		v := userPref.Int64
 		m.UserPreference = &v
@@ -104,7 +143,7 @@ func scanMedia(row scanner) (*Media, error) {
 func mediaPackageSelectSQL() string {
 	return `SELECT id, media_id, rendition_profile, status, package_root, init_segment_path,
 		segment_base_path, container, video_codec, video_profile, video_width, video_height,
-		audio_codec, audio_profile, timescale, packaged_duration_ms, error, last_attempt_error,
+		audio_codec, audio_profile, timescale, packaged_duration_ms, package_bytes, error, last_attempt_error,
 		attempts, created_at_ms, updated_at_ms FROM media_packages`
 }
 
@@ -164,11 +203,11 @@ func scanMediaPackage(row scanner) (*MediaPackage, error) {
 	var videoWidth, videoHeight, timescale sql.NullInt64
 	var audioCodec, audioProfile sql.NullString
 	var pkgRoot, initSegPath, pkgErr, lastAttempt sql.NullString
-	var pkgDurationMs sql.NullInt64
+	var pkgDurationMs, pkgBytes sql.NullInt64
 	if err := row.Scan(&p.ID, &p.MediaID, &p.RenditionProfile, &status, &pkgRoot,
 		&initSegPath, &segBase, &container, &videoCodec, &videoProfile,
 		&videoWidth, &videoHeight, &audioCodec, &audioProfile, &timescale,
-		&pkgDurationMs, &pkgErr, &lastAttempt, &p.Attempts,
+		&pkgDurationMs, &pkgBytes, &pkgErr, &lastAttempt, &p.Attempts,
 		&p.CreatedAtMs, &p.UpdatedAtMs); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -205,6 +244,10 @@ func scanMediaPackage(row scanner) (*MediaPackage, error) {
 	if pkgDurationMs.Valid {
 		v := pkgDurationMs.Int64
 		p.PackagedDurationMs = &v
+	}
+	if pkgBytes.Valid {
+		v := pkgBytes.Int64
+		p.PackageBytes = &v
 	}
 	if pkgErr.Valid {
 		v := pkgErr.String

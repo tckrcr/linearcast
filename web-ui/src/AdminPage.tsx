@@ -1,12 +1,14 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { ChannelArtwork } from "./ChannelArtwork";
+import { ChannelGuide } from "./ChannelGuide";
 import { Dialog } from "./Dialog";
 import {
   describeProbeResult,
   getMediaPackageProfileList,
   getAdminAuthStatus,
   logoutAdmin,
+  UNAUTHORIZED_EVENT,
   probeUpstreamHLS,
   useAdminNow,
   useChannelList,
@@ -14,28 +16,23 @@ import {
 import { AuthLoginForm, ChangePasswordForm } from "./AuthForms";
 import { formatMs } from "./format";
 import {
-  blankPolicyDraft,
-  profilesForMediaKind,
   useChannelActions,
 } from "./hooks/useChannelActions";
 // Admin panels are lazy-loaded so each chunk only fetches on first selection.
 const EncodingPanel = lazy(() =>
   import("./panels/EncodingPanel").then((m) => ({ default: m.EncodingPanel }))
 );
-const GuidePanel = lazy(() =>
-  import("./panels/GuidePanel").then((m) => ({ default: m.GuidePanel }))
+const InventoryPanel = lazy(() =>
+  import("./panels/InventoryPanel").then((m) => ({ default: m.InventoryPanel }))
+);
+const MediaSourcesPanel = lazy(() =>
+  import("./panels/MediaSourcesPanel").then((m) => ({ default: m.MediaSourcesPanel }))
 );
 const ProfilesPanel = lazy(() =>
   import("./panels/ProfilesPanel").then((m) => ({ default: m.ProfilesPanel }))
 );
-const SubtitlesPanel = lazy(() =>
-  import("./panels/SubtitlesPanel").then((m) => ({ default: m.SubtitlesPanel }))
-);
 const ToolsPanel = lazy(() =>
   import("./panels/ToolsPanel").then((m) => ({ default: m.ToolsPanel }))
-);
-const FillerAssetsPanel = lazy(() =>
-  import("./panels/FillerAssetsPanel").then((m) => ({ default: m.FillerAssetsPanel }))
 );
 const ScheduleBuilderPanel = lazy(() =>
   import("./panels/ScheduleBuilderPanel").then((m) => ({ default: m.ScheduleBuilderPanel }))
@@ -44,12 +41,10 @@ import type {
   ChannelNow,
   ChannelSummary,
   PackageProfile,
-  PolicyDraft,
-  ProfileReadiness,
 } from "./types";
 
 const SCHEDULE_WARN_HOURS = 6;
-const ADMIN_PANEL_IDS = new Set(["guide", "tools", "encoding", "profiles", "subtitles", "filler", "schedule"]);
+const ADMIN_PANEL_IDS = new Set(["guide", "library", "sources", "tools", "encoding", "profiles", "schedule"]);
 const SIDEBAR_AUTO_CLOSE_QUERY = "(max-width: 900px)";
 const NON_ERROR_STATUS_PREFIXES = [
   "queueing package run",
@@ -65,6 +60,7 @@ const NON_ERROR_STATUS_PREFIXES = [
   "skipped",
   "showing",
   "policy",
+  "profile",
   "resetting",
   "saving",
   "visible",
@@ -101,6 +97,18 @@ export function AdminPage() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // A 401 on any non-auth request means the session lapsed (commonly after a
+  // redeploy restarts the admin). Drop back to the login screen rather than
+  // leaving the operator on a workspace whose data calls all fail.
+  useEffect(() => {
+    function handleUnauthorized() {
+      setAuthEnabled(true);
+      setAuthState((prev) => (prev === "authenticated" || prev === "must-change" ? "unauthenticated" : prev));
+    }
+    window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
   }, []);
 
   if (authState === "checking") {
@@ -161,10 +169,9 @@ function AdminUnavailable({ error }: { error: string }) {
       <div className="admin-auth-panel">
         <h1>Admin</h1>
         <p className="muted">
-          Admin API is unavailable. If you removed LINEARCAST_ADMIN_PASSWORD,
-          linearcast-admin will refuse to start. Set a password, or did you mean
-          to enable no-auth mode with LINEARCAST_ADMIN_ALLOW_NO_AUTH=true for
-          development or recovery?
+          Admin API is unavailable. If auth is enabled, sign in with the
+          default password and change it, or enable no-auth mode with
+          LINEARCAST_ADMIN_ALLOW_NO_AUTH=true for development or recovery.
         </p>
         {error && <p className="form-status error">{error}</p>}
         <Link to="/" className="admin-auth-live-link">Back to live</Link>
@@ -180,10 +187,17 @@ function AdminWorkspace({
   authEnabled: boolean;
   onLogout: () => void;
 }) {
-  const { data: adminNow, updatedAt } = useAdminNow(15000);
+  const { data: adminNow } = useAdminNow(15000);
   const { channels: allChannels, loaded: channelsLoaded, refresh: refreshChannels } = useChannelList(60000);
 
-  const [selected, setSelected] = useState<string>("guide"); // channelID or an ADMIN_PANEL_IDS value
+  const [selected, setSelected] = useState<string>("library"); // channelID or an ADMIN_PANEL_IDS value
+  // Once the Inventory panel has been opened we keep it mounted (hidden when
+  // another view is active) so returning to it is instant and doesn't re-run
+  // its inventory query.
+  const [libraryVisited, setLibraryVisited] = useState(false);
+  useEffect(() => {
+    if (selected === "library") setLibraryVisited(true);
+  }, [selected]);
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     if (typeof window === "undefined") return true;
     return !window.matchMedia(SIDEBAR_AUTO_CLOSE_QUERY).matches;
@@ -197,10 +211,6 @@ function AdminWorkspace({
   const {
     rowBusy,
     rowStatus,
-    policyDraft,
-    setPolicyDraft,
-    migrationReadiness,
-    loadPolicy,
     extendSchedule,
     clearSchedule,
     restartPlayback,
@@ -210,9 +220,7 @@ function AdminWorkspace({
     cloneChannel,
     updateArtwork,
     updateUpstreamHLS,
-    savePolicy,
-    queueMigration,
-    refreshMigrationStatus,
+    changeOnDemandProfile,
   } = useChannelActions({
     allowedProfiles,
     profileDetails,
@@ -238,7 +246,7 @@ function AdminWorkspace({
     if (!deleteTarget) return;
     const target = deleteTarget;
     setDeleteTarget(null);
-    void deleteChannel(target.id, target.displayName, reclaimEncodes);
+    void deleteChannel(target.id, target.displayName, reclaimEncodes, target.enabled);
   }
 
   // Auto-load allowed profiles on mount.
@@ -262,17 +270,9 @@ function AdminWorkspace({
     return () => query.removeEventListener("change", onChange);
   }, []);
 
-  // Auto-load policy when a channel is first selected.
-  useEffect(() => {
-    if (ADMIN_PANEL_IDS.has(selected) || policyDraft[selected]?.loaded) return;
-    void loadPolicy(selected);
-  }, [selected]);
-
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
-
-  const lastUpdated = updatedAt ? new Date(updatedAt).toLocaleTimeString() : "—";
 
   // Channels with a non-empty error status message.
   const errorIds = new Set(
@@ -310,7 +310,6 @@ function AdminWorkspace({
           <span className="admin-page-title">Admin</span>
         </div>
         <div className="admin-page-session">
-          <span className="muted admin-page-updated">updated {lastUpdated}</span>
           {authEnabled && (
             <button type="button" className="admin-logout-btn" onClick={() => void logout()}>
               Log out
@@ -328,6 +327,20 @@ function AdminWorkspace({
             onClick={() => selectChannel("guide")}
           >
             Guide
+          </button>
+          <button
+            type="button"
+            className={`admin-sidebar-item${selected === "library" ? " is-selected" : ""}`}
+            onClick={() => selectChannel("library")}
+          >
+            Inventory
+          </button>
+          <button
+            type="button"
+            className={`admin-sidebar-item${selected === "sources" ? " is-selected" : ""}`}
+            onClick={() => selectChannel("sources")}
+          >
+            Sources
           </button>
           <button
             type="button"
@@ -352,27 +365,13 @@ function AdminWorkspace({
           </button>
           <button
             type="button"
-            className={`admin-sidebar-item${selected === "subtitles" ? " is-selected" : ""}`}
-            onClick={() => selectChannel("subtitles")}
-          >
-            Subtitles
-          </button>
-          <button
-            type="button"
-            className={`admin-sidebar-item${selected === "filler" ? " is-selected" : ""}`}
-            onClick={() => selectChannel("filler")}
-          >
-            Filler
-          </button>
-          <button
-            type="button"
             className={`admin-sidebar-item${selected === "schedule" ? " is-selected" : ""}`}
             onClick={() => {
               setScheduleChannelId(null);
               selectChannel("schedule");
             }}
           >
-            Schedule Builder
+            Schedule builder
           </button>
 
           {enabledChannels.length > 0 && (
@@ -413,27 +412,51 @@ function AdminWorkspace({
         {/* Main panel */}
         <main className="admin-main">
           <Suspense fallback={<div className="admin-panel"><section className="admin-panel-section"><p className="muted">loading…</p></section></div>}>
-          {selected === "guide" && <GuidePanel onChannelSelect={selectChannel} />}
+          {selected === "guide" && (
+            <div className="admin-panel">
+              <section className="admin-panel-section">
+                <div className="section-headline">
+                  <div className="section-headline-main">
+                    <h2>Guide</h2>
+                    <p className="section-purpose">
+                      Live program grid across all channels. Click a program to open its channel.
+                    </p>
+                  </div>
+                </div>
+                <ChannelGuide activeChannelID={null} onSelect={selectChannel} />
+              </section>
+            </div>
+          )}
 
-          {selected === "tools" && <ToolsPanel onChannelImported={refreshChannels} />}
+          {selected === "tools" && <ToolsPanel onChannelChanged={refreshChannels} />}
+
+          {libraryVisited && (
+            <div style={{ display: selected === "library" ? undefined : "none" }}>
+              <InventoryPanel />
+            </div>
+          )}
+
+          {selected === "sources" && (
+            <div className="admin-panel">
+              <MediaSourcesPanel />
+            </div>
+          )}
 
           {selected === "encoding" && <EncodingPanel />}
 
           {selected === "profiles" && <ProfilesPanel />}
-
-          {selected === "subtitles" && <SubtitlesPanel />}
-
-          {selected === "filler" && <FillerAssetsPanel />}
 
           {selected === "schedule" && (
             <ScheduleBuilderPanel
               existingChannel={scheduleChannelId ? enabledChannels.find((c) => c.id === scheduleChannelId) : undefined}
               onChannelImported={() => {
                 refreshChannels();
+                // Return to the channel just edited, or Inventory for a brand-new one.
+                const target = scheduleChannelId ?? "library";
                 setScheduleChannelId(null);
-                selectChannel("guide");
+                selectChannel(target);
               }}
-              onOpenMediaSources={() => selectChannel("tools")}
+              onOpenMediaSources={() => selectChannel("sources")}
             />
           )}
 
@@ -442,29 +465,14 @@ function AdminWorkspace({
               channel={selectedEnabled}
               busy={rowBusy[selectedEnabled.id] ?? false}
               status={rowStatus[selectedEnabled.id] ?? ""}
-              policyDraft={policyDraft[selectedEnabled.id]}
-              migrationReadiness={migrationReadiness[selectedEnabled.id]}
-              allowedProfiles={allowedProfiles}
-              profileDetails={profileDetails}
-              onPolicyChange={(patch) =>
-                setPolicyDraft((prev) => ({
-                  ...prev,
-                  [selectedEnabled.id]: {
-                    ...(prev[selectedEnabled.id] ?? blankPolicyDraft),
-                    ...patch,
-                    ...(patch.mediaKind
-                      ? {
-                          profile:
-                            profilesForMediaKind(allowedProfiles, profileDetails, patch.mediaKind)[0] ??
-                            (prev[selectedEnabled.id]?.profile ?? ""),
-                        }
-                      : {}),
-                  },
-                }))
+              onChangeProfile={() =>
+                void changeOnDemandProfile(
+                  selectedEnabled.id,
+                  selectedEnabled.displayName,
+                  selectedEnabled.packageProfile,
+                  selectedEnabled.mediaKind,
+                )
               }
-              onSavePolicy={() => void savePolicy(selectedEnabled.id)}
-              onQueueMigration={(profile) => void queueMigration(selectedEnabled.id, profile)}
-              onRefreshMigrationStatus={(profile) => void refreshMigrationStatus(selectedEnabled.id, profile)}
               onExtend={(hours) => void extendSchedule(selectedEnabled.id, hours)}
               onRestart={() => void restartPlayback(selectedEnabled.id, selectedEnabled.displayName)}
               onClearSchedule={() => void clearSchedule(selectedEnabled.id, selectedEnabled.displayName)}
@@ -485,6 +493,10 @@ function AdminWorkspace({
                 void setHiddenFromGuide(selectedEnabled.id, selectedEnabled.displayName, hidden)
               }
               onDisable={() => void setEnabled(selectedEnabled.id, selectedEnabled.displayName, false)}
+              onDelete={() => {
+                const summary = allChannels.find((c) => c.id === selectedEnabled.id);
+                if (summary) setDeleteTarget(summary);
+              }}
             />
           )}
 
@@ -507,9 +519,10 @@ function AdminWorkspace({
       >
         <div className="delete-channel-dialog">
           <p>
-            Delete this disabled channel, its playlist membership, and its
-            schedule? Source media stays in the library. You can also reclaim
-            packaged encodes that are no longer used by another channel.
+            Delete this channel, its playlist membership, and its schedule? An
+            enabled channel is disabled first, so it drops from the grid. Source
+            media stays in the library. You can also reclaim packaged encodes
+            that are no longer used by another channel.
           </p>
           <div className="delete-channel-dialog-actions">
             <button type="button" className="link-button" onClick={closeDeleteDialog}>
@@ -539,14 +552,7 @@ function ChannelPanel({
   channel,
   busy,
   status,
-  policyDraft,
-  migrationReadiness,
-  allowedProfiles,
-  profileDetails,
-  onPolicyChange,
-  onSavePolicy,
-  onQueueMigration,
-  onRefreshMigrationStatus,
+  onChangeProfile,
   onExtend,
   onRestart,
   onClearSchedule,
@@ -556,18 +562,12 @@ function ChannelPanel({
   onEditSchedule,
   onHiddenFromGuideChange,
   onDisable,
+  onDelete,
 }: {
   channel: ChannelNow;
   busy: boolean;
   status: string;
-  policyDraft?: PolicyDraft;
-  migrationReadiness?: ProfileReadiness | null;
-  allowedProfiles: string[];
-  profileDetails: Record<string, PackageProfile>;
-  onPolicyChange: (patch: Partial<PolicyDraft>) => void;
-  onSavePolicy: () => void;
-  onQueueMigration: (profile: string) => void;
-  onRefreshMigrationStatus: (profile: string) => void;
+  onChangeProfile: () => void;
   onExtend: (hours?: number) => void;
   onRestart: () => void;
   onClearSchedule: () => void;
@@ -577,6 +577,7 @@ function ChannelPanel({
   onEditSchedule: () => void;
   onHiddenFromGuideChange: (hidden: boolean) => void;
   onDisable: () => void;
+  onDelete: () => void;
 }) {
   const [extendHours, setExtendHours] = useState("24");
   const [hlsUrlDraft, setHlsUrlDraft] = useState(channel.upstreamHlsUrl ?? "");
@@ -599,9 +600,7 @@ function ChannelPanel({
   const schedHrs = channel.scheduleCoverageHours ?? 0;
   const schedWarn = schedHrs < SCHEDULE_WARN_HOURS;
   const pkgWarn = (channel.packageCoverageMs ?? 0) === 0;
-
-  const draft = policyDraft ?? blankPolicyDraft;
-  const kindProfiles = profilesForMediaKind(allowedProfiles, profileDetails, draft.mediaKind);
+  const isLiveEncoded = channel.prefillMode === "on_demand";
 
   return (
     <div className="admin-panel">
@@ -675,6 +674,11 @@ function ChannelPanel({
           <button type="button" disabled={busy} onClick={onClone}>
             {busy ? "…" : "Duplicate channel"}
           </button>
+          {!channel.isExternal && isLiveEncoded && (
+            <button type="button" disabled={busy} onClick={onChangeProfile}>
+              {busy ? "…" : "Change profile"}
+            </button>
+          )}
           {!channel.isExternal && (
             <div className="channel-action-artwork">
               <button type="button" disabled={busy} onClick={onUpdateArtwork}>
@@ -697,6 +701,9 @@ function ChannelPanel({
           <button type="button" className="danger" disabled={busy} onClick={onDisable}>
             {busy ? "…" : "Disable channel"}
           </button>
+          <button type="button" className="danger" disabled={busy} onClick={onDelete}>
+            {busy ? "…" : "Delete channel"}
+          </button>
         </div>
         {status && <p className="channel-status-msg muted">{status}</p>}
       </section>
@@ -706,7 +713,7 @@ function ChannelPanel({
           <h3>Source</h3>
           <div className="policy-editor-row">
             <label style={{ flex: 1 }}>
-              <span>upstream HLS URL</span>
+              <span>Spotify HLS URL</span>
               <input
                 type="url"
                 value={hlsUrlDraft}
@@ -736,7 +743,7 @@ function ChannelPanel({
             </button>
           </div>
           {hlsProbe && (
-            <p className="muted" style={{ color: hlsProbe.ok ? "#3fb950" : "#d29922" }}>
+            <p className={hlsProbe.ok ? "success" : "warn"}>
               {hlsProbe.ok ? "✓ " : "⚠ "}
               {hlsProbe.text}
             </p>
@@ -746,57 +753,6 @@ function ChannelPanel({
 
       {!channel.isExternal && (
         <>
-          {/* Profile */}
-          <section className="admin-panel-section">
-            <h3>Profile</h3>
-            <div className="policy-editor-row">
-              <label>
-                <span>media kind</span>
-                <select
-                  value={draft.mediaKind}
-                  disabled={busy || !draft.loaded}
-                  onChange={(e) => onPolicyChange({ mediaKind: e.target.value as "video" | "music" })}
-                >
-                  <option value="video">video</option>
-                  <option value="music">music</option>
-                </select>
-              </label>
-              <label>
-                <span>profile</span>
-                <select
-                  value={draft.profile}
-                  disabled={busy || !draft.loaded}
-                  onChange={(e) => onPolicyChange({ profile: e.target.value })}
-                >
-                  {kindProfiles.map((p) => (
-                    <option key={p} value={p}>{profileOptionLabel(p, profileDetails[p])}</option>
-                  ))}
-                </select>
-              </label>
-              <button type="button" className="primary" disabled={busy || !draft.loaded} onClick={onSavePolicy}>
-                Save
-              </button>
-            </div>
-            {draft.loaded && draft.profile !== channel.packageProfile && (
-              <div className="migration-row">
-                <span className="muted">
-                  re-encode {channel.packageReadyCount} episodes to {draft.profile} —
-                </span>
-                {migrationReadiness && migrationReadiness.profile === draft.profile ? (
-                  <span className={migrationReadiness.ready < migrationReadiness.total ? "danger" : ""}>
-                    {migrationReadiness.ready}/{migrationReadiness.total} ready
-                  </span>
-                ) : null}
-                <button type="button" disabled={busy} onClick={() => onQueueMigration(draft.profile)}>
-                  Queue packaging
-                </button>
-                <button type="button" disabled={busy} onClick={() => onRefreshMigrationStatus(draft.profile)}>
-                  Refresh
-                </button>
-              </div>
-            )}
-          </section>
-
           {/* Schedule */}
           <section className="admin-panel-section">
             <div className="section-headline">
@@ -813,10 +769,6 @@ function ChannelPanel({
       )}
     </div>
   );
-}
-
-function profileOptionLabel(name: string, detail?: PackageProfile) {
-  return detail?.label ? `${detail.label} (${name})` : name;
 }
 
 // ---------------------------------------------------------------------------

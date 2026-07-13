@@ -13,6 +13,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/tckrcr/linearcast/internal/codec"
 	"github.com/tckrcr/linearcast/internal/db"
 )
@@ -28,8 +29,18 @@ type Options struct {
 	RenditionProfile     string
 	InTransaction        bool
 	ResumeAfterMediaID   string
-	ScheduleMode         string
-	SlotDurationMs       int64
+	// MinStartMs, when positive, is the earliest wall-clock start for an empty
+	// or drained schedule. Existing healthy schedule tails still extend from
+	// their current end.
+	MinStartMs     int64
+	ScheduleMode   string
+	SlotDurationMs int64
+	// AllowLeadingPrimary permits a slot-grid build to place one primary
+	// entry before the first slot boundary when the channel has no existing
+	// schedule. The chosen episode is the longest one that fits in the
+	// leading gap, and the first slot-boundary primary resumes rotation
+	// immediately after it.
+	AllowLeadingPrimary bool
 }
 
 func OptionsForChannel(ch db.Channel, fallback Options) Options {
@@ -52,15 +63,17 @@ func OptionsForChannel(ch db.Channel, fallback Options) Options {
 		slotDurationMs = *ch.SlotDurationMs
 	}
 	return Options{
-		// On-demand and Plex relay channels schedule from eligible media without
+		// On-demand channels schedule from eligible media without
 		// requiring ready linearcast packages. Eager packaged channels keep the
 		// ready-package requirement.
-		RequireReadyPackages: ch.PrefillMode != "on_demand" && ch.PlaybackMode != db.PlaybackModePlexRelay,
+		RequireReadyPackages: ch.RequiresReadyPackages(),
 		RenditionProfile:     profile,
 		InTransaction:        fallback.InTransaction,
 		ResumeAfterMediaID:   fallback.ResumeAfterMediaID,
+		MinStartMs:           fallback.MinStartMs,
 		ScheduleMode:         scheduleMode,
 		SlotDurationMs:       slotDurationMs,
+		AllowLeadingPrimary:  fallback.AllowLeadingPrimary,
 	}
 }
 
@@ -82,7 +95,7 @@ func ExtendChannelTailWithOptions(ctx context.Context, conn *sql.DB, channelID, 
 func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering string, hours int, nowMs int64, opts Options) (inserted int, lastEnd int64, err error) {
 	wantEndMs := nowMs + int64(hours)*3600*1000
 
-	startMs, existingEnd, tailID, err := scheduleStart(ctx, conn, channelID, nowMs)
+	startMs, existingEnd, tailID, err := scheduleStart(ctx, conn, channelID, nowMs, opts.MinStartMs)
 	if err != nil {
 		return 0, 0, fmt.Errorf("schedule start: %w", err)
 	}
@@ -143,7 +156,8 @@ func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering 
 		if len(filler) == 0 {
 			log.Printf("WARN channel=%s slot_grid extension found no enabled filler assets with a ready %q package; extending with gaps", channelID, opts.RenditionProfile)
 		}
-		entries, err = BuildEntriesSlotGridFilled(channelID, media, filler, startMs, wantEndMs, slotMs, lastMediaID)
+
+		entries, err = BuildEntriesSlotGridFilled(channelID, media, filler, startMs, wantEndMs, slotMs, opts.AllowLeadingPrimary && tailID == "", lastMediaID)
 	} else {
 		switch ordering {
 		case "block":
@@ -204,7 +218,7 @@ func loadSlotGridFiller(ctx context.Context, conn db.Execer, channelID, profile 
 		if a.PackageStatus == nil || *a.PackageStatus != string(db.PackageStatusReady) || a.PackagedDurationMs == nil {
 			continue
 		}
-		dur := ClipTo6s(*a.PackagedDurationMs)
+		dur := ClipToGrid(*a.PackagedDurationMs)
 		if dur <= 0 {
 			continue
 		}
@@ -221,20 +235,101 @@ func loadSlotGridFiller(ctx context.Context, conn db.Execer, channelID, profile 
 	return out, nil
 }
 
+// backfillSlotGridLeadingGap fills a future leading gap at the head of a
+// slot-grid schedule with now-ready filler. A slot-grid channel created before
+// its filler packages were ready leaves the span [now, first slot boundary)
+// empty, and tail extension never revisits it (it only continues the tail, and
+// ScheduleGaps reports gaps only between entries, not a leading one). Once
+// filler packages are ready, the next extension pass calls this to tile that
+// span and splice the entries ahead of the existing head, so the dead air
+// self-heals without a manual RecomposeSlotGridFuture. Returns the number of
+// filler entries inserted.
+func backfillSlotGridLeadingGap(ctx context.Context, conn db.Execer, channelID string, nowMs int64, opts Options) (int, error) {
+	gapStart := AlignToGrid(nowMs)
+	head, err := db.FirstScheduleEntryEndingAfter(ctx, conn, channelID, nowMs)
+	if err != nil {
+		return 0, fmt.Errorf("first schedule entry ending after now: %w", err)
+	}
+	// No schedule yet (tail extension owns the empty case), or the head already
+	// covers now — either way there is no future leading gap to fill.
+	if head == nil || head.StartMs <= gapStart {
+		return 0, nil
+	}
+	gapEnd := head.StartMs
+
+	filler, err := loadSlotGridFiller(ctx, conn, channelID, opts.RenditionProfile, gapStart)
+	if err != nil {
+		return 0, fmt.Errorf("load slot-grid filler: %w", err)
+	}
+	if len(filler) == 0 {
+		// Same fallback as tail extension: leave the gap until filler packages
+		// exist, then a later pass heals it.
+		log.Printf("WARN channel=%s slot_grid leading gap [%d,%d) has no enabled filler with a ready %q package; leaving gap", channelID, gapStart, gapEnd, opts.RenditionProfile)
+		return 0, nil
+	}
+
+	createdAt := time.Now().UTC().UnixMilli()
+	entries, _ := tileFillerGap(nil, channelID, filler, 0, gapStart, gapEnd, createdAt)
+	if len(entries) == 0 {
+		return 0, nil
+	}
+
+	// Splice ahead of the head while preserving the chain invariants: the first
+	// filler takes the head's current chain position, the fillers chain among
+	// themselves, and the head then anchors to the last filler. The gap is empty
+	// space ending exactly on the head's boundary, so no suffix shift is needed.
+	for i := range entries {
+		entries[i].ID = uuid.New().String()
+	}
+	entries[0].AnchorScheduleEntryID = head.AnchorScheduleEntryID
+	lastID := entries[len(entries)-1].ID
+
+	insert := func(ex db.Execer) (int, error) {
+		// Re-point the head onto the new tail filler BEFORE inserting the run.
+		// The single-head index (channel_id WHERE anchor IS NULL) and the
+		// single-successor index (channel_id, anchor) would both fire if the old
+		// head and the new entries momentarily shared an anchor value. There is
+		// no FK on the anchor column, so pointing at a not-yet-inserted id is
+		// fine; the run is inserted in the same transaction.
+		if e := db.SetScheduleEntryAnchor(ctx, ex, head.ID, &lastID); e != nil {
+			return 0, e
+		}
+		return db.InsertScheduleEntries(ctx, ex, entries)
+	}
+
+	if opts.InTransaction {
+		return insert(conn)
+	}
+	sqlDB, ok := conn.(*sql.DB)
+	if !ok {
+		return 0, fmt.Errorf("transaction is required for slot-grid leading-gap backfill")
+	}
+	var inserted int
+	err = db.WithTx(ctx, sqlDB, func(tx db.Execer) error {
+		var e error
+		inserted, e = insert(tx)
+		return e
+	})
+	return inserted, err
+}
+
 // scheduleStart returns (nextStartMs, currentEndMs, tailID).
 // nextStartMs is where new entries should begin (existing end, aligned forward to now if stale).
-// currentEndMs is the end of the existing schedule, or align6s(now) if empty.
-func scheduleStart(ctx context.Context, conn db.Execer, channelID string, nowMs int64) (int64, int64, string, error) {
+// currentEndMs is the end of the existing schedule, or the aligned start floor if empty.
+func scheduleStart(ctx context.Context, conn db.Execer, channelID string, nowMs, minStartMs int64) (int64, int64, string, error) {
+	startFloorMs := AlignToGrid(nowMs)
+	if minStartMs > startFloorMs {
+		startFloorMs = AlignToGridCeil(minStartMs)
+	}
 	last, err := db.LastScheduleEntry(ctx, conn, channelID)
 	if err != nil {
 		return 0, 0, "", err
 	}
 	if last == nil {
 		// Use the segment grid as the source of truth for schedule starts.
-		// This floors to the current 6s boundary so the first playable window
-		// includes "now" instead of opening a short gap before the next boundary.
-		aligned := Align6s(nowMs)
-		return aligned, aligned, "", nil
+		// Channels floor to the current 6s boundary so the first playable window
+		// includes "now", unless a caller passes a future minStartMs floor.
+		return startFloorMs, startFloorMs, "", nil
 	}
 	end := last.StartMs + last.DurationMs
 	if end%db.ScheduleGridMs != 0 {
@@ -242,9 +337,10 @@ func scheduleStart(ctx context.Context, conn db.Execer, channelID string, nowMs 
 	}
 	if end < nowMs {
 		// Existing schedule has fully drained; resume on the current segment
-		// grid boundary. The old end is still returned for observability so
-		// callers can see how far the schedule had fallen behind.
-		return Align6s(nowMs), end, last.ID, nil
+		// grid boundary, or a later caller-provided floor. The old end is still
+		// returned for observability so callers can see how far the schedule had
+		// fallen behind.
+		return startFloorMs, end, last.ID, nil
 	}
 	return end, end, last.ID, nil
 }
@@ -297,7 +393,7 @@ func BuildEntries(channelID, ordering string, media []db.Media, startMs, wantEnd
 			continue
 		}
 
-		dur := ClipTo6s(remainingInMedia)
+		dur := ClipToGrid(remainingInMedia)
 		if dur <= 0 {
 			mediaIdx++
 			offsetInMedia = 0
@@ -337,16 +433,17 @@ func enforceCodecAllowlist(m db.Media) error {
 	if db.NormalizeMediaKind(m.MediaKind) == db.MediaKindMusic {
 		return nil
 	}
-	reason, ok := codec.Check(codec.Probe{
-		Container:       m.Container,
-		VideoCodec:      m.VideoCodec,
-		VideoHeight:     m.VideoHeight,
-		ColorTransfer:   m.ColorTransfer,
-		ColorPrimaries:  m.ColorPrimaries,
-		AudioCodec:      m.AudioCodec,
+	dec := codec.Admit(codec.Probe{
+		Container:      m.Container,
+		VideoCodec:     m.VideoCodec,
+		VideoHeight:    m.VideoHeight,
+		ColorTransfer:  m.ColorTransfer,
+		ColorPrimaries: m.ColorPrimaries,
+		CodecTagString: m.CodecTagString,
+		AudioCodec:     m.AudioCodec,
 	})
-	if !ok {
-		return fmt.Errorf("%s", reason)
+	if !dec.OK {
+		return fmt.Errorf("%s", dec.Reason)
 	}
 	return nil
 }
@@ -364,9 +461,23 @@ func InsertEntries(ctx context.Context, conn *sql.DB, entries []db.ScheduleEntry
 }
 
 // TargetSegmentMs is the canonical packaged-segment duration used by the
-// packager, encoder, scheduler, and HLS manifest generator. All schedule
-// entry start_ms and duration_ms must be divisible by this value.
-const TargetSegmentMs = db.ScheduleGridMs
+// packager, encoder, scheduler, and HLS manifest generator.
+const TargetSegmentMs = int64(2000)
 
-func ClipTo6s(ms int64) int64 { return ms - (ms % TargetSegmentMs) }
-func Align6s(ms int64) int64  { return ms - (ms % TargetSegmentMs) }
+// ClipToGrid and AlignToGrid operate on the persisted schedule grid, not the
+// transport segment target.
+func ClipToGrid(ms int64) int64  { return ms - (ms % db.ScheduleGridMs) }
+func AlignToGrid(ms int64) int64 { return ms - (ms % db.ScheduleGridMs) }
+
+func AlignToGridCeil(ms int64) int64 {
+	aligned := AlignToGrid(ms)
+	if aligned == ms {
+		return ms
+	}
+	return aligned + db.ScheduleGridMs
+}
+
+// Deprecated names kept as aliases while call sites move to the grid-specific
+// helpers.
+func ClipTo6s(ms int64) int64 { return ClipToGrid(ms) }
+func Align6s(ms int64) int64  { return AlignToGrid(ms) }

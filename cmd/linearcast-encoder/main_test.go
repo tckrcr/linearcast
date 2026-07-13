@@ -137,7 +137,7 @@ func TestRunDownloadOnceSuccess(t *testing.T) {
 				t.Fatalf("claim Authorization=%q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"packageId":"pkg_1","mediaId":"m1","mediaPath":"/srv/media/movie.mkv","renditionProfile":"h264-main-1080p"}`))
+			_, _ = w.Write([]byte(`{"packageId":"pkg_1","mediaId":"m1","mediaPath":"/srv/media/movie.mkv","renditionProfile":"h264-1080p-8mbps"}`))
 		case "/api/encoder/media/m1":
 			sawDownload = true
 			if got := r.Header.Get("Authorization"); got != "Bearer lcenc_test" {

@@ -8,10 +8,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/tckrcr/linearcast/internal/admin"
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/linearcastlog"
 )
 
 const (
@@ -34,7 +37,6 @@ type startupConfig struct {
 	dbPath            string
 	addr              string
 	upstreamURL       string
-	adminPassword     string
 	allowNoAuth       bool
 	adminCookieSecure bool
 }
@@ -44,7 +46,6 @@ func loadStartupConfig(getenv func(string) string) (startupConfig, error) {
 		dbPath:            getenv("LINEARCAST_DB"),
 		addr:              getenv("LINEARCAST_ADMIN_ADDR"),
 		upstreamURL:       strings.TrimRight(getenv("LINEARCAST_UPSTREAM_URL"), "/"),
-		adminPassword:     strings.TrimSpace(getenv("LINEARCAST_ADMIN_PASSWORD")),
 		allowNoAuth:       parseEnvBool(getenv("LINEARCAST_ADMIN_ALLOW_NO_AUTH")),
 		adminCookieSecure: parseEnvBool(getenv("LINEARCAST_ADMIN_COOKIE_SECURE")),
 	}
@@ -54,58 +55,59 @@ func loadStartupConfig(getenv func(string) string) (startupConfig, error) {
 	if cfg.addr == "" {
 		cfg.addr = defaultAddr
 	}
+	if err := validateListenAddr("LINEARCAST_ADMIN_ADDR", cfg.addr); err != nil {
+		return startupConfig{}, err
+	}
 	if cfg.upstreamURL == "" {
 		cfg.upstreamURL = defaultUpstreamURL
 	}
-	// LINEARCAST_ADMIN_PASSWORD is no longer required: the DB-backed default
-	// password is used on fresh installs and existing env passwords are seeded
-	// into the DB on first startup. LINEARCAST_ADMIN_ALLOW_NO_AUTH=true
-	// disables auth for development or recovery.
 	return cfg, nil
+}
+
+// validateListenAddr rejects an address that net.Listen would later fail on, so
+// a malformed listen address surfaces as a clear config error at startup
+// instead of an opaque ListenAndServe failure. The port must be numeric to
+// match the nginx upstream the container entrypoint derives from it.
+func validateListenAddr(name, addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s must be a host:port listen address (got %q): %w", name, addr, err)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("%s must end in a numeric port 1-65535 (got %q)", name, addr)
+	}
+	return nil
 }
 
 // ensureAdminPassword seeds the DB password on first startup and returns the
 // hash + must-change flag for the current run.
 //
-// Migration path: if envPassword is set and the DB has no password yet, hash
-// the env value and seed it without a must-change flag so existing installs
-// keep working without interruption. Log a deprecation notice either way.
-//
 // Fresh install: seed the default packaged password with must-change=true so
 // the operator is forced to set their own on first login.
-func ensureAdminPassword(conn *sql.DB, envPassword string) (hash string, mustChange bool, err error) {
+//
+// Existing install: return the persisted hash and must-change flag.
+func ensureAdminPassword(conn *sql.DB) (hash string, mustChange bool, err error) {
 	existing, exists, err := db.GetAdminPasswordHash(context.Background(), conn)
 	if err != nil {
 		return "", false, fmt.Errorf("read admin password hash: %w", err)
 	}
 
 	if !exists {
-		plaintext := envPassword
-		mustChange = plaintext == ""
-		if plaintext == "" {
-			plaintext = defaultAdminPassword
-		}
-		h, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+		h, err := bcrypt.GenerateFromPassword([]byte(defaultAdminPassword), bcrypt.DefaultCost)
 		if err != nil {
 			return "", false, fmt.Errorf("hash admin password: %w", err)
 		}
 		if err := db.SetAdminPasswordHash(context.Background(), conn, string(h)); err != nil {
 			return "", false, err
 		}
-		if err := db.SetAdminPasswordMustChange(context.Background(), conn, mustChange); err != nil {
+		if err := db.SetAdminPasswordMustChange(context.Background(), conn, true); err != nil {
 			return "", false, err
 		}
-		if envPassword != "" {
-			log.Printf("LINEARCAST_ADMIN_PASSWORD seeded to DB — remove it from .env to finish migration")
-		} else {
-			log.Printf("first-run: default admin password set — sign in with %q and change it immediately", defaultAdminPassword)
-		}
-		return string(h), mustChange, nil
+		slog.Info("first-run: default admin password set — sign in and change it immediately")
+		return string(h), true, nil
 	}
 
-	if envPassword != "" {
-		log.Printf("LINEARCAST_ADMIN_PASSWORD is set but DB password already exists — env var ignored; remove it from .env")
-	}
 	mustChange, err = db.AdminPasswordMustChange(context.Background(), conn)
 	if err != nil {
 		return "", false, fmt.Errorf("read must-change flag: %w", err)
@@ -130,7 +132,7 @@ func defaultEncoderDistDir(value string) string {
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	linearcastlog.SetupJSON()
 
 	if len(os.Args) > 1 && os.Args[1] == "maint" {
 		runMaint(os.Args[2:])
@@ -139,38 +141,50 @@ func main() {
 
 	cfg, err := loadStartupConfig(os.Getenv)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("startup config failed", "err", err)
+		os.Exit(1)
 	}
 
 	conn, err := db.OpenReadWrite(cfg.dbPath)
 	if err != nil {
-		log.Fatalf("open db: %v", err)
+		slog.Error("open db", "err", err)
+		os.Exit(1)
 	}
 	defer conn.Close()
 	if err := db.VerifySchema(context.Background(), conn); err != nil {
-		log.Fatalf("verify schema: %v", err)
+		slog.Error("verify schema", "err", err)
+		os.Exit(1)
 	}
 	if issues, err := db.ValidateChannelMediaChains(context.Background(), conn); err != nil {
-		log.Printf("chain integrity check failed to run: %v", err)
+		slog.Warn("chain integrity check failed to run", "err", err)
 	} else if len(issues) > 0 {
-		log.Printf("chain integrity: %d issue(s) found across channel_media — boot continues; query /api/admin/chain-integrity for details", len(issues))
+		slog.Warn("chain integrity issues found",
+			"count", len(issues),
+		)
 		for _, iss := range issues {
-			log.Printf("  channel=%s kind=%s media=%v detail=%s", iss.ChannelID, iss.Kind, iss.MediaIDs, iss.Detail)
+			slog.Warn("chain integrity issue",
+				"channel", iss.ChannelID,
+				"kind", iss.Kind,
+				"media", iss.MediaIDs,
+				"detail", iss.Detail,
+			)
 		}
 	} else {
-		log.Printf("chain integrity: all channel_media chains intact")
+		slog.Info("chain integrity: all channel_media chains intact")
 	}
 	sweeperSettings, err := db.GetEncoderSweeperSettings(context.Background(), conn)
 	if err != nil {
-		log.Fatalf("read encoder sweeper settings: %v", err)
+		slog.Error("read encoder sweeper settings", "err", err)
+		os.Exit(1)
 	}
 
 	var adminPasswordHash string
 	var adminPasswordMustChange bool
 	if !cfg.allowNoAuth {
-		adminPasswordHash, adminPasswordMustChange, err = ensureAdminPassword(conn, cfg.adminPassword)
+		adminPasswordHash, adminPasswordMustChange, err = ensureAdminPassword(conn)
 		if err != nil {
-			log.Fatalf("admin password setup: %v", err)
+			slog.Error("admin password setup", "err", err)
+			os.Exit(1)
 		}
 	}
 
@@ -180,7 +194,6 @@ func main() {
 		UpstreamURL:             cfg.upstreamURL,
 		HTTPClient:              &http.Client{Timeout: 2 * time.Second},
 		CacheDir:                os.Getenv("CACHE_DIR"),
-		PackageRoot:             os.Getenv("LINEARCAST_PACKAGE_ROOT"),
 		MediaRoot:               os.Getenv("LINEARCAST_MEDIA_ROOT"),
 		PlexURL:                 os.Getenv("PLEX_URL"),
 		PlexPathMap:             os.Getenv("PLEX_PATH_MAP"),
@@ -193,15 +206,23 @@ func main() {
 	})
 
 	if cfg.allowNoAuth {
-		log.Printf("linearcast-admin listening addr=%s db=%s upstream=%s auth=disabled allow_no_auth=true", cfg.addr, cfg.dbPath, cfg.upstreamURL)
+		slog.Info("linearcast-admin listening",
+			"addr", cfg.addr,
+			"db", cfg.dbPath,
+			"upstream", cfg.upstreamURL,
+			"auth", "disabled",
+			"allow_no_auth", true,
+		)
 	} else {
-		log.Printf("linearcast-admin listening addr=%s db=%s upstream=%s auth=password must_change=%v", cfg.addr, cfg.dbPath, cfg.upstreamURL, adminPasswordMustChange)
+		slog.Info("linearcast-admin listening",
+			"addr", cfg.addr,
+			"db", cfg.dbPath,
+			"upstream", cfg.upstreamURL,
+			"auth", "password",
+			"must_change", adminPasswordMustChange,
+		)
 	}
 
-	// Sweeper runs alongside the HTTP server. It transitions expired encoder
-	// leases back to pending (or to failed once the attempts cap is reached).
-	// We tie it to SIGINT/SIGTERM so an orderly shutdown lets in-flight sweep
-	// transactions commit before the DB closes.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	sweeper := admin.NewSweeper(conn)
@@ -209,12 +230,16 @@ func main() {
 	sweeper.MaxAttempts = sweeperSettings.MaxAttempts
 	go func() {
 		if err := sweeper.Run(ctx); err != nil && err != context.Canceled {
-			log.Printf("encoder sweeper exited: %v", err)
+			slog.Warn("encoder sweeper exited", "err", err)
 		}
 	}()
-	log.Printf("encoder sweeper interval=%s max_attempts=%d", sweeper.Interval, sweeper.MaxAttempts)
+	slog.Info("encoder sweeper started",
+		"interval", sweeper.Interval.String(),
+		"max_attempts", sweeper.MaxAttempts,
+		"stale_processing_timeout", sweeper.StaleProcessingTimeout.String(),
+	)
 
 	if err := http.ListenAndServe(cfg.addr, a.Handler()); err != nil {
-		log.Fatal(err)
+		slog.Error("server exited", "err", err)
 	}
 }

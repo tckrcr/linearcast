@@ -2,14 +2,15 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
-// TestBitmapSubtitleInventory: an embedded_bitmap row records a non-text
+// TestPackageBitmapSubtitleInventory: an embedded_bitmap row records a non-text
 // subtitle stream (path NULL) that is visible in the full listing but excluded
 // from playback selection, carries its forced flag, and does not collide with a
 // same-language bitmap stream at a different index.
-func TestBitmapSubtitleInventory(t *testing.T) {
+func TestPackageBitmapSubtitleInventory(t *testing.T) {
 	rw, err := OpenReadWrite(newTestDB(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -21,21 +22,26 @@ func TestBitmapSubtitleInventory(t *testing.T) {
 		VALUES ('m1', '/tmp/m1', '/tmp', 1000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
 		t.Fatalf("insert media: %v", err)
 	}
+	if _, err := rw.Exec(`INSERT INTO media_packages
+		(id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
+		VALUES ('pkg', 'm1', 'prof', 'ready', 0, 0)`); err != nil {
+		t.Fatalf("insert package: %v", err)
+	}
 
 	// A forced PGS track and a full PGS track, both English, on distinct streams.
-	forced := MediaTrack{MediaID: "m1", Kind: "subtitle", StreamIndex: 3, Language: "eng",
+	forced := PackageTrack{PackageID: "pkg", Kind: "subtitle", StreamIndex: 3, Language: "eng", Title: "English (Forced)",
 		Codec: "hdmv_pgs_subtitle", Source: TrackSourceEmbeddedBitmap, Forced: true}
-	full := MediaTrack{MediaID: "m1", Kind: "subtitle", StreamIndex: 4, Language: "eng",
+	full := PackageTrack{PackageID: "pkg", Kind: "subtitle", StreamIndex: 4, Language: "eng", Title: "English (SDH)",
 		Codec: "hdmv_pgs_subtitle", Source: TrackSourceEmbeddedBitmap}
-	for _, tr := range []MediaTrack{forced, full} {
-		if err := UpsertMediaTrack(context.Background(), rw, tr); err != nil {
+	for _, tr := range []PackageTrack{forced, full} {
+		if err := UpsertPackageTrack(context.Background(), rw, tr); err != nil {
 			t.Fatalf("upsert bitmap stream %d: %v", tr.StreamIndex, err)
 		}
 	}
 
 	// Both stay distinct (same language, different stream) — the embedded index
 	// keys on stream_index, not language.
-	all, err := MediaTracksByMediaID(context.Background(), rw, "m1")
+	all, err := PackageTracksByPackageID(context.Background(), rw, "pkg")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -43,6 +49,7 @@ func TestBitmapSubtitleInventory(t *testing.T) {
 		t.Fatalf("got %d tracks, want 2 (same-language bitmap streams must not collide)", len(all))
 	}
 	var sawForced bool
+	var forcedTitle string
 	for _, tr := range all {
 		if tr.Source != TrackSourceEmbeddedBitmap {
 			t.Errorf("stream %d source = %q, want embedded_bitmap", tr.StreamIndex, tr.Source)
@@ -52,100 +59,147 @@ func TestBitmapSubtitleInventory(t *testing.T) {
 		}
 		if tr.StreamIndex == 3 {
 			sawForced = tr.Forced
+			forcedTitle = tr.Title
 		}
 	}
 	if !sawForced {
 		t.Error("forced flag not persisted on stream 3")
 	}
+	if forcedTitle != "English (Forced)" {
+		t.Fatalf("forced title = %q, want English (Forced)", forcedTitle)
+	}
 
 	// Excluded from playback selection (path IS NULL).
-	pref, err := PreferredSubtitleTracksByMediaID(context.Background(), rw, "m1")
-	if err != nil {
-		t.Fatalf("preferred: %v", err)
+	if pref := PreferredSubtitleTrack(all, "eng"); pref != nil {
+		t.Errorf("preferred returned bitmap row %+v, want nil (NULL path must be excluded)", pref)
 	}
-	if len(pref) != 0 {
-		t.Errorf("preferred returned %d bitmap rows, want 0 (NULL path must be excluded)", len(pref))
-	}
-	has, err := HasSubtitleTrackForLang(context.Background(), rw, "m1", "eng")
-	if err != nil {
-		t.Fatalf("has: %v", err)
-	}
-	if has {
-		t.Error("HasSubtitleTrackForLang true for a bitmap-only language, want false")
-	}
-	bitmap, err := BitmapSubtitleTracksForMedia(context.Background(), rw, "m1")
-	if err != nil {
-		t.Fatalf("bitmap tracks: %v", err)
-	}
-	if len(bitmap) != 2 || bitmap[0].StreamIndex != 3 || bitmap[1].StreamIndex != 4 {
-		t.Fatalf("bitmap tracks = %+v, want forced stream 3 then stream 4", bitmap)
-	}
-
 	// Re-upserting the same stream updates in place (idempotent re-package).
-	if err := UpsertMediaTrack(context.Background(), rw, full); err != nil {
+	if err := UpsertPackageTrack(context.Background(), rw, full); err != nil {
 		t.Fatalf("re-upsert: %v", err)
 	}
-	all, _ = MediaTracksByMediaID(context.Background(), rw, "m1")
+	all, _ = PackageTracksByPackageID(context.Background(), rw, "pkg")
 	if len(all) != 2 {
 		t.Fatalf("after re-upsert got %d tracks, want 2 (must be idempotent)", len(all))
 	}
 }
 
-// TestMigrateV20toV21PreservesTracks simulates a v20 media_tracks (no forced
-// column), inserts a row, rewinds schema_version, and re-runs ApplySchema. The
-// existing row must survive with forced defaulting to 0, and embedded_bitmap
-// must be insertable afterward.
-func TestMigrateV20toV21PreservesTracks(t *testing.T) {
+func textSub(streamIndex int, language string, forced, hi bool) PackageTrack {
+	p := fmt.Sprintf("/tmp/subs/s%d.vtt", streamIndex)
+	return PackageTrack{
+		PackageID: "pkg", Kind: "subtitle", StreamIndex: streamIndex,
+		Language: language, Codec: "webvtt", Source: TrackSourceEmbedded,
+		Forced: forced, HearingImpaired: hi, Path: &p,
+	}
+}
+
+// TestPreferredSubtitleTrackExcludesForced: the Rings of Power shape — a forced
+// narrative track at the lowest stream index, full dialogue, then SDH. The
+// plain per-language pick must be the full dialogue track, never the forced or
+// SDH one, so the CC toggle shows real subtitles.
+func TestPreferredSubtitleTrackExcludesForced(t *testing.T) {
+	forced := textSub(2, "eng", true, false)
+	dialogue := textSub(3, "eng", false, false)
+	sdh := textSub(4, "eng", false, true)
+
+	if got := PreferredSubtitleTrack([]PackageTrack{forced, dialogue, sdh}, "eng"); got == nil || got.StreamIndex != 3 {
+		t.Fatalf("preferred = %+v, want dialogue stream 3", got)
+	}
+	if got := ForcedSubtitleTrack([]PackageTrack{forced, dialogue, sdh}, "eng"); got == nil || got.StreamIndex != 2 {
+		t.Fatalf("forced = %+v, want forced stream 2", got)
+	}
+	// SDH-only English (E02 shape): SDH is the only non-forced dialogue, so it
+	// is served rather than nothing.
+	if got := PreferredSubtitleTrack([]PackageTrack{forced, sdh}, "eng"); got == nil || got.StreamIndex != 4 {
+		t.Fatalf("SDH-only preferred = %+v, want SDH stream 4", got)
+	}
+	// Forced-only English resolves to no plain rendition.
+	if got := PreferredSubtitleTrack([]PackageTrack{forced}, "eng"); got != nil {
+		t.Fatalf("forced-only preferred = %+v, want nil", got)
+	}
+	// Language isolation: an English request ignores a French dialogue track.
+	if got := PreferredSubtitleTrack([]PackageTrack{textSub(2, "fre", false, false)}, "eng"); got != nil {
+		t.Fatalf("cross-language preferred = %+v, want nil", got)
+	}
+}
+
+// TestPackageSubtitleTracksForMediaIDsPrefersDialogue: the master-playlist query
+// collapses to one non-forced track per language and prefers full dialogue over
+// SDH, matching PreferredSubtitleTrack.
+func TestPackageSubtitleTracksForMediaIDsPrefersDialogue(t *testing.T) {
 	rw, err := OpenReadWrite(newTestDB(t))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	defer rw.Close()
-
 	if _, err := rw.Exec(`INSERT INTO media
 		(id, path, directory, duration_ms, container, video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('m1', '/tmp/m1', '/tmp', 1000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
 		t.Fatalf("insert media: %v", err)
 	}
-
-	// Simulate a v20 table: drop the forced column and rewind the version so the
-	// v20->v21 rebuild re-runs. (CHECK/index shape is recreated by the rebuild.)
-	if _, err := rw.Exec(`ALTER TABLE media_tracks DROP COLUMN forced`); err != nil {
-		t.Fatalf("simulate v20 (drop forced): %v", err)
+	if _, err := rw.Exec(`INSERT INTO media_packages
+		(id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
+		VALUES ('pkg', 'm1', 'prof', 'ready', 0, 0)`); err != nil {
+		t.Fatalf("insert package: %v", err)
 	}
-	if _, err := rw.Exec(`INSERT INTO media_tracks
-		(media_id, kind, stream_index, language, codec, source, default_flag, path)
-		VALUES ('m1', 'subtitle', 2, 'eng', 'webvtt', 'embedded_text', 1, '/tmp/m1/sub.vtt')`); err != nil {
-		t.Fatalf("insert legacy track: %v", err)
+	for _, tr := range []PackageTrack{
+		textSub(2, "eng", true, false),  // forced
+		textSub(3, "eng", false, false), // dialogue
+		textSub(4, "eng", false, true),  // SDH
+	} {
+		if err := UpsertPackageTrack(context.Background(), rw, tr); err != nil {
+			t.Fatalf("upsert stream %d: %v", tr.StreamIndex, err)
+		}
 	}
-	if _, err := rw.Exec(`UPDATE meta SET value = '20' WHERE key = 'schema_version'`); err != nil {
-		t.Fatalf("rewind schema_version: %v", err)
-	}
-
-	if err := ApplySchema(context.Background(), rw); err != nil {
-		t.Fatalf("ApplySchema (migration): %v", err)
-	}
-	if err := VerifySchema(context.Background(), rw); err != nil {
-		t.Fatalf("VerifySchema after migration: %v", err)
-	}
-
-	tracks, err := MediaTracksByMediaID(context.Background(), rw, "m1")
+	got, err := PackageSubtitleTracksForMediaIDs(context.Background(), rw, []string{"m1"}, "prof")
 	if err != nil {
-		t.Fatalf("list: %v", err)
+		t.Fatalf("query: %v", err)
 	}
-	if len(tracks) != 1 {
-		t.Fatalf("got %d tracks after migration, want 1 (row must be preserved)", len(tracks))
+	if len(got) != 1 {
+		t.Fatalf("got %d advertised tracks, want 1 per language", len(got))
 	}
-	if tracks[0].Forced {
-		t.Error("migrated row forced = true, want false (default backfill)")
-	}
-	if tracks[0].Source != TrackSourceEmbedded || tracks[0].Path == nil {
-		t.Errorf("migrated row not preserved faithfully: %+v", tracks[0])
+	if got[0].StreamIndex != 3 || got[0].Forced {
+		t.Fatalf("advertised track = %+v, want non-forced dialogue stream 3", got[0])
 	}
 
-	// The widened CHECK now admits embedded_bitmap.
-	if err := UpsertMediaTrack(context.Background(), rw, MediaTrack{MediaID: "m1", Kind: "subtitle", StreamIndex: 5,
-		Language: "fra", Codec: "dvd_subtitle", Source: TrackSourceEmbeddedBitmap, Forced: true}); err != nil {
-		t.Fatalf("insert embedded_bitmap after migration: %v", err)
+	forced, err := ForcedPackageSubtitleTracksForMediaIDs(context.Background(), rw, []string{"m1"}, "prof")
+	if err != nil {
+		t.Fatalf("forced query: %v", err)
+	}
+	if len(forced) != 1 {
+		t.Fatalf("got %d forced tracks, want 1 per language", len(forced))
+	}
+	if forced[0].StreamIndex != 2 || !forced[0].Forced {
+		t.Fatalf("forced advertised track = %+v, want forced stream 2", forced[0])
+	}
+}
+
+func TestPackageTracksCascadeWithMediaPackage(t *testing.T) {
+	rw, err := OpenReadWrite(newTestDB(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer rw.Close()
+	if _, err := rw.Exec(`INSERT INTO media
+		(id, path, directory, duration_ms, container, video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', '/tmp/m1', '/tmp', 1000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	if _, err := rw.Exec(`INSERT INTO media_packages
+		(id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
+		VALUES ('pkg', 'm1', 'prof', 'ready', 0, 0)`); err != nil {
+		t.Fatalf("insert package: %v", err)
+	}
+	if err := UpsertPackageTrack(context.Background(), rw, textSub(3, "eng", false, false)); err != nil {
+		t.Fatalf("upsert track: %v", err)
+	}
+	if err := DeleteMediaPackage(context.Background(), rw, "pkg"); err != nil {
+		t.Fatalf("delete package: %v", err)
+	}
+	var got int
+	if err := rw.QueryRow(`SELECT COUNT(*) FROM package_tracks WHERE package_id = 'pkg'`).Scan(&got); err != nil {
+		t.Fatalf("count package tracks: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("package_tracks rows = %d, want cascade delete", got)
 	}
 }

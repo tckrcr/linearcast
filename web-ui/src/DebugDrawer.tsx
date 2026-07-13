@@ -1,4 +1,3 @@
-import type Hls from "hls.js";
 import { formatSeconds } from "./format";
 import type { PlaybackStats, StreamProbe } from "./types";
 
@@ -8,10 +7,12 @@ type Props = {
   stats: PlaybackStats;
   probe: StreamProbe;
   appliedSource: string;
-  autoPlay: boolean;
-  onAutoPlayChange: (value: boolean) => void;
-  videoRef: React.RefObject<HTMLVideoElement | null>;
-  hlsRef: React.RefObject<Hls | null>;
+};
+
+type DebugRow = {
+  name: string;
+  value: string;
+  title?: string;
 };
 
 export function DebugDrawer({
@@ -20,108 +21,81 @@ export function DebugDrawer({
   stats,
   probe,
   appliedSource,
-  autoPlay,
-  onAutoPlayChange,
-  videoRef,
-  hlsRef,
 }: Props) {
   if (!open) return null;
 
-  function jumpBehindLive() {
-    const hls = hlsRef.current;
-    const video = videoRef.current;
-    if (!hls || !video || hls.liveSyncPosition == null) return;
-    video.currentTime = Math.max(0, hls.liveSyncPosition - 6);
-  }
+  const rows: DebugRow[] = [
+    { name: "Stream Status", value: probe.detail ? `${probe.status} · ${probe.detail}` : probe.status },
+    { name: "Stream Unavailable", value: stats.streamUnavailable ? stats.streamUnavailableReason || "yes" : "no", title: stats.streamUnavailableReason },
+    { name: "Fatal Error", value: stats.fatalError || "-", title: stats.fatalError },
+    { name: "Applied Source", value: appliedSource || "-", title: appliedSource },
+    { name: "Playback Engine", value: stats.playbackEngine || "-" },
+    { name: "Ready State", value: String(stats.readyState) },
+    { name: "Playback State", value: stats.paused ? "Paused" : "Playing" },
+    { name: "Current Time", value: formatSeconds(stats.currentTime) },
+    { name: "Playback Rate", value: `${stats.playbackRate.toFixed(2)}×` },
+    { name: "Video Resolution", value: formatResolution(stats.videoWidth, stats.videoHeight) },
+    { name: "Player Resolution", value: formatResolution(stats.playerWidth, stats.playerHeight) },
+    { name: "Viewport Resolution", value: formatResolution(stats.viewportWidth, stats.viewportHeight) },
+    { name: "Buffer Ahead", value: formatSeconds(stats.bufferAhead) },
+    { name: "Buffered Ranges", value: stats.buffered || "-", title: stats.buffered },
+    { name: "HLS Latency", value: formatSeconds(stats.hlsLatency) },
+    { name: "Live Sync Position", value: formatSeconds(stats.liveSyncPosition) },
+    { name: "Bandwidth Estimate", value: formatKbps(stats.bandwidthEstimate) },
+    { name: "Current Level", value: stats.currentLevel == null || stats.currentLevel < 0 ? "auto" : String(stats.currentLevel) },
+    { name: "Frames", value: `${stats.droppedFrames} dropped / ${stats.totalFrames} total` },
+    { name: "Last Fragment", value: stats.lastFrag || "-", title: stats.lastFrag },
+    { name: "Last Event", value: stats.lastEvent || "-", title: stats.lastEvent },
+  ];
 
   return (
     <aside className="drawer drawer-debug" role="dialog" aria-label="Debug panel">
-      <header className="drawer-head">
-        <h2>Debug</h2>
+      <header className="drawer-head drawer-debug-head">
+        <h2>Debug Stats</h2>
         <button type="button" className="drawer-close" onClick={onClose} aria-label="Close debug panel">
           ×
         </button>
       </header>
 
-      <section className="drawer-section">
-        <h3>Controls</h3>
-        <div className="drawer-controls">
-          <button type="button" onClick={() => void videoRef.current?.play()}>
-            Play
-          </button>
-          <button type="button" onClick={() => videoRef.current?.pause()}>
-            Pause
-          </button>
-          <button type="button" onClick={jumpBehindLive}>
-            −6s live
-          </button>
-          <label>
-            <input
-              type="checkbox"
-              checked={autoPlay}
-              onChange={(event) => onAutoPlayChange(event.target.checked)}
-            />
-            autoplay
-          </label>
-        </div>
-      </section>
+      <table className="debug-stats-table">
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            <th scope="col">Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.name}>
+              <td>{row.name}</td>
+              <td className="ellipsis" title={row.title ?? row.value}>{row.value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
 
-      <section className="drawer-section">
-        <h3>Stream probe</h3>
-        <div className="kv">
-          <span>status</span>
-          <strong>{probe.status}</strong>
-          <span>detail</span>
-          <strong>{probe.detail || "-"}</strong>
-          <span>applied</span>
-          <strong className="ellipsis" title={appliedSource}>
-            {appliedSource}
-          </strong>
-        </div>
-      </section>
-
-      <section className="drawer-section">
-        <h3>Playback</h3>
-        <div className="kv">
-          <span>engine</span>
-          <strong>{stats.playbackEngine || "-"}</strong>
-          <span>readyState</span>
-          <strong>{stats.readyState}</strong>
-          <span>paused</span>
-          <strong>{String(stats.paused)}</strong>
-          <span>currentTime</span>
-          <strong>{formatSeconds(stats.currentTime)}</strong>
-          <span>bufferAhead</span>
-          <strong>{formatSeconds(stats.bufferAhead)}</strong>
-          <span>buffered</span>
-          <strong className="ellipsis" title={stats.buffered}>
-            {stats.buffered || "-"}
-          </strong>
-          <span>frames</span>
-          <strong>
-            {stats.droppedFrames} / {stats.totalFrames}
-          </strong>
-          <span>hls latency</span>
-          <strong>{formatSeconds(stats.hlsLatency)}</strong>
-          <span>live sync</span>
-          <strong>{formatSeconds(stats.liveSyncPosition)}</strong>
-          <span>last frag</span>
-          <strong>{stats.lastFrag || "-"}</strong>
-          <span>last event</span>
-          <strong>{stats.lastEvent || "-"}</strong>
-        </div>
-      </section>
-
-      {stats.errors.length > 0 && (
-        <section className="drawer-section">
-          <h3>Recent errors</h3>
+      <section className="drawer-section debug-errors-section">
+        <h3>Recent Errors</h3>
+        {stats.errors.length > 0 ? (
           <ul className="drawer-errors">
             {stats.errors.map((error, index) => (
               <li key={`${error}-${index}`}>{error}</li>
             ))}
           </ul>
-        </section>
-      )}
+        ) : (
+          <p className="debug-no-errors">No recent playback errors.</p>
+        )}
+      </section>
     </aside>
   );
+}
+
+function formatResolution(width: number, height: number): string {
+  if (!width || !height) return "-";
+  return `${width}×${height}`;
+}
+
+function formatKbps(bitsPerSecond: number | null): string {
+  if (bitsPerSecond == null || !Number.isFinite(bitsPerSecond) || bitsPerSecond <= 0) return "-";
+  return `${Math.round(bitsPerSecond / 1000)} Kbps`;
 }

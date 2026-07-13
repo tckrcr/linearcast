@@ -27,7 +27,7 @@ func TestHandleMediaSearchNullTitleGroupWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertMedia(t, conn, "ep-alpha", 12000) // NULL title + scheduling_group
 
-	want := `[{"mediaId":"ep-alpha","title":"","path":"/tmp/ep-alpha.mkv","schedulingGroup":"","durationMs":12000,"codecCheckPassed":true}]` + "\n"
+	want := `[{"mediaId":"ep-alpha","title":"","path":"/tmp/ep-alpha.mkv","collectionName":"","durationMs":12000,"videoHeight":1080,"videoCodec":"h264","codecCheckPassed":true}]` + "\n"
 	if got := mediaSearchBody(t, app, "ep-alpha"); got != want {
 		t.Fatalf("media search body mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -40,13 +40,13 @@ func TestHandleMediaSearchSetTitleGroupWireShape(t *testing.T) {
 		t.Fatalf("set fields: %v", err)
 	}
 
-	want := `[{"mediaId":"ep-alpha","title":"Alpha Episode","path":"/tmp/ep-alpha.mkv","schedulingGroup":"Season 1","durationMs":12000,"codecCheckPassed":true}]` + "\n"
+	want := `[{"mediaId":"ep-alpha","title":"Alpha Episode","path":"/tmp/ep-alpha.mkv","collectionName":"Season 1","durationMs":12000,"videoHeight":1080,"videoCodec":"h264","codecCheckPassed":true}]` + "\n"
 	if got := mediaSearchBody(t, app, "ep-alpha"); got != want {
 		t.Fatalf("media search body mismatch:\n got: %s\nwant: %s", got, want)
 	}
 }
 
-// scheduleEntryItem uses omitempty on title/schedulingGroup, so a NULL media
+// scheduleEntryItem uses omitempty on title/collectionName, so a NULL media
 // title is omitted and a set one is present. The entry id is randomized by the
 // fixture, so assert the affected fields rather than the whole body.
 func TestHandleChannelScheduleMediaTitleOmitemptyWireShape(t *testing.T) {
@@ -72,14 +72,14 @@ func TestHandleChannelScheduleMediaTitleOmitemptyWireShape(t *testing.T) {
 		return resp.Entries[0]
 	}
 
-	if e := decodeEntry(); e.Title != "" || e.SchedulingGroup != "" {
-		t.Fatalf("NULL media title/group should be empty: %+v", e)
+	if e := decodeEntry(); e.Title != "" || e.CollectionName != "" {
+		t.Fatalf("NULL media title/collection should be empty: %+v", e)
 	}
 
 	if _, err := conn.Exec(`UPDATE media SET title = 'M1 Title', scheduling_group = 'Group A' WHERE id = 'm1'`); err != nil {
 		t.Fatalf("set fields: %v", err)
 	}
-	if e := decodeEntry(); e.Title != "M1 Title" || e.SchedulingGroup != "Group A" {
-		t.Fatalf("set media title/group not surfaced: %+v", e)
+	if e := decodeEntry(); e.Title != "M1 Title" || e.CollectionName != "Group A" {
+		t.Fatalf("set media title/collection not surfaced: %+v", e)
 	}
 }

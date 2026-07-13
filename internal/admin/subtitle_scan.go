@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -177,10 +176,21 @@ func (a *App) runSubtitleScan(job *subtitleScanJob) {
 		}
 
 		var extractedLangs []string
-		if dbTracks, err := db.MediaTracksByMediaID(context.Background(), a.dbConn, m.ID); err == nil {
-			for _, t := range dbTracks {
-				if t.Kind == "subtitle" && t.Path != nil && *t.Path != "" && t.Language != "" {
-					extractedLangs = append(extractedLangs, t.Language)
+		if pkgs, err := db.MediaPackagesForMedia(context.Background(), a.dbConn, m.ID); err == nil {
+			seenLang := map[string]bool{}
+			for _, pkg := range pkgs {
+				if pkg.Status != db.PackageStatusReady {
+					continue
+				}
+				dbTracks, err := db.PackageTracksByPackageID(context.Background(), a.dbConn, pkg.ID)
+				if err != nil {
+					continue
+				}
+				for _, t := range dbTracks {
+					if t.Kind == "subtitle" && t.Path != nil && *t.Path != "" && t.Language != "" && !seenLang[t.Language] {
+						extractedLangs = append(extractedLangs, t.Language)
+						seenLang[t.Language] = true
+					}
 				}
 			}
 		}
@@ -245,131 +255,6 @@ func showAndSeason(path string) (show, season string) {
 		return grandparent, parent
 	}
 	return parent, ""
-}
-
-// ---------------------------------------------------------------------------
-// Extract-all job
-// ---------------------------------------------------------------------------
-
-type subtitleExtractJob struct {
-	mu        sync.RWMutex
-	status    string // "running" | "done" | "error"
-	processed int
-	total     int
-	extracted int
-	skipped   int
-	failed    int
-	errMsg    string
-}
-
-func (j *subtitleExtractJob) snapshot() subtitleExtractStatus {
-	j.mu.RLock()
-	defer j.mu.RUnlock()
-	return subtitleExtractStatus{
-		Status:    j.status,
-		Processed: j.processed,
-		Total:     j.total,
-		Extracted: j.extracted,
-		Skipped:   j.skipped,
-		Failed:    j.failed,
-		Error:     j.errMsg,
-	}
-}
-
-type subtitleExtractStatus struct {
-	Status    string `json:"status"`
-	Processed int    `json:"processed"`
-	Total     int    `json:"total"`
-	Extracted int    `json:"extracted"`
-	Skipped   int    `json:"skipped"`
-	Failed    int    `json:"failed"`
-	Error     string `json:"error,omitempty"`
-}
-
-func (a *App) handleSubtitleExtractAllGet(w http.ResponseWriter, _ *http.Request) {
-	a.mu().RLock()
-	job := a.subtitleExtract
-	a.mu().RUnlock()
-
-	if job == nil {
-		writeJSON(w, subtitleExtractStatus{Status: "idle"})
-		return
-	}
-	writeJSON(w, job.snapshot())
-}
-
-func (a *App) handleSubtitleExtractAllStart(w http.ResponseWriter, r *http.Request) {
-	a.mu().Lock()
-	if a.subtitleExtract != nil && a.subtitleExtract.snapshot().Status == "running" {
-		a.mu().Unlock()
-		writeError(w, http.StatusConflict, "already_running", "an extract is already in progress")
-		return
-	}
-	job := &subtitleExtractJob{status: "running"}
-	a.subtitleExtract = job
-	a.mu().Unlock()
-
-	go a.runSubtitleExtractAll(job)
-	writeJSON(w, subtitleExtractStatus{Status: "running"})
-}
-
-func (a *App) runSubtitleExtractAll(job *subtitleExtractJob) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
-	defer cancel()
-
-	packagedIDs, err := db.ReadyPackagedMediaIDs(context.Background(), a.dbConn)
-	if err != nil {
-		job.mu.Lock()
-		job.status = "error"
-		job.errMsg = err.Error()
-		job.mu.Unlock()
-		return
-	}
-	prefs, err := db.GetSubtitleLanguagePreference(context.Background(), a.dbConn)
-	if err != nil {
-		job.mu.Lock()
-		job.status = "error"
-		job.errMsg = err.Error()
-		job.mu.Unlock()
-		return
-	}
-
-	packageRoot := a.packageRoot
-	if packageRoot == "" {
-		if cacheDir := os.Getenv("CACHE_DIR"); cacheDir != "" {
-			packageRoot = cacheDir + "/packages"
-		}
-	}
-
-	mediaIDs := make([]string, 0, len(packagedIDs))
-	for id := range packagedIDs {
-		mediaIDs = append(mediaIDs, id)
-	}
-
-	job.mu.Lock()
-	job.total = len(mediaIDs)
-	job.mu.Unlock()
-
-	for _, mediaID := range mediaIDs {
-		if ctx.Err() != nil {
-			break
-		}
-		result, err := packager.FetchSubtitlesForMedia(ctx, a.dbConn, mediaID, "", packageRoot, prefs)
-		job.mu.Lock()
-		job.processed++
-		if err != nil {
-			job.failed++
-		} else if result.Skipped {
-			job.skipped++
-		} else {
-			job.extracted++
-		}
-		job.mu.Unlock()
-	}
-
-	job.mu.Lock()
-	job.status = "done"
-	job.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------

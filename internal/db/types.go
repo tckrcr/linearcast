@@ -41,7 +41,6 @@ type PlaybackMode string
 const (
 	PlaybackModeGenerated PlaybackMode = "generated"
 	PlaybackModePackaged  PlaybackMode = "packaged"
-	PlaybackModePlexRelay PlaybackMode = "plex_relay"
 )
 
 type PackageStatus string
@@ -74,35 +73,71 @@ type Channel struct {
 	// possibly empty) marks an external/live channel. The nil/non-nil split is
 	// load-bearing — readers gate external-channel behavior on it.
 	UpstreamHLSURL *string
-	// PrefillMode is "eager" (default — package the whole channel ahead) or
-	// "on_demand" (defer packaging until a viewer tunes in). On-demand channels
-	// schedule from codec-eligible media without requiring ready packages and are
-	// excluded from eager packager discovery.
+	// PrefillMode controls how the channel's media is encoded:
+	//   "eager"    — package the entire channel ahead of playback (default)
+	//   "on_demand"— defer encoding until a viewer tunes in
+	// On-demand channels schedule from codec-eligible media without requiring
+	// ready packages and are excluded from eager packager discovery.
 	PrefillMode string
 }
 
+// RequiresReadyPackages reports whether the channel's scheduled media must have
+// ready linearcast packages. On-demand channels defer encoding via live
+// channel encodings, so they don't require ready packages; only eager channels do. This
+// is the single source of truth shared by the scheduler, the
+// schedule builder, and the schedule-check audit — keep those call sites
+// pointed here so the rule cannot drift.
+func (c Channel) RequiresReadyPackages() bool {
+	return c.PrefillMode == "eager"
+}
+
 type Media struct {
-	ID              string
-	Path            string
-	Directory       string
-	Title           string
-	SchedulingGroup string
-	UserPreference  *int64
-	DurationMs      int64
-	Container       string
-	VideoCodec      string
-	VideoWidth      int64 // 0 = unknown (pre-v29 ingest or audio-only)
-	VideoHeight     int64
+	ID             string
+	Path           string
+	Directory      string
+	Title          string
+	CollectionName string
+	CollectionID   string
+	SeasonNumber   *int64
+	EpisodeNumber  *int64
+	UserPreference *int64
+	DurationMs     int64
+	Container      string
+	VideoCodec     string
+	VideoWidth     int64 // 0 = unknown (pre-v29 ingest or audio-only)
+	VideoHeight    int64
+	// VideoBitrateBps is the source video bitrate in bits per second recorded at
+	// ingest (0 = unknown). Used to estimate packaged size — exact for copy
+	// profiles, since the video stream is remuxed unchanged.
+	VideoBitrateBps int64
 	// ColorTransfer and ColorPrimaries are ffprobe color metadata recorded for
 	// HDR detection ("" = unknown). See codec.IsHDRTransfer.
-	ColorTransfer    string
-	ColorPrimaries   string
+	ColorTransfer  string
+	ColorPrimaries string
+	// CodecTagString is ffprobe's codec_tag_string for the video stream
+	// ("" = unknown). Persisted for Dolby Vision Profile 5 detection. See
+	// codec.IsDolbyVisionProfile5.
+	CodecTagString   string
 	AudioCodec       string
 	CodecCheckPassed bool
 	CodecCheckReason string
 	IngestedAtMs     int64
 	MediaKind        MediaKind // "" = video; "music" = audio-only
 	SourceRef        string    // e.g. "plex://{ratingKey}" for media sourced from Plex
+	Description      string
+	ThumbPath        string
+	ContentRating    string
+	Genres           []string
+}
+
+type Collection struct {
+	ID          string
+	Name        string
+	Kind        string
+	Source      string
+	Genres      []string
+	CreatedAtMs int64
+	UpdatedAtMs int64
 }
 
 type ChannelMediaRow struct {
@@ -117,7 +152,7 @@ type ChannelMediaPackageRow struct {
 	AddedAtMs          int64
 	Path               string
 	Title              string
-	SchedulingGroup    string
+	CollectionName     string
 	DurationMs         int64
 	CodecCheckPassed   bool
 	CodecCheckReason   string
@@ -143,7 +178,7 @@ type ChannelFillerAsset struct {
 	ChannelEnabled     bool
 	Path               string
 	Title              string
-	SchedulingGroup    string
+	CollectionName     string
 	DurationMs         int64
 	PackageID          *string
 	PackageStatus      *string
@@ -195,6 +230,7 @@ type MediaPackage struct {
 	AudioProfile       string
 	Timescale          *int64
 	PackagedDurationMs *int64
+	PackageBytes       *int64 // on-disk package size recorded at finalize (nil = unknown)
 	Error              *string
 	LastAttemptError   *string
 	Attempts           int64
@@ -261,13 +297,16 @@ type MediaPackageCandidate struct {
 	MediaID            string
 	Path               string
 	Title              string
-	SchedulingGroup    string
+	CollectionName     string
+	SourceRef          string
 	DurationMs         int64
+	VideoBitrateBps    int64 // source video bitrate (0 = unknown); feeds copy-profile size estimates
 	PackageID          *string
 	RenditionProfile   string
 	PackageStatus      *string
 	PackageError       *string
 	PackagedDurationMs *int64
+	PackageBytes       *int64
 	UpdatedAtMs        *int64
 }
 
@@ -307,28 +346,30 @@ type TrackSource string
 const (
 	TrackSourceEmbedded       TrackSource = "embedded_text"
 	TrackSourceEmbeddedBitmap TrackSource = "embedded_bitmap"
-	TrackSourceOpenSubtitles  TrackSource = "opensubtitles"
 	TrackSourceManual         TrackSource = "manual"
 )
 
-// MediaTrack represents one subtitle or audio track. Embedded tracks have
-// StreamIndex >= 0 (the stream's index in the source file). API-sourced tracks
-// use StreamIndex = -1. A subtitle track with Source = opensubtitles and
-// Path == nil is a "no good match" sentinel (NULL path is load-bearing). A
-// Source = embedded_bitmap row is an inventory record for a non-text subtitle
-// stream (PGS/VOBSUB); it always has Path == nil and never reaches playback.
-type MediaTrack struct {
+// PackageTrack represents one subtitle or audio track generated for a package.
+// Embedded tracks have StreamIndex >= 0 (the stream's index in the source file).
+// Manually sourced tracks use StreamIndex = -1. A Source = embedded_bitmap row is
+// package-scoped inventory for a non-text subtitle stream (PGS/VOBSUB); it always
+// has Path == nil and is usable only for burn-in.
+type PackageTrack struct {
 	ID          int64
-	MediaID     string
+	PackageID   string
 	Kind        string
 	StreamIndex int
 	Language    string
+	Title       string
 	Codec       string
 	Source      TrackSource
 	DefaultFlag bool
 	// Forced marks a forced-display (foreign-dialogue) subtitle track.
 	Forced bool
-	Path   *string
+	// HearingImpaired marks an SDH (subtitles for the deaf/hard of hearing) track.
+	// Within the same language and source tier, SDH is preferred for playback.
+	HearingImpaired bool
+	Path            *string
 }
 
 type ChannelWrite struct {
@@ -350,16 +391,24 @@ type ChannelWrite struct {
 
 // ScheduleEntryEnriched is a ScheduleEntry joined with its media row.
 type ScheduleEntryEnriched struct {
-	ID              string
-	ChannelID       string
-	StartMs         int64
-	MediaID         string
-	OffsetMs        int64
-	DurationMs      int64
-	CreatedAtMs     int64
-	Path            string
-	Title           string
-	SchedulingGroup string
+	ID             string
+	ChannelID      string
+	StartMs        int64
+	MediaID        string
+	OffsetMs       int64
+	DurationMs     int64
+	CreatedAtMs    int64
+	Path           string
+	Title          string
+	CollectionName string
+	Description    string
+	ThumbPath      string
+	ContentRating  string
+	Genres         []string
+	// SeasonNumber and EpisodeNumber carry the source media's episode metadata
+	// (nil for movies / non-episodic media). Used to emit XMLTV <episode-num>.
+	SeasonNumber  *int64
+	EpisodeNumber *int64
 }
 
 // GroupCursor is the per-scheduling_group cursor derived from a channel's

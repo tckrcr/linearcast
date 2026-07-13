@@ -9,5 +9,4 @@ export * from "./api/settings";
 export * from "./api/sources";
 export * from "./api/writeLog";
 export * from "./api/encoders";
-export * from "./api/subtitles";
 export * from "./api/scheduleBuilder";

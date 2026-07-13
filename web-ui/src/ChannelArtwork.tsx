@@ -37,7 +37,7 @@ export function ChannelArtwork({
 
 export function defaultChannelArtworkURL(name: string) {
   const initials = channelInitials(name);
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 90" role="img" aria-label="Channel artwork"><rect width="160" height="90" fill="#111820"/><path d="M0 64h160v26H0z" fill="#1f2f3d"/><path d="M0 0h160v16H0z" fill="#3c6e8f"/><text x="80" y="56" fill="#e7eaef" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700" text-anchor="middle">${escapeSVG(initials)}</text></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 90" role="img" aria-label="Channel artwork"><rect width="160" height="90" fill="#202020"/><path d="M0 64h160v26H0z" fill="#2b2b2b"/><path d="M0 0h160v16H0z" fill="#4a4a4a"/><text x="80" y="56" fill="#f1f1f1" font-family="Noto Sans, Arial, Helvetica, sans-serif" font-size="30" font-weight="700" text-anchor="middle">${escapeSVG(initials)}</text></svg>`;
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 

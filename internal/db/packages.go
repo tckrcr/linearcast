@@ -13,7 +13,7 @@ import (
 // must include the complete durable state for that transition rather than a
 // partial patch.
 func UpsertMediaPackage(ctx context.Context, conn *sql.DB, p MediaPackage) error {
-	var pkgRoot, initSeg, videoWidth, videoHeight, timescale, pkgDurationMs, pkgErr, lastAttempt any
+	var pkgRoot, initSeg, videoWidth, videoHeight, timescale, pkgDurationMs, pkgBytes, pkgErr, lastAttempt any
 	if p.PackageRoot != nil {
 		pkgRoot = *p.PackageRoot
 	}
@@ -32,6 +32,9 @@ func UpsertMediaPackage(ctx context.Context, conn *sql.DB, p MediaPackage) error
 	if p.PackagedDurationMs != nil {
 		pkgDurationMs = *p.PackagedDurationMs
 	}
+	if p.PackageBytes != nil {
+		pkgBytes = *p.PackageBytes
+	}
 	if p.Error != nil {
 		pkgErr = *p.Error
 	}
@@ -43,9 +46,9 @@ func UpsertMediaPackage(ctx context.Context, conn *sql.DB, p MediaPackage) error
 			id, media_id, rendition_profile, status, package_root, init_segment_path,
 			segment_base_path, container, video_codec, video_profile, video_width,
 			video_height, audio_codec, audio_profile, timescale, packaged_duration_ms,
-			error, last_attempt_error, created_at_ms, updated_at_ms
+			package_bytes, error, last_attempt_error, created_at_ms, updated_at_ms
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			media_id = excluded.media_id,
 			rendition_profile = excluded.rendition_profile,
@@ -62,6 +65,7 @@ func UpsertMediaPackage(ctx context.Context, conn *sql.DB, p MediaPackage) error
 			audio_profile = excluded.audio_profile,
 			timescale = excluded.timescale,
 			packaged_duration_ms = excluded.packaged_duration_ms,
+			package_bytes = excluded.package_bytes,
 			error = excluded.error,
 			last_attempt_error = excluded.last_attempt_error,
 			created_at_ms = excluded.created_at_ms,
@@ -70,7 +74,7 @@ func UpsertMediaPackage(ctx context.Context, conn *sql.DB, p MediaPackage) error
 		nullString(p.SegmentBasePath), nullString(p.Container), nullString(p.VideoCodec),
 		nullString(p.VideoProfile), videoWidth, videoHeight,
 		nullString(p.AudioCodec), nullString(p.AudioProfile), timescale, pkgDurationMs,
-		pkgErr, lastAttempt, p.CreatedAtMs, p.UpdatedAtMs)
+		pkgBytes, pkgErr, lastAttempt, p.CreatedAtMs, p.UpdatedAtMs)
 	return err
 }
 
@@ -160,6 +164,14 @@ func ReplacePackagedSegments(ctx context.Context, conn *sql.DB, packageID string
 		}
 	}
 	return tx.Commit()
+}
+
+// DeletePackagedSegments removes all segment metadata for packageID. It is used
+// by failure cleanup paths where uploaded package artifacts were validated far
+// enough to write segment rows, but the package was not promoted to ready.
+func DeletePackagedSegments(ctx context.Context, conn *sql.DB, packageID string) error {
+	_, err := conn.ExecContext(ctx, `DELETE FROM packaged_segments WHERE package_id = ?`, packageID)
+	return err
 }
 
 // PackagedSegmentByNumber returns one segment by durable package identity and

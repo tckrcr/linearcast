@@ -43,7 +43,12 @@ export function WriteLogPanel() {
     <div className="admin-panel">
       <section className="admin-panel-section">
         <div className="section-headline">
-          <h2>Operator write log</h2>
+          <div className="section-headline-main">
+            <h2>Operator write log</h2>
+            <p className="section-purpose">
+              Recent state-changing admin actions, newest first.
+            </p>
+          </div>
           <div className={styles["write-log-controls"]}>
             <label>
               <span className="muted">limit</span>{" "}

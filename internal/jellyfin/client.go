@@ -3,6 +3,7 @@
 package jellyfin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/tckrcr/linearcast/internal/mediasource"
 )
 
 type Client struct {
@@ -27,50 +30,10 @@ func New(baseURL, apiKey string) *Client {
 	}
 }
 
-type Status struct {
-	ServerName string
-	Version    string
-	ID         string
-}
-
 type systemInfoResponse struct {
 	ServerName string `json:"ServerName"`
 	Version    string `json:"Version"`
 	ID         string `json:"Id"`
-}
-
-func (c *Client) Status() (Status, error) {
-	var resp systemInfoResponse
-	if err := c.getJSON("/System/Info", &resp); err != nil {
-		return Status{}, err
-	}
-	return Status{
-		ServerName: resp.ServerName,
-		Version:    resp.Version,
-		ID:         resp.ID,
-	}, nil
-}
-
-// Library is a top-level Jellyfin media folder.
-type Library struct {
-	ID   string
-	Name string
-	Type string // "movies", "tvshows", "homevideos", etc.
-}
-
-// Item is one Jellyfin media item (a movie or episode).
-// Path is taken from the first MediaSource. Height is from the first
-// MediaSource's video dimensions, used for resolution filtering.
-type Item struct {
-	ID            string
-	Name          string
-	Type          string // "Movie" or "Episode"
-	SeriesName    string // show title, for episodes
-	SeasonNumber  int    // for episodes
-	EpisodeNumber int    // for episodes
-	Year          int    // for movies
-	Path          string
-	Height        int // video height in pixels, 0 if unknown
 }
 
 type mediaFoldersResponse struct {
@@ -102,68 +65,14 @@ type mediaSource struct {
 	Height int    `json:"Height"`
 }
 
-// Libraries returns all top-level media folders.
-func (c *Client) Libraries() ([]Library, error) {
-	var resp mediaFoldersResponse
-	if err := c.getJSON("/Library/MediaFolders", &resp); err != nil {
-		return nil, err
-	}
-	out := make([]Library, 0, len(resp.Items))
-	for _, item := range resp.Items {
-		out = append(out, Library{
-			ID:   item.ID,
-			Name: item.Name,
-			Type: item.CollectionType,
-		})
-	}
-	return out, nil
-}
-
-// Items returns all Movie and Episode items under libraryID, recursively.
-// Path is taken from the first MediaSource; items with no path are dropped.
-func (c *Client) Items(libraryID string) ([]Item, error) {
-	q := "ParentId=" + libraryID +
-		"&Recursive=true" +
-		"&IncludeItemTypes=Movie%2CEpisode" +
-		"&Fields=Path%2CMediaSources%2CParentIndexNumber%2CIndexNumber%2CProductionYear"
-	var resp itemsResponse
-	if err := c.getJSON("/Items?"+q, &resp); err != nil {
-		return nil, err
-	}
-	out := make([]Item, 0, len(resp.Items))
-	for _, r := range resp.Items {
-		path := ""
-		height := 0
-		if len(r.MediaSources) > 0 {
-			path = r.MediaSources[0].Path
-			height = r.MediaSources[0].Height
-		}
-		if path == "" {
-			continue
-		}
-		out = append(out, Item{
-			ID:            r.ID,
-			Name:          r.Name,
-			Type:          r.Type,
-			SeriesName:    r.SeriesName,
-			SeasonNumber:  r.ParentIndexNumber,
-			EpisodeNumber: r.IndexNumber,
-			Year:          r.ProductionYear,
-			Path:          path,
-			Height:        height,
-		})
-	}
-	return out, nil
-}
-
-func (c *Client) getJSON(path string, out any) error {
+func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	if c.BaseURL == "" {
 		return fmt.Errorf("jellyfin: BaseURL is empty (set JELLYFIN_URL)")
 	}
 	if c.APIKey == "" {
 		return fmt.Errorf("jellyfin: APIKey is empty")
 	}
-	req, err := http.NewRequest(http.MethodGet, c.BaseURL+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
 	if err != nil {
 		return err
 	}
@@ -189,3 +98,117 @@ func sanitizeRequestError(err error) error {
 	}
 	return err
 }
+
+// Name returns the source kind identifier.
+func (c *Client) Name() string {
+	return "jellyfin"
+}
+
+// Status checks connectivity and returns server info.
+func (c *Client) Status(ctx context.Context) (mediasource.Status, error) {
+	var resp systemInfoResponse
+	if err := c.getJSON(ctx, "/System/Info", &resp); err != nil {
+		return mediasource.Status{}, err
+	}
+	return mediasource.Status{
+		Connected:  true,
+		ServerName: resp.ServerName,
+		Version:    resp.Version,
+		ID:         resp.ID,
+		URL:        c.BaseURL,
+		PathMap:    "",
+	}, nil
+}
+
+// Libraries returns all available libraries/sections.
+func (c *Client) Libraries(ctx context.Context) ([]mediasource.Library, error) {
+	var resp mediaFoldersResponse
+	if err := c.getJSON(ctx, "/Library/MediaFolders", &resp); err != nil {
+		return nil, err
+	}
+	out := make([]mediasource.Library, 0, len(resp.Items))
+	for _, item := range resp.Items {
+		libType := item.CollectionType
+		if libType == "tvshows" {
+			libType = "shows"
+		}
+		out = append(out, mediasource.Library{
+			ID:   item.ID,
+			Name: item.Name,
+			Type: libType,
+		})
+	}
+	return out, nil
+}
+
+// Items returns items in a library, filtered by options.
+func (c *Client) Items(ctx context.Context, libraryID string, opts mediasource.ScanOptions) ([]mediasource.Item, error) {
+	maxHeight := jellyfinMaxHeight(opts.MaxResolution)
+
+	q := "ParentId=" + libraryID +
+		"&Recursive=true" +
+		"&IncludeItemTypes=Movie%2CEpisode" +
+		"&Fields=Path%2CMediaSources%2CParentIndexNumber%2CIndexNumber%2CProductionYear"
+	var resp itemsResponse
+	if err := c.getJSON(ctx, "/Items?"+q, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]mediasource.Item, 0, len(resp.Items))
+	for _, r := range resp.Items {
+		path := ""
+		height := 0
+		if len(r.MediaSources) > 0 {
+			path = r.MediaSources[0].Path
+			height = r.MediaSources[0].Height
+		}
+		if path == "" {
+			continue
+		}
+		if maxHeight > 0 && height > maxHeight {
+			continue
+		}
+		itemType := "movie"
+		if r.Type == "Episode" {
+			itemType = "episode"
+		}
+		sourceRef := ""
+		if r.ID != "" {
+			sourceRef = "jellyfin://" + r.ID
+		}
+		out = append(out, mediasource.Item{
+			ID:             r.ID,
+			Title:          r.Name,
+			Type:           itemType,
+			SeriesName:     r.SeriesName,
+			SeasonNumber:   r.ParentIndexNumber,
+			EpisodeNumber:  r.IndexNumber,
+			Year:           r.ProductionYear,
+			Path:           path,
+			Resolution:     "",
+			Height:         height,
+			SourceRef:      sourceRef,
+		})
+	}
+	return out, nil
+}
+
+// Close releases any resources held by the client.
+func (c *Client) Close() error {
+	return nil
+}
+
+// jellyfinMaxHeight returns the max allowed video height for a given
+// maxResolution label. 0 means no cap.
+func jellyfinMaxHeight(maxRes string) int {
+	switch strings.ToLower(strings.TrimSpace(maxRes)) {
+	case "1080":
+		return 1440 // skip true 4K (2160) but allow 1080p
+	case "720":
+		return 900 // skip 1080 and above
+	default:
+		return 0
+	}
+}
+
+// compile-time interface check
+var _ mediasource.MediaSourceClient = (*Client)(nil)

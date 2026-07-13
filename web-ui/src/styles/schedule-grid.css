@@ -226,6 +226,17 @@
   background: color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
+.schedule-timeline-entry.is-down {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.schedule-timeline-entry.is-down:hover {
+  background: color-mix(in srgb, var(--danger) 24%, transparent);
+}
+
 .schedule-timeline-unscheduled {
   position: absolute;
   top: 6px;
@@ -348,7 +359,7 @@
   text-transform: uppercase;
   letter-spacing: 0.03em;
   color: var(--bg, #111);
-  background: var(--accent, #6cf);
+  background: var(--accent, #d8d8d8);
   vertical-align: middle;
 }
 
@@ -578,7 +589,7 @@
 }
 
 .schedule-entry.is-selected {
-  background: rgba(90, 169, 255, 0.12);
+  background: rgba(216, 216, 216, 0.12);
 }
 
 .schedule-time {

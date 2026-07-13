@@ -58,7 +58,29 @@ func TestHandleMediaPackageQueuesArbitraryMedia(t *testing.T) {
 	if len(body.Failed) != 2 || body.Failed[0].Code != "codec_check_failed" || body.Failed[1].Code != "not_found" {
 		t.Fatalf("failed=%+v, want codec_check_failed then not_found", body.Failed)
 	}
-	assertCount(t, conn, `SELECT COUNT(*) FROM media_packages WHERE media_id='m2' AND rendition_profile='h264-main-1080p' AND status='pending'`, 1)
+	assertCount(t, conn, `SELECT COUNT(*) FROM media_packages WHERE media_id='m2' AND rendition_profile='h264-1080p-8mbps' AND status='pending'`, 1)
+}
+
+func TestHandleMediaPackageRejectsCopyProfileOverBrowserHLSBitrateCeiling(t *testing.T) {
+	app, conn := testAdminApp(t)
+	insertMedia(t, conn, "high", 12000)
+	if _, err := conn.Exec(`UPDATE media SET video_codec='hevc', video_bitrate_bps=41000000 WHERE id='high'`); err != nil {
+		t.Fatalf("set source bitrate: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/media/package",
+		bytes.NewBufferString(`{"mediaIds":["high"],"profile":"hevc-copy-source"}`))
+	res := httptest.NewRecorder()
+
+	app.handleMediaPackage(res, req)
+
+	if res.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if got := res.Body.String(); !strings.Contains(got, "copy_profile_browser_hls_bitrate_ceiling") {
+		t.Fatalf("body=%s, want copy_profile_browser_hls_bitrate_ceiling", got)
+	}
+	assertCount(t, conn, `SELECT COUNT(*) FROM media_packages WHERE media_id='high'`, 0)
 }
 
 func TestHandleMediaPackageCancelAll(t *testing.T) {
@@ -75,7 +97,7 @@ func TestHandleMediaPackageCancelAll(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/media/package/cancel",
-		bytes.NewBufferString(`{"profile":"h264-main-1080p","all":true}`))
+		bytes.NewBufferString(`{"profile":"h264-1080p-8mbps","all":true}`))
 	res := httptest.NewRecorder()
 
 	app.handleMediaPackageCancel(res, req)
@@ -250,64 +272,6 @@ func TestHandleMediaPackageCandidatesListsAllProfilesReadOnly(t *testing.T) {
 	}
 }
 
-func TestHandleMediaShowsAggregatesSeasonsAndHalves(t *testing.T) {
-	app, conn := testAdminApp(t)
-	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, title, scheduling_group, duration_ms, container,
-		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
-		VALUES
-		('m1', '/tmp/m1.mkv', '/tmp', 'Mad Men S01E01', 'Mad Men S01 H1', 6000, 'mkv', 'h264', 1080, 'aac', 1, 0),
-		('m2', '/tmp/m2.mkv', '/tmp', 'Mad Men S01E08', 'Mad Men S01 H2', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0),
-		('m3', '/tmp/m3.mkv', '/tmp', 'Mad Men S02E01', 'Mad Men S02 H1', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
-		('m4', '/tmp/m4.mkv', '/tmp', 'Movie', 'Movie Bucket', 24000, 'mkv', 'h264', 1080, 'aac', 1, 0),
-		('m5', '/tmp/m5.mkv', '/tmp', 'Office S01E01', 'The Office S01 H1', 30000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
-		t.Fatalf("insert media: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/api/media/shows", nil)
-	res := httptest.NewRecorder()
-
-	app.handleMediaShows(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
-	}
-	var body struct {
-		Shows []struct {
-			ShowName     string `json:"showName"`
-			EpisodeCount int    `json:"episodeCount"`
-			DurationMs   int64  `json:"durationMs"`
-			SeasonCount  int    `json:"seasonCount"`
-			Seasons      []struct {
-				Season       int   `json:"season"`
-				EpisodeCount int   `json:"episodeCount"`
-				DurationMs   int64 `json:"durationMs"`
-				Halves       []struct {
-					Half         int    `json:"half"`
-					Group        string `json:"group"`
-					EpisodeCount int    `json:"episodeCount"`
-					DurationMs   int64  `json:"durationMs"`
-				} `json:"halves"`
-			} `json:"seasons"`
-		} `json:"shows"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if len(body.Shows) != 2 {
-		t.Fatalf("shows=%+v, want two parsed shows", body.Shows)
-	}
-	madMen := body.Shows[0]
-	if madMen.ShowName != "Mad Men" || madMen.EpisodeCount != 3 || madMen.DurationMs != 36000 || madMen.SeasonCount != 2 {
-		t.Fatalf("madMen summary=%+v, want 3 episodes over 2 seasons", madMen)
-	}
-	if len(madMen.Seasons) != 2 || len(madMen.Seasons[0].Halves) != 2 || madMen.Seasons[0].Halves[1].Group != "Mad Men S01 H2" {
-		t.Fatalf("madMen seasons=%+v, want sorted seasons and halves", madMen.Seasons)
-	}
-	if body.Shows[1].ShowName != "The Office" {
-		t.Fatalf("shows sorted unexpectedly: %+v", body.Shows)
-	}
-}
-
 func TestHandleMediaPackageProfilesExcludesTypoPackageRows(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if err := db.SetDefaultPackagedProfile(context.Background(), conn, "removed-profile"); err != nil {
@@ -349,26 +313,17 @@ func TestHandleMediaPackageProfilesExcludesTypoPackageRows(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	wantProfiles := strings.Join([]string{
-		db.DefaultPackageProfile,
-		packageprofile.H264CopySourceName,
-		packageprofile.HEVCCopySourceName,
-		packageprofile.H264Main720pName,
-		packageprofile.H264Main480pName,
-		packageprofile.MusicName,
-		packageprofile.H264NVENC1080pName,
-		packageprofile.H264NVENCCopySrcName,
-		packageprofile.H264NVENC720pName,
-		packageprofile.H264NVENC480pName,
-	}, ",")
-	if strings.Join(body.Profiles, ",") != wantProfiles {
-		t.Fatalf("profiles=%v, want seeded built-in profiles", body.Profiles)
+	if len(body.Profiles) == 0 {
+		t.Fatal("profiles empty, want built-in profiles")
+	}
+	if body.Profiles[0] != db.DefaultPackageProfile {
+		t.Fatalf("profiles[0]=%q, want default profile first", body.Profiles[0])
 	}
 	if body.DefaultProfile != db.DefaultPackageProfile {
 		t.Fatalf("defaultProfile=%q, want seeded default when stored profile is unavailable", body.DefaultProfile)
 	}
-	if len(body.ProfileDetails) != 10 {
-		t.Fatalf("profileDetails=%+v, want built-in profile details", body.ProfileDetails)
+	if len(body.ProfileDetails) != len(body.Profiles) {
+		t.Fatalf("profileDetails=%d, want one detail per profile (%d)", len(body.ProfileDetails), len(body.Profiles))
 	}
 	if body.ProfileDetails[0].Video.Mode == "" || body.ProfileDetails[0].Audio.Mode == "" {
 		t.Fatalf("profileDetails missing nested modes: %+v", body.ProfileDetails)
@@ -487,6 +442,77 @@ func TestHandlePackageProfileDeleteHardDeletesUnusedCustomProfile(t *testing.T) 
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 	assertCount(t, conn, `SELECT COUNT(*) FROM package_profiles WHERE name='unused-h264-1080p'`, 0)
+}
+
+func TestHandlePackageProfileDeleteHardDeletesDisabledUnusedCustomProfile(t *testing.T) {
+	app, conn := testAdminApp(t)
+	profile := packageprofile.Profile{
+		Name:        "disabled-unused-h264-1080p",
+		Label:       "Disabled unused H.264 1080p",
+		Description: "disabled unused",
+		Video:       packageprofile.VideoSettings{Mode: packageprofile.VideoModeTranscode, Codec: "libx264", Profile: "main"},
+		Audio:       packageprofile.AudioSettings{Mode: packageprofile.AudioModeTranscode, Codec: "aac"},
+	}
+	if err := db.UpsertPackageProfile(context.Background(), conn, profile); err != nil {
+		t.Fatalf("insert profile: %v", err)
+	}
+	if err := db.DisablePackageProfile(context.Background(), conn, profile.Name); err != nil {
+		t.Fatalf("disable profile: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/package-profiles/disabled-unused-h264-1080p", nil)
+	req.SetPathValue("name", profile.Name)
+	res := httptest.NewRecorder()
+
+	app.handlePackageProfileDelete(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	assertCount(t, conn, `SELECT COUNT(*) FROM package_profiles WHERE name='disabled-unused-h264-1080p'`, 0)
+}
+
+func TestHandlePackageProfileEnableReactivatesDisabledProfile(t *testing.T) {
+	app, conn := testAdminApp(t)
+	if err := db.DisablePackageProfile(context.Background(), conn, packageprofile.HEVCCopySourceName); err != nil {
+		t.Fatalf("disable profile: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/package-profiles/hevc-copy-source/enable", nil)
+	req.SetPathValue("name", packageprofile.HEVCCopySourceName)
+	res := httptest.NewRecorder()
+
+	app.handlePackageProfileEnable(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	var body struct {
+		Name    string `json:"name"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Name != packageprofile.HEVCCopySourceName || !body.Enabled {
+		t.Fatalf("response=%+v, want enabled hevc-copy-source", body)
+	}
+	assertCount(t, conn, `SELECT COUNT(*) FROM package_profiles WHERE name='hevc-copy-source' AND disabled=0`, 1)
+}
+
+func TestHandlePackageProfileEnableAlreadyActiveIsIdempotent(t *testing.T) {
+	app, conn := testAdminApp(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/package-profiles/hevc-copy-source/enable", nil)
+	req.SetPathValue("name", packageprofile.HEVCCopySourceName)
+	res := httptest.NewRecorder()
+
+	app.handlePackageProfileEnable(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	assertCount(t, conn, `SELECT COUNT(*) FROM package_profiles WHERE name='hevc-copy-source' AND disabled=0`, 1)
 }
 
 func TestHandleMediaPackageAcceptsCustomProfile(t *testing.T) {

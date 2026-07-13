@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
 )
 
 func TestHandleMaintenanceMissingMedia(t *testing.T) {
@@ -40,7 +41,7 @@ func TestHandleMaintenanceMissingMedia(t *testing.T) {
 
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
 		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0)`)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, title, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('present', ?, ?, 'Present', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0)`,
@@ -56,7 +57,7 @@ func TestHandleMaintenanceMissingMedia(t *testing.T) {
 	mustExec(`INSERT INTO play_history (channel_id, schedule_entry_id, media_id, started_at, ended_at, duration_ms)
 		VALUES ('ch', 'sched-1', 'gone', 0, 18000, 18000)`)
 	mustExec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
-		VALUES ('pkg-gone', 'gone', 'h264-main-1080p', 'ready', 0, 0)`)
+		VALUES ('pkg-gone', 'gone', 'h264-1080p-8mbps', 'ready', 0, 0)`)
 
 	app := New(Config{
 		DB:  conn,
@@ -140,6 +141,38 @@ func TestHandleMaintenanceMissingMedia(t *testing.T) {
 	}
 }
 
+func TestHandleMaintenanceMediaOrderingBackfill(t *testing.T) {
+	app, conn := testAdminApp(t)
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, title, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('ep1', '/srv/media/tv/Show/Show.S04E07.1080p.mkv', '/srv/media/tv/Show', 'Show', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/maintenance/media-ordering", nil)
+	res := httptest.NewRecorder()
+	app.handleMaintenanceMediaOrderingBackfill(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	var body mediaOrderingBackfillResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Scanned != 1 || body.Updated != 1 {
+		t.Fatalf("body=%+v, want scanned=1 updated=1", body)
+	}
+
+	row, err := db.MediaByID(context.Background(), conn, "ep1")
+	if err != nil {
+		t.Fatalf("MediaByID: %v", err)
+	}
+	if row.SeasonNumber == nil || *row.SeasonNumber != 4 || row.EpisodeNumber == nil || *row.EpisodeNumber != 7 {
+		t.Fatalf("ordering=%v/%v, want 4/7", row.SeasonNumber, row.EpisodeNumber)
+	}
+}
+
 func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	dir := t.TempDir()
 	cacheDir := filepath.Join(dir, "cache")
@@ -156,10 +189,12 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	}
 
 	// Layout:
-	//   packages/keep/h264-main-1080p          → in DB and referenced by a schedule entry (must remain)
-	//   packages/orphan-row/h264-main-1080p    → in DB but no schedule reference (clean up DB+disk)
-	//   packages/never-in-db/h264-main-1080p   → only on disk, no DB row (orphan dir)
-	//   packages/other-leftover                → empty dir, no DB row (should be pruned)
+	//   packages/keep/h264-1080p-8mbps          → in DB and referenced by a schedule entry (must remain)
+	//   packages/keep/keep-h264-...-burn-...    → old packageID/identity dir, no DB row (orphan dir)
+	//   packages/orphan-row/h264-1080p-8mbps    → in DB but no schedule reference (clean up DB+disk)
+	//   packages/never-in-db/h264-1080p-8mbps   → only on disk, no DB row (orphan dir)
+	//   packages/keep/subtitles                 → legacy per-media subtitle dir, no DB row (orphan dir)
+	//   packages/other-leftover                 → empty dir, no DB row (should be pruned)
 	makeDir := func(rel string) string {
 		full := filepath.Join(pkgRoot, rel)
 		if err := os.MkdirAll(full, 0o755); err != nil {
@@ -170,11 +205,29 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 		}
 		return filepath.Clean(full)
 	}
-	keepRoot := makeDir("keep/h264-main-1080p")
-	orphanRowRoot := makeDir("orphan-row/h264-main-1080p")
-	orphanDiskRoot := makeDir("never-in-db/h264-main-1080p")
+	keepRoot := makeDir("keep/h264-1080p-8mbps")
+	legacyIdentityRoot := makeDir("keep/keep-h264-1080p-8mbps-burn-forced-disposition-s2-eng")
+	orphanRowRoot := makeDir("orphan-row/h264-1080p-8mbps")
+	orphanDiskRoot := makeDir("never-in-db/h264-1080p-8mbps")
+	orphanPackageSubtitleDir := layout.PackageSubtitleDir(orphanRowRoot)
+	if err := os.MkdirAll(orphanPackageSubtitleDir, 0o755); err != nil {
+		t.Fatalf("mkdir package subtitles: %v", err)
+	}
+	orphanPackageSubtitlePath := filepath.Join(orphanPackageSubtitleDir, "s2.vtt")
+	if err := os.WriteFile(orphanPackageSubtitlePath, []byte("WEBVTT\n"), 0o644); err != nil {
+		t.Fatalf("write package subtitle: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Join(pkgRoot, "other-leftover"), 0o755); err != nil {
 		t.Fatalf("mkdir leftover: %v", err)
+	}
+	// A legacy media-level subtitle sidecar dir is orphaned cache residue now
+	// that subtitle sidecars live inside package roots.
+	subtitleDir := filepath.Join(pkgRoot, "keep", layout.SubtitlesDirName)
+	if err := os.MkdirAll(subtitleDir, 0o755); err != nil {
+		t.Fatalf("mkdir subtitles: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(subtitleDir, "s2.vtt"), []byte("WEBVTT\n"), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
 	}
 
 	mustExec := func(query string, args ...any) {
@@ -185,17 +238,21 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	}
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
 		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0)`)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('keep', '/tmp/keep.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
 		       ('orphan-row', '/tmp/orphan.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0)`)
 	mustExec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, package_root, created_at_ms, updated_at_ms)
-		VALUES ('pkg-keep', 'keep', 'h264-main-1080p', 'ready', ?, 0, 0),
-		       ('pkg-orphan-row', 'orphan-row', 'h264-main-1080p', 'ready', ?, 0, 0)`,
+			VALUES ('pkg-keep', 'keep', 'h264-1080p-8mbps', 'ready', ?, 0, 0),
+			       ('pkg-orphan-row', 'orphan-row', 'h264-1080p-8mbps', 'ready', ?, 0, 0)`,
 		keepRoot, orphanRowRoot)
+	mustExec(`INSERT INTO package_tracks
+			(package_id, kind, stream_index, language, codec, source, path)
+			VALUES ('pkg-orphan-row', 'subtitle', 2, 'eng', 'webvtt', 'embedded_text', ?)`,
+		orphanPackageSubtitlePath)
 	mustExec(`INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, created_at_ms)
-		VALUES ('sched-1', 'ch', 0, 'keep', 0, 18000, 0)`)
+			VALUES ('sched-1', 'ch', 0, 'keep', 0, 18000, 0)`)
 
 	app := New(Config{
 		DB:       conn,
@@ -220,9 +277,17 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	if len(dry.Unreferenced) != 1 || dry.Unreferenced[0].ID != "pkg-orphan-row" {
 		t.Errorf("unreferenced=%+v, want one entry pkg-orphan-row", dry.Unreferenced)
 	}
-	// One real orphan dir; the empty 'other-leftover' has no profile subdir so it isn't listed.
-	if len(dry.OrphanDirs) != 1 || dry.OrphanDirs[0].Path != orphanDiskRoot {
-		t.Errorf("orphanDirs=%+v, want one entry %s", dry.OrphanDirs, orphanDiskRoot)
+	orphanDirSet := func(items []orphanPackageDirItem) map[string]bool {
+		t.Helper()
+		out := make(map[string]bool, len(items))
+		for _, item := range items {
+			out[item.Path] = true
+		}
+		return out
+	}
+	// Three real orphan dirs; the empty 'other-leftover' has no profile subdir so it isn't listed.
+	if got := orphanDirSet(dry.OrphanDirs); len(got) != 3 || !got[orphanDiskRoot] || !got[legacyIdentityRoot] || !got[subtitleDir] {
+		t.Errorf("orphanDirs=%+v, want %s, %s, and %s", dry.OrphanDirs, orphanDiskRoot, legacyIdentityRoot, subtitleDir)
 	}
 	if dry.DeletedRows != 0 || dry.DeletedDirs != 0 {
 		t.Errorf("dry-run modified state: rows=%d dirs=%d", dry.DeletedRows, dry.DeletedDirs)
@@ -233,6 +298,9 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	}
 	if _, err := os.Stat(orphanDiskRoot); err != nil {
 		t.Errorf("dry-run removed orphan-disk dir: %v", err)
+	}
+	if _, err := os.Stat(legacyIdentityRoot); err != nil {
+		t.Errorf("dry-run removed legacy identity dir: %v", err)
 	}
 
 	// Real run.
@@ -249,8 +317,8 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	if run.DeletedRows != 1 {
 		t.Errorf("deletedRows=%d, want 1", run.DeletedRows)
 	}
-	if run.DeletedDirs != 1 {
-		t.Errorf("deletedDirs=%d, want 1", run.DeletedDirs)
+	if run.DeletedDirs != 3 {
+		t.Errorf("deletedDirs=%d, want 3", run.DeletedDirs)
 	}
 
 	// DB row gone.
@@ -261,6 +329,12 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	if c != 0 {
 		t.Errorf("pkg-orphan-row still in DB: count=%d", c)
 	}
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM package_tracks WHERE package_id = 'pkg-orphan-row'`).Scan(&c); err != nil {
+		t.Fatalf("count package tracks: %v", err)
+	}
+	if c != 0 {
+		t.Errorf("pkg-orphan-row package_tracks still in DB: count=%d", c)
+	}
 	// Disk dirs gone.
 	if _, err := os.Stat(orphanRowRoot); !os.IsNotExist(err) {
 		t.Errorf("pkg-orphan-row dir still exists: err=%v", err)
@@ -268,9 +342,16 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 	if _, err := os.Stat(orphanDiskRoot); !os.IsNotExist(err) {
 		t.Errorf("never-in-db dir still exists: err=%v", err)
 	}
+	if _, err := os.Stat(legacyIdentityRoot); !os.IsNotExist(err) {
+		t.Errorf("legacy identity dir still exists: err=%v", err)
+	}
 	// Keep dir still there.
 	if _, err := os.Stat(keepRoot); err != nil {
 		t.Errorf("keep dir removed: %v", err)
+	}
+	// Legacy subtitle sidecar dir gone.
+	if _, err := os.Stat(subtitleDir); !os.IsNotExist(err) {
+		t.Errorf("legacy subtitle sidecar dir still exists: err=%v", err)
 	}
 	// Empty 'other-leftover' should have been pruned.
 	if _, err := os.Stat(filepath.Join(pkgRoot, "other-leftover")); !os.IsNotExist(err) {
@@ -298,7 +379,7 @@ func TestHandleMaintenanceOrphanPackagesPreservesExtraFiles(t *testing.T) {
 	}
 
 	// Package dir that has generated files AND an unrecognised file.
-	pkgDir := filepath.Join(pkgRoot, "media1", "h264-main-1080p")
+	pkgDir := filepath.Join(pkgRoot, "media1", "h264-1080p-8mbps")
 	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -317,7 +398,7 @@ func TestHandleMaintenanceOrphanPackagesPreservesExtraFiles(t *testing.T) {
 		t.Fatalf("insert media: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, package_root, created_at_ms, updated_at_ms)
-		VALUES ('pkg1', 'm1', 'h264-main-1080p', 'ready', ?, 0, 0)`, pkgDir); err != nil {
+		VALUES ('pkg1', 'm1', 'h264-1080p-8mbps', 'ready', ?, 0, 0)`, pkgDir); err != nil {
 		t.Fatalf("insert package: %v", err)
 	}
 
@@ -381,8 +462,8 @@ func TestHandleMaintenancePackageDelete(t *testing.T) {
 		}
 		return filepath.Clean(full)
 	}
-	refRoot := makeDir("ref/h264-main-1080p")
-	unrefRoot := makeDir("unref/h264-main-1080p")
+	refRoot := makeDir("ref/h264-1080p-8mbps")
+	unrefRoot := makeDir("unref/h264-1080p-8mbps")
 
 	mustExec := func(query string, args ...any) {
 		t.Helper()
@@ -392,14 +473,14 @@ func TestHandleMaintenancePackageDelete(t *testing.T) {
 	}
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
 		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0)`)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('ref', '/tmp/ref.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
 		       ('unref', '/tmp/unref.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0)`)
 	mustExec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, package_root, created_at_ms, updated_at_ms)
-		VALUES ('pkg-ref', 'ref', 'h264-main-1080p', 'ready', ?, 0, 0),
-		       ('pkg-unref', 'unref', 'h264-main-1080p', 'ready', ?, 0, 0)`, refRoot, unrefRoot)
+		VALUES ('pkg-ref', 'ref', 'h264-1080p-8mbps', 'ready', ?, 0, 0),
+		       ('pkg-unref', 'unref', 'h264-1080p-8mbps', 'ready', ?, 0, 0)`, refRoot, unrefRoot)
 	// 'ref' is scheduled (referenced); 'unref' is used by no channel.
 	mustExec(`INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, created_at_ms)
 		VALUES ('sched-1', 'ch', 0, 'ref', 0, 18000, 0)`)
@@ -560,5 +641,125 @@ func TestHandleMaintenanceOptimizeDBMissingPath(t *testing.T) {
 	app.handleMaintenanceOptimizeDB(res, req)
 	if res.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected 503 when DBPath unset, got %d", res.Code)
+	}
+}
+
+func TestHandleMaintenancePackageIntegrityRepair(t *testing.T) {
+	app, conn := testAdminApp(t)
+
+	// Insert a ready package with no files on disk — the sweep will requeue it.
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', '/tmp/m1.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	dur := int64(12000)
+	initPath := "/nonexistent/init.mp4"
+	if _, err := conn.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status,
+		packaged_duration_ms, init_segment_path, package_root, created_at_ms, updated_at_ms)
+		VALUES ('pkg-1', 'm1', 'h264-1080p-8mbps', 'ready', ?, ?, '/nonexistent', 0, 0)`,
+		dur, initPath); err != nil {
+		t.Fatalf("insert package: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/maintenance/package-integrity", nil)
+	res := httptest.NewRecorder()
+	app.handleMaintenancePackageIntegrityRepair(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	var resp packageIntegrityRepairResponse
+	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.FileReset != 1 {
+		t.Fatalf("expected fileReset=1, got %d", resp.FileReset)
+	}
+
+	// Verify the package was actually requeued.
+	var status string
+	if err := conn.QueryRow(`SELECT status FROM media_packages WHERE id = 'pkg-1'`).Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+	if status != string(db.PackageStatusPending) {
+		t.Fatalf("expected pending, got %s", status)
+	}
+}
+
+func TestHandleMaintenancePackageRequeue(t *testing.T) {
+	app, conn := testAdminApp(t)
+
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', '/tmp/m1.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	if _, err := conn.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status,
+		created_at_ms, updated_at_ms)
+		VALUES ('pkg-1', 'm1', 'h264-1080p-8mbps', 'ready', 0, 0)`); err != nil {
+		t.Fatalf("insert package: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/maintenance/packages/pkg-1/requeue", nil)
+	req.SetPathValue("packageID", "pkg-1")
+	res := httptest.NewRecorder()
+	app.handleMaintenancePackageRequeue(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	var resp packageRequeueResponse
+	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Requeued {
+		t.Fatalf("expected requeued=true")
+	}
+	if resp.Status != string(db.PackageStatusPending) {
+		t.Fatalf("expected status=pending, got %s", resp.Status)
+	}
+}
+
+func TestHandleMaintenancePackageRequeueNotReady(t *testing.T) {
+	app, conn := testAdminApp(t)
+
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', '/tmp/m1.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	if _, err := conn.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status,
+		created_at_ms, updated_at_ms)
+		VALUES ('pkg-1', 'm1', 'h264-1080p-8mbps', 'pending', 0, 0)`); err != nil {
+		t.Fatalf("insert package: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/maintenance/packages/pkg-1/requeue", nil)
+	req.SetPathValue("packageID", "pkg-1")
+	res := httptest.NewRecorder()
+	app.handleMaintenancePackageRequeue(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	var resp packageRequeueResponse
+	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Package was pending, not ready — requeued must be false.
+	if resp.Requeued {
+		t.Fatalf("expected requeued=false for non-ready package")
+	}
+}
+
+func TestHandleMaintenancePackageRequeueNotFound(t *testing.T) {
+	app, _ := testAdminApp(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/maintenance/packages/no-such-pkg/requeue", nil)
+	req.SetPathValue("packageID", "no-such-pkg")
+	res := httptest.NewRecorder()
+	app.handleMaintenancePackageRequeue(res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", res.Code)
 	}
 }

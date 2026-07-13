@@ -139,6 +139,31 @@ describe("useScheduleEditor — importDraftChannel", () => {
     expect(onImported).toHaveBeenCalledWith("ch-42", { scheduleMode: undefined });
   });
 
+  it("treats a create response without queue details as success", async () => {
+    const onImported = vi.fn();
+    api.createScheduleBuilderChannel.mockResolvedValue({
+      channelID: "ch-on-demand",
+      displayName: "My Draft",
+      created: true,
+      syncedMedia: 1,
+      scheduleEntries: 1,
+      profile: "default",
+    });
+    const cfg = { ...draftConfig(onImported), prefillMode: "on_demand" as const };
+
+    const { result } = renderHook(() => useScheduleEditor(null, cfg));
+    act(() => {
+      result.current.appendDraftEntry(insertItem());
+    });
+    await act(async () => {
+      await result.current.importDraftChannel();
+    });
+
+    expect(result.current.scheduleError).toBe("");
+    expect(result.current.scheduleNotice).toContain("created ch-on-demand");
+    expect(onImported).toHaveBeenCalledWith("ch-on-demand", { scheduleMode: undefined });
+  });
+
   it("does nothing when the draft is empty", async () => {
     const { result } = renderHook(() => useScheduleEditor(null, draftConfig()));
     await act(async () => {

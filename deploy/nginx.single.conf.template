@@ -1,0 +1,109 @@
+# Template — NOT a usable nginx config on its own. The entrypoint renders it
+# with envsubst into /tmp/nginx/nginx.conf, substituting ${LC_PORT} (playback
+# upstream, from LINEARCAST_ADDR) and ${LC_ADMIN_PORT} (admin upstream, from
+# LINEARCAST_ADMIN_ADDR). Only those two tokens are expanded; nginx's own
+# $variables are passed through untouched.
+worker_processes auto;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    access_log /dev/stdout;
+    error_log /dev/stderr warn;
+
+    sendfile on;
+    keepalive_timeout 65;
+
+    client_body_temp_path /tmp/nginx/client-body;
+    proxy_temp_path /tmp/nginx/proxy;
+    fastcgi_temp_path /tmp/nginx/fastcgi;
+    uwsgi_temp_path /tmp/nginx/uwsgi;
+    scgi_temp_path /tmp/nginx/scgi;
+
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    gzip_min_length 1024;
+
+    server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        client_max_body_size 10m;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy same-origin always;
+        add_header X-Frame-Options DENY always;
+
+        location = /healthz {
+            access_log off;
+            add_header Content-Type text/plain;
+            return 200 "ok\n";
+        }
+
+        location /hls/ {
+            rewrite ^/hls/(.*)$ /$1 break;
+            proxy_pass http://127.0.0.1:${LC_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_buffering off;
+        }
+
+        location /channels/ {
+            proxy_pass http://127.0.0.1:${LC_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_buffering off;
+        }
+
+        location = /status {
+            proxy_pass http://127.0.0.1:${LC_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location = /metrics {
+            proxy_pass http://127.0.0.1:${LC_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location /api/ {
+            limit_except GET POST PUT PATCH DELETE {
+                deny all;
+            }
+            client_max_body_size 100g;
+            proxy_pass http://127.0.0.1:${LC_ADMIN_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 120s;
+        }
+
+        location ~ /\.(?!well-known/) {
+            deny all;
+        }
+
+        location /assets/ {
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+            try_files $uri =404;
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
+}

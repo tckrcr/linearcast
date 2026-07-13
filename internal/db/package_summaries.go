@@ -17,7 +17,7 @@ func PackageProfiles(ctx context.Context, conn *sql.DB) ([]string, error) {
 }
 
 type CandidateFilter struct {
-	Search string // substring match on title, path, scheduling_group
+	Search string // substring match on title, path, collection
 	Status string // "missing", "failed", "pending", "processing", "ready", "all", or "" for all non-ready
 }
 
@@ -65,16 +65,17 @@ func MediaPackageCandidates(ctx context.Context, conn *sql.DB, profile string, l
 
 	if q := strings.TrimSpace(f.Search); q != "" {
 		like := "%" + q + "%"
-		extraWhere = ` AND (COALESCE(m.title,'') LIKE ? OR m.path LIKE ? OR COALESCE(m.scheduling_group,'') LIKE ?)`
+		extraWhere = ` AND (COALESCE(m.title,'') LIKE ? OR m.path LIKE ? OR COALESCE(c.name,'') LIKE ?)`
 		args = append(args, like, like, like)
 	}
 	args = append(args, limit, offset)
 
 	args = append([]any{profile, string(profileKind)}, args[1:]...)
 	return queryRows(ctx, conn, scanMediaPackageCandidate(profile), `
-		SELECT m.id, m.path, m.title, m.scheduling_group, m.duration_ms,
-		       p.id, p.status, p.error, p.packaged_duration_ms, p.updated_at_ms
+		SELECT m.id, m.path, m.title, COALESCE(CASE WHEN c.kind = 'movie' THEN 'movie:' || c.name ELSE c.name END, m.scheduling_group), m.source_ref, m.duration_ms, m.video_bitrate_bps,
+		       p.id, p.status, p.error, p.packaged_duration_ms, p.package_bytes, p.updated_at_ms
 		FROM media m
+		LEFT JOIN collections c ON c.id = m.collection_id
 		LEFT JOIN media_packages p
 		       ON p.media_id = m.id
 		      AND p.rendition_profile = ?
@@ -120,16 +121,17 @@ func MediaPackageCandidatesAllProfiles(ctx context.Context, conn *sql.DB, limit,
 
 	if q := strings.TrimSpace(f.Search); q != "" {
 		like := "%" + q + "%"
-		extraWhere = ` AND (COALESCE(m.title,'') LIKE ? OR m.path LIKE ? OR COALESCE(m.scheduling_group,'') LIKE ? OR p.rendition_profile LIKE ?)`
+		extraWhere = ` AND (COALESCE(m.title,'') LIKE ? OR m.path LIKE ? OR COALESCE(c.name,'') LIKE ? OR p.rendition_profile LIKE ?)`
 		args = append(args, like, like, like, like)
 	}
 	args = append(args, limit, offset)
 
 	return queryRows(ctx, conn, scanMediaPackageCandidateAllProfiles, `
-		SELECT m.id, m.path, m.title, m.scheduling_group, m.duration_ms,
-		       p.id, p.rendition_profile, p.status, p.error, p.packaged_duration_ms, p.updated_at_ms
+		SELECT m.id, m.path, m.title, COALESCE(CASE WHEN c.kind = 'movie' THEN 'movie:' || c.name ELSE c.name END, m.scheduling_group), m.source_ref, m.duration_ms, m.video_bitrate_bps,
+		       p.id, p.rendition_profile, p.status, p.error, p.packaged_duration_ms, p.package_bytes, p.updated_at_ms
 		FROM media_packages p
 		JOIN media m ON m.id = p.media_id
+		LEFT JOIN collections c ON c.id = m.collection_id
 		WHERE m.codec_check_passed = 1`+statusWhere+extraWhere+`
 		ORDER BY
 		  CASE p.status
@@ -246,6 +248,7 @@ func ChannelPackageNeedSummaries(ctx context.Context, conn *sql.DB) ([]ChannelPa
 		 AND p.rendition_profile = COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)
 		WHERE c.enabled = 1
 		  AND c.playback_mode = ?
+		  AND c.prefill_mode = 'eager'
 		  AND m.codec_check_passed = 1
 		GROUP BY c.id, c.display_name, COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)
 		ORDER BY c.id, rendition_profile`,
@@ -326,37 +329,39 @@ func ChannelPackageRoots(ctx context.Context, conn *sql.DB) ([]ChannelPackageRoo
 func scanMediaPackageCandidate(profile string) func(scanner) (MediaPackageCandidate, error) {
 	return func(row scanner) (MediaPackageCandidate, error) {
 		var c MediaPackageCandidate
-		var title, group sql.NullString
+		var title, group, sourceRef sql.NullString
 		var pkgID, pkgStatus, pkgError sql.NullString
-		var pkgDurationMs, updatedAtMs sql.NullInt64
-		if err := row.Scan(&c.MediaID, &c.Path, &title, &group, &c.DurationMs,
-			&pkgID, &pkgStatus, &pkgError, &pkgDurationMs, &updatedAtMs); err != nil {
+		var pkgDurationMs, pkgBytes, updatedAtMs sql.NullInt64
+		if err := row.Scan(&c.MediaID, &c.Path, &title, &group, &sourceRef, &c.DurationMs, &c.VideoBitrateBps,
+			&pkgID, &pkgStatus, &pkgError, &pkgDurationMs, &pkgBytes, &updatedAtMs); err != nil {
 			return MediaPackageCandidate{}, err
 		}
 		c.RenditionProfile = profile
 		c.Title = title.String
-		c.SchedulingGroup = group.String
-		applyPackageCandidateNulls(&c, pkgID, pkgStatus, pkgError, pkgDurationMs, updatedAtMs)
+		c.CollectionName = group.String
+		c.SourceRef = sourceRef.String
+		applyPackageCandidateNulls(&c, pkgID, pkgStatus, pkgError, pkgDurationMs, pkgBytes, updatedAtMs)
 		return c, nil
 	}
 }
 
 func scanMediaPackageCandidateAllProfiles(row scanner) (MediaPackageCandidate, error) {
 	var c MediaPackageCandidate
-	var title, group sql.NullString
+	var title, group, sourceRef sql.NullString
 	var pkgID, pkgStatus, pkgError sql.NullString
-	var pkgDurationMs, updatedAtMs sql.NullInt64
-	if err := row.Scan(&c.MediaID, &c.Path, &title, &group, &c.DurationMs,
-		&pkgID, &c.RenditionProfile, &pkgStatus, &pkgError, &pkgDurationMs, &updatedAtMs); err != nil {
+	var pkgDurationMs, pkgBytes, updatedAtMs sql.NullInt64
+	if err := row.Scan(&c.MediaID, &c.Path, &title, &group, &sourceRef, &c.DurationMs, &c.VideoBitrateBps,
+		&pkgID, &c.RenditionProfile, &pkgStatus, &pkgError, &pkgDurationMs, &pkgBytes, &updatedAtMs); err != nil {
 		return MediaPackageCandidate{}, err
 	}
 	c.Title = title.String
-	c.SchedulingGroup = group.String
-	applyPackageCandidateNulls(&c, pkgID, pkgStatus, pkgError, pkgDurationMs, updatedAtMs)
+	c.CollectionName = group.String
+	c.SourceRef = sourceRef.String
+	applyPackageCandidateNulls(&c, pkgID, pkgStatus, pkgError, pkgDurationMs, pkgBytes, updatedAtMs)
 	return c, nil
 }
 
-func applyPackageCandidateNulls(c *MediaPackageCandidate, pkgID, pkgStatus, pkgError sql.NullString, pkgDurationMs, updatedAtMs sql.NullInt64) {
+func applyPackageCandidateNulls(c *MediaPackageCandidate, pkgID, pkgStatus, pkgError sql.NullString, pkgDurationMs, pkgBytes, updatedAtMs sql.NullInt64) {
 	if pkgID.Valid {
 		v := pkgID.String
 		c.PackageID = &v
@@ -372,6 +377,10 @@ func applyPackageCandidateNulls(c *MediaPackageCandidate, pkgID, pkgStatus, pkgE
 	if pkgDurationMs.Valid {
 		v := pkgDurationMs.Int64
 		c.PackagedDurationMs = &v
+	}
+	if pkgBytes.Valid {
+		v := pkgBytes.Int64
+		c.PackageBytes = &v
 	}
 	if updatedAtMs.Valid {
 		v := updatedAtMs.Int64

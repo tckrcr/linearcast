@@ -95,7 +95,7 @@ func TestChannelPlaybackPolicy(t *testing.T) {
 
 	prefill := int64(86400000)
 	updated, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModePackaged,
-		"h264-main-1080p", nil, &prefill, MediaKindVideo)
+		"h264-1080p-8mbps", nil, &prefill, MediaKindVideo)
 	if err != nil || !updated {
 		t.Fatalf("update packaged policy updated=%v err=%v", updated, err)
 	}
@@ -104,7 +104,7 @@ func TestChannelPlaybackPolicy(t *testing.T) {
 		t.Fatalf("channel by id after update: %v", err)
 	}
 	if ch.PlaybackMode != PlaybackModePackaged ||
-		ch.RequiredPackageProfile != "h264-main-1080p" || ch.PackagePrefillMs == nil ||
+		ch.RequiredPackageProfile != "h264-1080p-8mbps" || ch.PackagePrefillMs == nil ||
 		*ch.PackagePrefillMs != 86400000 {
 		t.Fatalf("unexpected packaged policy: %+v", ch)
 	}
@@ -148,6 +148,58 @@ func TestEnabledGuideChannelsExcludeHidden(t *testing.T) {
 	}
 }
 
+func TestInsertChannelWritesHiddenFromGuideFalse(t *testing.T) {
+	path := newTestDB(t)
+	rw, err := OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	if _, err := rw.Exec(`
+		DROP TABLE channels;
+		CREATE TABLE channels (
+			id TEXT PRIMARY KEY,
+			display_name TEXT NOT NULL,
+			source_directory TEXT NOT NULL,
+			ordering TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			created_at_ms INTEGER NOT NULL,
+			description TEXT,
+			hidden_from_guide INTEGER,
+			artwork_url TEXT,
+			playback_mode TEXT NOT NULL DEFAULT 'packaged',
+			required_package_profile TEXT,
+			abr_ladder_json TEXT,
+			package_prefill_ms INTEGER,
+			encoder_policy TEXT,
+			media_kind TEXT NOT NULL DEFAULT 'video',
+			schedule_mode TEXT NOT NULL DEFAULT 'back_to_back',
+			slot_duration_ms INTEGER,
+			upstream_hls_url TEXT,
+			prefill_mode TEXT NOT NULL DEFAULT 'eager'
+		)`); err != nil {
+		t.Fatalf("create legacy channels table: %v", err)
+	}
+
+	if err := InsertChannel(context.Background(), rw, ChannelWrite{
+		ID:              "ch",
+		DisplayName:     "Channel",
+		SourceDirectory: "/tmp",
+		Ordering:        "alphabetical",
+	}); err != nil {
+		t.Fatalf("InsertChannel: %v", err)
+	}
+
+	var hidden sql.NullInt64
+	if err := rw.QueryRow(`SELECT hidden_from_guide FROM channels WHERE id = 'ch'`).Scan(&hidden); err != nil {
+		t.Fatalf("query hidden_from_guide: %v", err)
+	}
+	if !hidden.Valid || hidden.Int64 != 0 {
+		t.Fatalf("hidden_from_guide=%+v, want 0", hidden)
+	}
+}
+
 func TestCloneChannelCopiesConfigAndMediaWithoutSchedule(t *testing.T) {
 	path := newTestDB(t)
 	rw, err := OpenReadWrite(path)
@@ -161,7 +213,7 @@ func TestCloneChannelCopiesConfigAndMediaWithoutSchedule(t *testing.T) {
 			description, playback_mode, required_package_profile, package_prefill_ms
 		)
 		VALUES ('ch1', 'Channel One', '/tmp/src', 'block', 1, 1000,
-			'desc', 'packaged', 'h264-main-1080p', 86400000)`); err != nil {
+			'desc', 'packaged', 'h264-1080p-8mbps', 86400000)`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -190,7 +242,7 @@ func TestCloneChannelCopiesConfigAndMediaWithoutSchedule(t *testing.T) {
 		clone.CreatedAtMs != 2000 || clone.Description != "desc" ||
 		clone.HiddenFromGuide ||
 		clone.PlaybackMode != PlaybackModePackaged ||
-		clone.RequiredPackageProfile != "h264-main-1080p" ||
+		clone.RequiredPackageProfile != "h264-1080p-8mbps" ||
 		clone.PackagePrefillMs == nil || *clone.PackagePrefillMs != 86400000 {
 		t.Fatalf("clone did not preserve config: %+v", clone)
 	}
@@ -248,7 +300,7 @@ func TestCloneChannelMissingReturnsNoRows(t *testing.T) {
 	}
 }
 
-func TestNormalizeChannelsToPackagedPreservesPlexRelay(t *testing.T) {
+func TestExternalChannelReturnsSingletonOrNil(t *testing.T) {
 	path := newTestDB(t)
 	rw, err := OpenReadWrite(path)
 	if err != nil {
@@ -256,38 +308,35 @@ func TestNormalizeChannelsToPackagedPreservesPlexRelay(t *testing.T) {
 	}
 	defer rw.Close()
 
-	if err := ApplySchema(context.Background(), rw); err != nil {
-		t.Fatalf("schema: %v", err)
+	// No external channel configured yet.
+	got, err := ExternalChannel(context.Background(), rw)
+	if err != nil {
+		t.Fatalf("external (none): %v", err)
 	}
-	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode)
-		VALUES ('relay', 'Relay', '', 'alphabetical', 1, 0, 'plex_relay')`); err != nil {
-		t.Fatalf("insert relay: %v", err)
-	}
-	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode)
-		VALUES ('legacy', 'Legacy', '/tmp', 'alphabetical', 1, 0, 'generated')`); err != nil {
-		t.Fatalf("insert legacy: %v", err)
+	if got != nil {
+		t.Fatalf("want nil external channel, got %+v", got)
 	}
 
-	n, err := NormalizeChannelsToPackaged(context.Background(), rw, "h264-main-1080p")
-	if err != nil {
-		t.Fatalf("normalize: %v", err)
+	// A packaged channel (no upstream_hls_url) must not count as external.
+	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms)
+        VALUES ('packaged', 'Packaged', '/tmp', 'alphabetical', 1, 0)`); err != nil {
+		t.Fatalf("insert packaged: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("normalized=%d, want 1", n)
+	if got, err := ExternalChannel(context.Background(), rw); err != nil || got != nil {
+		t.Fatalf("packaged channel must not be external: got=%+v err=%v", got, err)
 	}
 
-	relay, err := ChannelByID(context.Background(), rw, "relay")
+	// Two external channels: the lowest id wins deterministically.
+	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, upstream_hls_url)
+        VALUES ('zeta', 'Zeta', '', 'alphabetical', 1, 0, 'https://example.com/z.m3u8'),
+               ('alpha', 'Alpha', '', 'alphabetical', 1, 0, 'https://example.com/a.m3u8')`); err != nil {
+		t.Fatalf("insert external: %v", err)
+	}
+	got, err = ExternalChannel(context.Background(), rw)
 	if err != nil {
-		t.Fatalf("relay lookup: %v", err)
+		t.Fatalf("external: %v", err)
 	}
-	if relay == nil || relay.PlaybackMode != PlaybackModePlexRelay || relay.RequiredPackageProfile != "" {
-		t.Fatalf("relay mutated: %+v", relay)
-	}
-	legacy, err := ChannelByID(context.Background(), rw, "legacy")
-	if err != nil {
-		t.Fatalf("legacy lookup: %v", err)
-	}
-	if legacy == nil || legacy.PlaybackMode != PlaybackModePackaged || legacy.RequiredPackageProfile != "h264-main-1080p" {
-		t.Fatalf("legacy not normalized: %+v", legacy)
+	if got == nil || got.ID != "alpha" || got.UpstreamHLSURL == nil || *got.UpstreamHLSURL != "https://example.com/a.m3u8" {
+		t.Fatalf("want alpha external channel, got %+v", got)
 	}
 }

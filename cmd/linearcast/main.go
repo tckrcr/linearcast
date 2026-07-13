@@ -3,33 +3,32 @@
 // Its schedule lives in SQLite (see docs/database.md). linearcast opens
 // the database and serves per-channel HLS at:
 //
-//	/channel/<channelID>/stream.m3u8
-//	/channel/<channelID>/packaged/init/<packageID>/init.mp4
-//	/channel/<channelID>/packaged/segments/<packageID>/<idx>.m4s
-//	/channel/<channelID>/session/<sessionID>/init.mp4
-//	/channel/<channelID>/session/<sessionID>/<idx>.m4s
-//	/channel/<channelID>/plexrelay.m3u8
-//	/channel/<channelID>/plexrelay/<viewerToken>/<path>
-//	/channel/<channelID>/now
+//	/channels/<channelID>/stream.m3u8
+//	/channels/<channelID>/streams/<profile>/init/<packageID>/init.mp4
+//	/channels/<channelID>/streams/<profile>/segments/<packageID>/<idx>.m4s
+//	/channels/<channelID>/encoding/<encodingID>/init.mp4
+//	/channels/<channelID>/encoding/<encodingID>/<idx>.m4s
+//	/channels/<channelID>/now
+//	/channels/<channelID>/direct-play
 //
 // Plus service-level /healthz, /readyz, /status, /metrics.
 package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
-	"github.com/tckrcr/linearcast/internal/clock"
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
+	"github.com/tckrcr/linearcast/internal/linearcastlog"
+	"github.com/tckrcr/linearcast/internal/liveproxy"
 	"github.com/tckrcr/linearcast/internal/ondemand"
 	"github.com/tckrcr/linearcast/internal/packager"
-	"github.com/tckrcr/linearcast/internal/plexrelay"
 )
 
 const (
@@ -37,114 +36,104 @@ const (
 	manifestAheadMs        int64 = 72 * 1000
 	packagedManifestLimit        = 24
 	defaultAddr                  = ":8888"
-	packagedPath                 = "packaged"
-	sessionPath                  = "session"
+	streamPath                   = "streams"
+	encodingPath                 = "encoding"
+	onDemandSubtitlePath         = "subs-channel-encoding"
 	defaultPackagedProfile       = db.DefaultPackageProfile
 	channelRefreshPeriod         = 60 * time.Second
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	linearcastlog.SetupJSON()
 
-	dbPath := os.Getenv("LINEARCAST_DB")
-	if dbPath == "" {
-		log.Fatal("LINEARCAST_DB is required")
-	}
-	addr := os.Getenv("LINEARCAST_ADDR")
-	if addr == "" {
-		addr = defaultAddr
-	}
-	conn, err := db.OpenReadWrite(dbPath)
+	cfg, err := loadStartupConfig(os.Getenv)
 	if err != nil {
-		log.Fatalf("open db: %v", err)
+		slog.Error("startup config failed", "err", err)
+		os.Exit(1)
+	}
+	conn, err := db.OpenReadWrite(cfg.dbPath)
+	if err != nil {
+		slog.Error("open db", "err", err)
+		os.Exit(1)
 	}
 	defer conn.Close()
 	if err := db.VerifySchema(context.Background(), conn); err != nil {
-		log.Fatalf("verify schema: %v", err)
+		slog.Error("verify schema", "err", err)
+		os.Exit(1)
 	}
 	packagedProfile, err := db.GetDefaultPackagedProfile(context.Background(), conn)
 	if err != nil {
-		log.Fatalf("read default packaged profile: %v", err)
+		slog.Error("read default packaged profile", "err", err)
+		os.Exit(1)
 	}
 	if packagedProfile == "" {
 		packagedProfile = defaultPackagedProfile
 	}
-	sessionDir := os.Getenv("LINEARCAST_SESSION_DIR")
-	if sessionDir == "" {
-		sessionDir = filepath.Join(os.TempDir(), "linearcast-sessions")
-	}
-
 	ctxStartup, cancelStartup := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := clock.Check(ctxStartup); err != nil {
-		cancelStartup()
-		log.Fatalf("ntp clock check: %v", err)
-	}
+	err = runStartupClockCheck(ctxStartup, cfg.clockCheckMode)
 	cancelStartup()
-	log.Printf("ntp drift within tolerance")
+	if err != nil {
+		slog.Error("ntp clock check", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
 	burstSec := 0
 	if packager.SupportsReadrateBurst(ctx) {
-		burstSec = 90
+		burstSec = 45
 	} else {
-		log.Printf("ffmpeg lacks -readrate_initial_burst; on-demand live sessions will encode uncapped")
+		slog.Warn("ffmpeg lacks -readrate_initial_burst; on-demand channel encodings will encode uncapped")
 	}
-	sessionSettings, err := db.GetOnDemandSessionSettings(context.Background(), conn)
-	if err != nil {
-		log.Fatalf("read on-demand session settings: %v", err)
-	}
-	sessions, err := ondemand.NewManager(ondemand.ManagerOptions{
-		Root:           sessionDir,
-		BurstSec:       burstSec,
-		GraceMs:        int64(sessionSettings.GraceSeconds) * 1000,
-		MaxConcurrent:  sessionSettings.MaxConcurrent,
-		EvictIdleMs:    int64(sessionSettings.EvictIdleSeconds) * 1000,
-		StallTimeoutMs: int64(sessionSettings.StallTimeoutSeconds) * 1000,
-		RestartBudget:  sessionSettings.RestartBudget,
-		MaxKeepaliveMs: int64(sessionSettings.KeepaliveCeilingSec) * 1000,
+	encodings, err := ondemand.NewManager(ondemand.ManagerOptions{
+		Root:                   cfg.encodingDir,
+		BurstSec:               burstSec,
+		MaxConcurrent:          cfg.onDemandMaxConcurrent,
+		MinArtifactRetentionMs: cfg.onDemandPlaybackLagMs + cfg.onDemandWarmupMs + onDemandReadyCoverageMs + 10_000,
+		DB:                     conn,
 	})
 	if err != nil {
-		log.Fatalf("init on-demand sessions: %v", err)
+		slog.Error("init on-demand channel encodings", "err", err)
+		os.Exit(1)
 	}
-	defer sessions.Shutdown()
-
-	plexURL, _ := db.GetPlexURL(context.Background(), conn)
-	plexToken, _ := db.GetPlexToken(context.Background(), conn)
-	var plexRelayManager *plexrelay.Manager
-	if plexURL != "" && plexToken != "" {
-		plexRelayManager = plexrelay.NewManager(plexURL, plexToken, &http.Client{Timeout: 30 * time.Second})
-		log.Printf("plexrelay manager initialized url=%s", plexURL)
-	}
+	defer encodings.Shutdown()
 
 	a := &app{
-		dbConn:          conn,
-		addr:            addr,
-		httpClient:      &http.Client{Timeout: 15 * time.Second},
-		sessions:        sessions,
-		plexRelay:       plexRelayManager,
-		packagedProfile: packagedProfile,
-		startedAt:       time.Now().UTC(),
-		channels:        map[string]*channelRuntime{},
+		dbConn:                conn,
+		addr:                  cfg.addr,
+		httpClient:            &http.Client{Timeout: 15 * time.Second},
+		externalHLSClient:     liveproxy.NewGuardedClient(externalHLSTimeout, liveproxy.AllowAllAddresses),
+		encodings:             encodings,
+		packagedProfile:       packagedProfile,
+		onDemandPlaybackLagMs: cfg.onDemandPlaybackLagMs,
+		onDemandWarmupMs:      cfg.onDemandWarmupMs,
+		cache:                 layout.NewCache(cfg.cacheDir),
+		startedAt:             time.Now().UTC(),
+		channels:              map[string]*channelRuntime{},
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if err := a.refreshChannels(ctx); err != nil {
-		log.Fatalf("load channels: %v", err)
+		slog.Error("load channels", "err", err)
+		os.Exit(1)
 	}
 
 	go a.channelRefreshLoop(ctx)
 	go a.metricsRefreshLoop(ctx)
-	go sessions.Run(ctx)
-	if a.plexRelay != nil {
-		a.plexRelay.Run(ctx)
-	}
+	go sampleCacheMetricsLoop(ctx, layout.NewCache(cfg.cacheDir))
+	go encodings.Run(ctx)
 
-	log.Printf("linearcast listening addr=%s db=%s packaged_profile=%s channels=%d",
-		addr, dbPath, packagedProfile, len(a.snapshotChannels()))
-	srv := &http.Server{Addr: addr, Handler: a.routes()}
+	slog.Info("linearcast listening",
+		"addr", cfg.addr,
+		"db", cfg.dbPath,
+		"packaged_profile", packagedProfile,
+		"channels", len(a.snapshotChannels()),
+		"on_demand_playback_lag_ms", cfg.onDemandPlaybackLagMs,
+		"on_demand_warmup_ms", cfg.onDemandWarmupMs,
+	)
+	srv := &http.Server{Addr: cfg.addr, Handler: a.routes()}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -152,6 +141,6 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		slog.Error("server exited", "err", err)
 	}
 }

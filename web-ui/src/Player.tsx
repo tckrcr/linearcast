@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type Hls from "hls.js";
 import { useHlsPlayer } from "./hooks/useHlsPlayer";
 import { usePlaybackStats } from "./hooks/usePlaybackStats";
 import { PlayerControls } from "./PlayerControls";
 import { formatMs, mediaTitle } from "./format";
+import type { LiveSlot } from "./playbackClock";
 import type { PlayableSource, PlaybackStats, StreamProbe } from "./types";
 
 const initialStats: PlaybackStats = {
@@ -11,18 +12,27 @@ const initialStats: PlaybackStats = {
   paused: true,
   currentTime: 0,
   playbackRate: 1,
+  videoWidth: 0,
+  videoHeight: 0,
+  playerWidth: 0,
+  playerHeight: 0,
+  viewportWidth: 0,
+  viewportHeight: 0,
   droppedFrames: 0,
   totalFrames: 0,
   bufferAhead: 0,
   buffered: "",
   hlsLatency: null,
   liveSyncPosition: null,
+  bandwidthEstimate: null,
+  currentLevel: null,
   lastFrag: "",
   lastEvent: "",
   playbackEngine: "",
   errors: [],
   streamUnavailable: false,
   streamUnavailableReason: "",
+  fatalError: "",
 };
 
 type PlayerProps = {
@@ -36,6 +46,7 @@ type PlayerProps = {
   onAbrModeChange: (mode: "best" | "saver") => void;
   probe: StreamProbe;
   activeSource: PlayableSource | null;
+  nowSlot: LiveSlot;
   hasSources: boolean;
   onStats: (stats: PlaybackStats) => void;
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -53,12 +64,14 @@ export function Player({
   onAbrModeChange,
   probe,
   activeSource,
+  nowSlot,
   hasSources,
   onStats,
   videoRef,
   hlsRef,
 }: PlayerProps) {
   const [stats, setStats] = useState<PlaybackStats>(initialStats);
+  const [subtitleSwitching, setSubtitleSwitching] = useState(false);
   const onStatsRef = useRef(onStats);
   onStatsRef.current = onStats;
 
@@ -80,9 +93,21 @@ export function Player({
     return () => video.removeEventListener("volumechange", onVolumeChange);
   }, [muted, onMutedChange, videoRef]);
 
+  const handleBurnSubtitleSwitch = useCallback(async <T,>(update: () => Promise<T>): Promise<T> => {
+    setSubtitleSwitching(true);
+    try {
+      await nextAnimationFrame();
+      const result = await update();
+      await waitForManifestReady(source);
+      return result;
+    } finally {
+      setSubtitleSwitching(false);
+    }
+  }, [source]);
+
   useHlsPlayer({
     source,
-    enabled: probe.status === "ready",
+    enabled: probe.status === "ready" && !subtitleSwitching,
     autoPlay,
     muted,
     abrMode,
@@ -100,7 +125,7 @@ export function Player({
   return (
     <div className="player">
       <video ref={videoRef} playsInline muted={muted} />
-      {probe.status === "ready" && !stats.streamUnavailable && (
+      {probe.status === "ready" && !subtitleSwitching && !stats.streamUnavailable && !stats.fatalError && (
         <PlayerControls
           channelID={activeSource?.id ?? ""}
           videoRef={videoRef}
@@ -110,9 +135,18 @@ export function Player({
           abrAvailable={abrAvailable}
           onMutedChange={onMutedChange}
           onAbrModeChange={onAbrModeChange}
+          onBurnSubtitleSwitch={handleBurnSubtitleSwitch}
+          hlsRef={hlsRef}
         />
       )}
-      {probe.status !== "ready" && !stats.streamUnavailable && (
+      {subtitleSwitching && !stats.fatalError && (
+        <div className="player-overlay">
+          <strong>Switching subtitles…</strong>
+          <span>Restarting the on-demand encoder.</span>
+          <span className="player-overlay-hint">Playback will resume when the new stream is ready.</span>
+        </div>
+      )}
+      {probe.status !== "ready" && !subtitleSwitching && !stats.streamUnavailable && !stats.fatalError && (
         <div className="player-overlay">
           {!hasSources ? (
             <>
@@ -123,10 +157,10 @@ export function Player({
             <>
               <strong>Stream unavailable</strong>
               <span>{unavailableReason(activeSource)}</span>
-              {activeSource.current.remainingMs != null ? (
+              {nowSlot.remainingMs != null ? (
                 <span className="player-overlay-hint">
-                  next up: {mediaTitle(activeSource.next)} in{" "}
-                  {formatMs(activeSource.current.remainingMs)}
+                  next up: {mediaTitle(nowSlot.next)} in{" "}
+                  {formatMs(nowSlot.remainingMs)}
                 </span>
               ) : (
                 <span className="player-overlay-hint">waiting for the next episode</span>
@@ -134,16 +168,23 @@ export function Player({
             </>
           ) : (
             <>
-              <strong>{probe.status === "checking" ? "Tuning in…" : "Channel warming up…"}</strong>
-              <span>{probe.detail || "waiting for manifest"}</span>
-              <span className="player-overlay-hint">
-                retrying every 3s — first segments take ~30s after import
-              </span>
+              <strong>{waitingTitle(activeSource, probe)}</strong>
+              <span>{waitingDetail(activeSource, probe)}</span>
+              <span className="player-overlay-hint">{waitingHint(activeSource)}</span>
             </>
           )}
         </div>
       )}
-      {stats.streamUnavailable && (
+      {stats.fatalError && (
+        <div className="player-overlay">
+          <strong>Can&apos;t play on this device</strong>
+          <span>{stats.fatalError}</span>
+          <span className="player-overlay-hint">
+            Try a different device, or switch this channel to a profile with an H.264 rendition.
+          </span>
+        </div>
+      )}
+      {stats.streamUnavailable && !stats.fatalError && (
         <div className="player-overlay">
           <strong>Stream unavailable</strong>
           {stats.streamUnavailableReason ? (
@@ -151,17 +192,17 @@ export function Player({
           ) : (
             <span>{mediaTitle(activeSource?.current)} can&apos;t be played right now.</span>
           )}
-          {activeSource?.current?.remainingMs != null ? (
+          {nowSlot.remainingMs != null ? (
             <span className="player-overlay-hint">
-              next up: {mediaTitle(activeSource.next)} in{" "}
-              {formatMs(activeSource.current.remainingMs)}
+              next up: {mediaTitle(nowSlot.next)} in{" "}
+              {formatMs(nowSlot.remainingMs)}
             </span>
           ) : (
             <span className="player-overlay-hint">waiting for the next episode</span>
           )}
         </div>
       )}
-      {muted && probe.status === "ready" && (
+      {muted && probe.status === "ready" && !subtitleSwitching && (
         <button
           type="button"
           className="unmute-pill"
@@ -173,6 +214,41 @@ export function Player({
       )}
     </div>
   );
+}
+
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+function waitingTitle(_source: PlayableSource | null, probe: StreamProbe): string {
+  if (probe.status === "checking") return "Tuning in…";
+  return "Channel warming up…";
+}
+
+function waitingDetail(_source: PlayableSource | null, probe: StreamProbe): string {
+  return probe.detail || "waiting for manifest";
+}
+
+function waitingHint(_source: PlayableSource | null): string {
+  return "retrying every 3s — first segments take ~30s after import";
+}
+
+async function waitForManifestReady(source: string): Promise<void> {
+  if (!source) return;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(source, { cache: "no-store" });
+      if (res.ok) return;
+    } catch {
+      // Keep polling through transient network errors while the encoder warms.
+    }
+    await sleep(1_000);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function unavailableReason(source: PlayableSource): string {

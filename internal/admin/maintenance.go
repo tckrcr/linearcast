@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
+	"github.com/tckrcr/linearcast/internal/lcingest"
 	"github.com/tckrcr/linearcast/internal/packager"
 )
 
@@ -34,6 +36,25 @@ type missingMediaResponse struct {
 	Missing     []missingMediaItem `json:"missing"`
 	Errors      []scanErrorItem    `json:"errors,omitempty"`
 	Deleted     int64              `json:"deleted"`
+}
+
+type mediaOrderingBackfillResponse struct {
+	GeneratedAt string `json:"generatedAt"`
+	Scanned     int    `json:"scanned"`
+	Updated     int    `json:"updated"`
+}
+
+func (a *App) handleMaintenanceMediaOrderingBackfill(w http.ResponseWriter, r *http.Request) {
+	result, err := lcingest.BackfillEpisodeOrdering(r.Context(), a.dbConn, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	writeJSON(w, mediaOrderingBackfillResponse{
+		GeneratedAt: a.now().UTC().Format(time.RFC3339Nano),
+		Scanned:     result.Scanned,
+		Updated:     result.Updated,
+	})
 }
 
 // handleMaintenanceMissingMedia scans the media table, checks whether each
@@ -147,8 +168,8 @@ func (a *App) handleMaintenanceOrphanPackages(w http.ResponseWriter, r *http.Req
 	}
 
 	var globalRoot string
-	if root := a.effectivePackageRoot(); root != "" {
-		globalRoot = filepath.Clean(root)
+	if a.cache.Root() != "" {
+		globalRoot = filepath.Clean(a.cache.PackagesDir())
 		resp.PackageRoot = globalRoot
 	}
 
@@ -295,23 +316,29 @@ func findOrphanPackageDirs(root string, knownSet map[string]bool) ([]string, []s
 }
 
 // deletePackageContents removes the known-generated files (init.mp4,
-// stream.m3u8, seg*.m4s) from dir, then removes dir itself if it is now
-// empty. Files with other names are never touched, so source files that
-// happen to share the same directory are always preserved. The directory
-// removal is best-effort and silently ignored when it fails (e.g. because
-// non-generated files remain).
+// stream.m3u8, seg*.m4s, and package-owned subtitle sidecars) from dir, then
+// removes dir itself if it is now empty. Files with other names are never
+// touched, so source files that happen to share the same directory are always
+// preserved. The directory removal is best-effort and silently ignored when it
+// fails (e.g. because non-generated files remain).
 func deletePackageContents(dir string) error {
+	if filepath.Base(filepath.Clean(dir)) == layout.SubtitlesDirName {
+		return os.RemoveAll(dir)
+	}
 	var errs []string
-	for _, name := range []string{"init.mp4", "stream.m3u8"} {
+	for _, name := range []string{layout.InitName, layout.PlaylistName} {
 		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err.Error())
 		}
 	}
-	segs, _ := filepath.Glob(filepath.Join(dir, "seg*.m4s"))
+	segs, _ := filepath.Glob(filepath.Join(dir, layout.SegmentGlob))
 	for _, seg := range segs {
 		if err := os.Remove(seg); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err.Error())
 		}
+	}
+	if err := os.RemoveAll(layout.PackageSubtitleDir(dir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		errs = append(errs, err.Error())
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
@@ -522,8 +549,8 @@ func (a *App) reclaimMediaEncodes(ctx context.Context, mediaIDs []string, profil
 	}
 
 	var globalRoot string
-	if root := a.effectivePackageRoot(); root != "" {
-		globalRoot = filepath.Clean(root)
+	if a.cache.Root() != "" {
+		globalRoot = filepath.Clean(a.cache.PackagesDir())
 	}
 
 	for _, mediaID := range mediaIDs {
@@ -608,12 +635,12 @@ type orphanEncodeItem struct {
 }
 
 type orphanEncodesResponse struct {
-	GeneratedAt   string             `json:"generatedAt"`
-	DryRun        bool               `json:"dryRun"`
-	IncludeParked bool               `json:"includeParked"`
-	Candidates    int                `json:"candidates"`
-	ParkedRows    int                `json:"parkedRows"`
-	DeletedRows   int                `json:"deletedRows"`
+	GeneratedAt   string `json:"generatedAt"`
+	DryRun        bool   `json:"dryRun"`
+	IncludeParked bool   `json:"includeParked"`
+	Candidates    int    `json:"candidates"`
+	ParkedRows    int    `json:"parkedRows"`
+	DeletedRows   int    `json:"deletedRows"`
 	// TotalBytes is the on-disk size of the encodes eligible for deletion
 	// (parked ones excluded unless includeParked). Reported on dry-run too, so it
 	// answers "how much would this free" before committing.
@@ -675,8 +702,8 @@ func (a *App) handleMaintenanceOrphanEncodes(w http.ResponseWriter, r *http.Requ
 	}
 
 	var globalRoot string
-	if root := a.effectivePackageRoot(); root != "" {
-		globalRoot = filepath.Clean(root)
+	if a.cache.Root() != "" {
+		globalRoot = filepath.Clean(a.cache.PackagesDir())
 	}
 
 	for _, p := range pkgs {
@@ -756,4 +783,140 @@ func (a *App) handleMaintenancePackageDelete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, res)
+}
+
+type packageIntegrityRepairResponse struct {
+	GeneratedAt     string `json:"generatedAt"`
+	FileReset       int64  `json:"fileReset"`
+	DurationReset   int64  `json:"durationReset"`
+	DurationSkipped int64  `json:"durationSkipped"`
+}
+
+// handleMaintenancePackageIntegrityRepair runs CheckReadyPackageIntegrity —
+// the same sweep the encoder sweeper runs on its timer — on demand. Ready
+// packages with missing/mismatched files or truncated durations are requeued
+// for re-encoding.
+func (a *App) handleMaintenancePackageIntegrityRepair(w http.ResponseWriter, r *http.Request) {
+	result, err := packager.CheckReadyPackageIntegrity(r.Context(), a.dbConn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "check_error", err.Error())
+		return
+	}
+	writeJSON(w, packageIntegrityRepairResponse{
+		GeneratedAt:     a.now().UTC().Format(time.RFC3339Nano),
+		FileReset:       result.FileReset,
+		DurationReset:   result.DurationReset,
+		DurationSkipped: result.DurationSkipped,
+	})
+}
+
+type packageRequeueResponse struct {
+	GeneratedAt string `json:"generatedAt"`
+	PackageID   string `json:"packageId"`
+	MediaID     string `json:"mediaId"`
+	Profile     string `json:"profile"`
+	Status      string `json:"status"`
+	Requeued    bool   `json:"requeued"`
+}
+
+// handleMaintenancePackageRequeue requeues a single ready package for
+// re-encoding by ID. The package must currently be in ready status; packages
+// already pending or processing are reported with requeued=false. Use the GET
+// package-integrity endpoint to find broken package IDs before calling this.
+func (a *App) handleMaintenancePackageRequeue(w http.ResponseWriter, r *http.Request) {
+	packageID := r.PathValue("packageID")
+
+	pkg, err := db.MediaPackageByID(r.Context(), a.dbConn, packageID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	if pkg == nil {
+		writeError(w, http.StatusNotFound, "not_found", "package not found")
+		return
+	}
+
+	requeued, err := db.MarkReadyPackagePendingForReencode(
+		r.Context(), a.dbConn, packageID, a.now().UTC().UnixMilli(), "manual requeue via admin API")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+
+	status := string(pkg.Status)
+	if requeued {
+		status = string(db.PackageStatusPending)
+	}
+	writeJSON(w, packageRequeueResponse{
+		GeneratedAt: a.now().UTC().Format(time.RFC3339Nano),
+		PackageID:   pkg.ID,
+		MediaID:     pkg.MediaID,
+		Profile:     pkg.RenditionProfile,
+		Status:      status,
+		Requeued:    requeued,
+	})
+}
+
+type importPackageItem struct {
+	MediaID      string `json:"mediaId"`
+	Profile      string `json:"profile"`
+	PackageID    string `json:"packageId"`
+	SegmentCount int    `json:"segmentCount"`
+	DurationMs   int64  `json:"durationMs"`
+}
+
+type importSkipItem struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
+type importPackagesResponse struct {
+	GeneratedAt  string              `json:"generatedAt"`
+	Scanned      int                 `json:"scanned"`
+	Imported     []importPackageItem `json:"imported"`
+	AlreadyReady int                 `json:"alreadyReady"`
+	NeedsMedia   []string            `json:"needsMedia"`
+	Skipped      []importSkipItem    `json:"skipped"`
+}
+
+// handleMaintenanceImportPackages rebuilds DB rows for finalized packages found
+// on disk whose media rows already exist (e.g. after rescanning source folders
+// into a fresh database), without re-encoding. See packager.ImportPackages.
+func (a *App) handleMaintenanceImportPackages(w http.ResponseWriter, r *http.Request) {
+	if a.cache.Root() == "" {
+		writeError(w, http.StatusInternalServerError, "package_root_missing", "CACHE_DIR is required")
+		return
+	}
+	report, err := packager.ImportPackages(r.Context(), a.dbConn, packager.ImportOptions{
+		OutputRoot: a.cache.PackagesDir(),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "import_failed", err.Error())
+		return
+	}
+
+	resp := importPackagesResponse{
+		GeneratedAt:  a.now().UTC().Format(time.RFC3339Nano),
+		Scanned:      report.Scanned,
+		AlreadyReady: report.AlreadyReady,
+		Imported:     make([]importPackageItem, 0, len(report.Imported)),
+		NeedsMedia:   report.NeedsMedia,
+		Skipped:      make([]importSkipItem, 0, len(report.Skipped)),
+	}
+	if resp.NeedsMedia == nil {
+		resp.NeedsMedia = []string{}
+	}
+	for _, it := range report.Imported {
+		resp.Imported = append(resp.Imported, importPackageItem{
+			MediaID:      it.MediaID,
+			Profile:      it.RenditionProfile,
+			PackageID:    it.PackageID,
+			SegmentCount: it.SegmentCount,
+			DurationMs:   it.DurationMs,
+		})
+	}
+	for _, sk := range report.Skipped {
+		resp.Skipped = append(resp.Skipped, importSkipItem{Path: sk.Path, Reason: sk.Reason})
+	}
+	writeJSON(w, resp)
 }

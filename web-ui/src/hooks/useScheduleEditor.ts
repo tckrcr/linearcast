@@ -308,7 +308,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
             mediaId: media.mediaId,
             title: media.title,
             path: media.path,
-            schedulingGroup: media.schedulingGroup,
+            collectionName: media.collectionName,
             durationMs,
             packagedDurationMs: ready ? durationMs : undefined,
             packageReady: ready,
@@ -335,7 +335,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
             mediaId: media.mediaId,
             title: media.title,
             path: media.path,
-            schedulingGroup: media.schedulingGroup,
+            collectionName: media.collectionName,
             durationMs,
             packagedDurationMs: durationMs,
             packageReady: true,
@@ -351,7 +351,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
             mediaId: media.mediaId,
             title: media.title,
             path: media.path,
-            schedulingGroup: media.schedulingGroup,
+            collectionName: media.collectionName,
             durationMs,
             packagedDurationMs: durationMs,
             packageReady: true,
@@ -368,7 +368,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
             mediaId: filler.mediaId,
             title: filler.label,
             path: "",
-            schedulingGroup: undefined,
+            collectionName: undefined,
             durationMs,
             packagedDurationMs: durationMs,
             packageReady: true,
@@ -778,7 +778,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
       mediaId: media.mediaId,
       title: media.title,
       path: media.path,
-      schedulingGroup: media.schedulingGroup,
+      collectionName: media.collectionName,
       startMs: 0,
       endMs: durationMs,
       durationMs,
@@ -813,7 +813,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
           mediaId: media.mediaId,
           title: media.title,
           path: media.path,
-          schedulingGroup: media.schedulingGroup,
+          collectionName: media.collectionName,
           startMs: 0,
           endMs: durationMs,
           durationMs,
@@ -986,15 +986,14 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
       const body = await apiCreateScheduleBuilderChannel({
         displayName: displayName.trim(),
         packageProfile,
-        ...(playbackMode === "plex_relay" ? { playbackMode } : {}),
         mediaIds,
-        ...(prefillMode === "on_demand" ? { prefillMode } : {}),
+        ...(prefillMode && prefillMode !== "eager" ? { prefillMode } : {}),
         ...(adaptiveBitrate ? { adaptiveBitrate } : {}),
         ...(scheduleMode === "slot_grid"
           ? { scheduleMode, slotDurationMs, entries: explicit?.entries, fillerMediaIds: explicit?.fillerMediaIds }
           : {}),
       });
-      const queuedSuffix = playbackMode === "plex_relay" ? "" : `, queued ${body.queued.length}`;
+      const queuedSuffix = `, queued ${body.queued?.length ?? 0}`;
       setScheduleNotice(`created ${body.channelID}: ${body.scheduleEntries} entr${body.scheduleEntries === 1 ? "y" : "ies"}${queuedSuffix}`);
       onImported(body.channelID, { scheduleMode });
     } catch (err) {
@@ -1023,7 +1022,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
   const mediaFilterLower = mediaFilter.trim().toLowerCase();
   const filteredReadyMedia = readyMedia.filter((media) => {
     if (!mediaFilterLower) return true;
-    return [media.title, media.mediaId, media.schedulingGroup, media.path]
+    return [media.title, media.mediaId, media.collectionName, media.path]
       .filter(Boolean)
       .some((value) => value!.toLowerCase().includes(mediaFilterLower));
   });

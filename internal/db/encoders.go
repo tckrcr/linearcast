@@ -607,6 +607,11 @@ type FinalizedPackage struct {
 	AudioProfile       *string
 	Timescale          *int64
 	PackagedDurationMs *int64
+	// PackageBytes is the on-disk size of the finished package (segments + init),
+	// recorded at finalize so size accounting/estimation never needs to walk the
+	// filesystem. nil = unknown (size unmeasurable, or a pre-column package not
+	// yet backfilled).
+	PackageBytes *int64
 }
 
 // resolveAndApplyFailure reads the current attempts for a processing package,
@@ -778,32 +783,6 @@ func RequeueEncoderJobs(ctx context.Context, conn *sql.DB, encoderID string, max
 func ClearEncoderLease(ctx context.Context, conn *sql.DB, packageID string) error {
 	_, err := conn.ExecContext(ctx, `DELETE FROM encoder_jobs WHERE package_id = ?`, packageID)
 	return err
-}
-
-// RequeueLeaselessProcessing recovers processing packages that have no
-// encoder_jobs lease — the pre-lease "local worker" rows. Since every claim now
-// inserts a lease, this only ever finds rows stranded before the lease model
-// shipped; it is a no-op on every startup once that backlog has drained.
-//
-// TODO(transitional): delete this and its caller once the lease-model deploy
-// has cleared pre-lease processing orphans.
-func RequeueLeaselessProcessing(ctx context.Context, conn *sql.DB, maxAttempts int, nowMs int64) (int64, error) {
-	ids, err := queryRows(ctx, conn, scanString, `
-		SELECT id FROM media_packages mp
-		WHERE mp.status = ?
-		  AND NOT EXISTS (SELECT 1 FROM encoder_jobs ej WHERE ej.package_id = mp.id)`,
-		string(PackageStatusProcessing))
-	if err != nil {
-		return 0, err
-	}
-	var count int64
-	for _, id := range ids {
-		if _, err := MarkPackageFailedWithKind(ctx, conn, id, "transient", "pre-lease processing orphan requeued at startup", maxAttempts, nowMs); err != nil {
-			return count, fmt.Errorf("requeue leaseless %s: %w", id, err)
-		}
-		count++
-	}
-	return count, nil
 }
 
 func expireOneLease(ctx context.Context, conn *sql.DB, packageID string, maxAttempts int, nowMs int64) (PackageStatus, int, error) {

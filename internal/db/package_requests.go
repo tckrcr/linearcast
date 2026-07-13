@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/metrics"
-	"github.com/tckrcr/linearcast/internal/packageid"
 )
 
 // validPackageTransition enforces the media_packages state machine. The
@@ -107,7 +107,7 @@ func RequestMediaPackages(ctx context.Context, conn *sql.DB, mediaIDs []string, 
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
 				VALUES (?, ?, ?, ?, ?, ?)`,
-				packageid.For(mediaID, profile), mediaID, profile, string(PackageStatusPending), nowMs, nowMs); err != nil {
+				layout.ID(mediaID, profile), mediaID, profile, string(PackageStatusPending), nowMs, nowMs); err != nil {
 				return result, err
 			}
 			metrics.PackageStateTransitionsTotal.WithLabelValues(profile, "missing", string(PackageStatusPending)).Inc()
@@ -203,7 +203,7 @@ func EnsurePendingPackages(ctx context.Context, conn *sql.DB, mediaIDs []string,
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
 			VALUES (?, ?, ?, ?, ?, ?)`,
-			packageid.For(mediaID, profile), mediaID, profile, string(PackageStatusPending), nowMs, nowMs); err != nil {
+			layout.ID(mediaID, profile), mediaID, profile, string(PackageStatusPending), nowMs, nowMs); err != nil {
 			return queued, err
 		}
 		metrics.PackageStateTransitionsTotal.WithLabelValues(profile, "missing", string(PackageStatusPending)).Inc()
@@ -342,9 +342,9 @@ func CancelAllMediaPackagesForProfile(ctx context.Context, conn *sql.DB, profile
 
 	for _, target := range targets {
 		res, err := tx.ExecContext(ctx, `
-			UPDATE media_packages
-			SET status = ?, error = ?, updated_at_ms = ?
-			WHERE media_id = ? AND rendition_profile = ? AND status = ?`,
+				UPDATE media_packages
+				SET status = ?, error = ?, updated_at_ms = ?
+				WHERE media_id = ? AND rendition_profile = ? AND status = ?`,
 			string(PackageStatusFailed), reason, nowMs, target.mediaID, target.profile, target.status)
 		if err != nil {
 			return result, err
@@ -594,13 +594,13 @@ func ApplyFinalizedPackageTransition(ctx context.Context, tx *sql.Tx, packageID 
 		       package_root = ?, init_segment_path = ?, segment_base_path = ?,
 		       container = ?, video_codec = ?, video_profile = ?,
 		       video_width = ?, video_height = ?, audio_codec = ?, audio_profile = ?,
-		       timescale = ?, packaged_duration_ms = ?, updated_at_ms = ?
+		       timescale = ?, packaged_duration_ms = ?, package_bytes = ?, updated_at_ms = ?
 		 WHERE id = ? AND status = ?`,
 		string(PackageStatusReady),
 		finalized.PackageRoot, finalized.InitSegmentPath, finalized.SegmentBasePath,
 		finalized.Container, finalized.VideoCodec, finalized.VideoProfile,
 		finalized.VideoWidth, finalized.VideoHeight, finalized.AudioCodec, finalized.AudioProfile,
-		finalized.Timescale, finalized.PackagedDurationMs, nowMs,
+		finalized.Timescale, finalized.PackagedDurationMs, finalized.PackageBytes, nowMs,
 		packageID, string(PackageStatusProcessing))
 	if err != nil {
 		return 0, err
@@ -630,6 +630,7 @@ func MarkPackageReady(ctx context.Context, conn *sql.DB, p MediaPackage) error {
 		AudioProfile:       nonEmptyStr(p.AudioProfile),
 		Timescale:          p.Timescale,
 		PackagedDurationMs: p.PackagedDurationMs,
+		PackageBytes:       p.PackageBytes,
 	}
 	n, err := ApplyFinalizedPackageTransition(ctx, tx, p.ID, finalized, p.UpdatedAtMs)
 	if err != nil {
@@ -783,10 +784,29 @@ func QueueChannelProfileMigration(ctx context.Context, conn *sql.DB, channelID, 
 	return RequestMediaPackages(ctx, conn, ids, profile)
 }
 
+// FailStaleProcessingPackages is the periodic backstop for `processing` rows
+// stranded with no encoder_jobs row at all — e.g. a worker crashed between
+// clearing its lease and updating the package status. The lease sweeper
+// (LeaseExpiredJobs) only acts on rows that still have a lease row to expire,
+// so it never sees a leaseless one.
+//
+// The NOT EXISTS guard is load-bearing and is deliberately scoped to rows with
+// no lease row at all, not just no *live* lease: every lease-bearing row —
+// including one whose lease has expired — belongs to the lease sweeper, which
+// deletes the lease row as it transitions the package. Reaping an expired-lease
+// row here would leave that encoder_jobs row orphaned. It also means an active
+// encode (which holds a heart-beating lease but does NOT advance
+// media_packages.updated_at_ms, so it looks "stale" by updated_at alone) is
+// always protected. Rows are reset transient (→ pending, or failed at
+// maxAttempts) like lease expiry, so a stranded row gets one more attempt
+// rather than a hard fail.
 func FailStaleProcessingPackages(ctx context.Context, conn *sql.DB, cutoffMs, nowMs int64, maxAttempts int, reason string) (int64, error) {
 	ids, err := queryRows(ctx, conn, scanString, `
-		SELECT id FROM media_packages
-		WHERE status = ? AND updated_at_ms < ?`,
+		SELECT id FROM media_packages mp
+		WHERE mp.status = ? AND mp.updated_at_ms < ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM encoder_jobs ej WHERE ej.package_id = mp.id
+		  )`,
 		string(PackageStatusProcessing), cutoffMs)
 	if err != nil {
 		return 0, err

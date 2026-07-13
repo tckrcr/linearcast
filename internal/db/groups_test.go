@@ -48,3 +48,45 @@ func TestLoadGroupHistory(t *testing.T) {
 		t.Errorf("GroupB cursor wrong: %+v (want m3, 18000)", cursors["GroupB"])
 	}
 }
+
+// TestSchedulingGroupGateExcludesCodecFailures verifies the schedule-builder
+// listings (Shows rollup and by-group) hide codec-failed media — e.g. DV
+// Profile 5 / HEVC-PQ that the encoder can't yet handle — so a show can't be
+// scheduled when it's already gated from being encoded.
+func TestSchedulingGroupGateExcludesCodecFailures(t *testing.T) {
+	path := newTestDB(t)
+	rw, err := OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer rw.Close()
+
+	// "Example Show" has one passing 1080p row and one failed 2160p DV row.
+	// "Failonly" has only a failed row, so the group should vanish entirely.
+	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, title, scheduling_group, duration_ms, container,
+        video_codec, video_height, audio_codec, codec_check_passed, codec_check_reason, ingested_at_ms)
+        VALUES
+          ('show-1080', '/tmp/show.1080p.mkv', '/tmp', 'Example Show S01E01', 'Example Show', 6000, 'mkv', 'h264', 1080, 'aac', 1, NULL, 0),
+          ('show-2160', '/tmp/show.2160p.mkv', '/tmp', 'Example Show S01E01', 'Example Show', 6000, 'mkv', 'hevc', 2160, 'eac3', 0, 'video_codec=hevc; video_height=2160', 0),
+          ('fo-2160', '/tmp/fo.2160p.mkv', '/tmp', 'FailOnly S01E01',    'Failonly',    6000, 'mkv', 'hevc', 2160, 'eac3', 0, 'video_codec=hevc; video_height=2160', 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+
+	ctx := context.Background()
+
+	rows, err := MediaByGroup(ctx, rw, "Example Show")
+	if err != nil {
+		t.Fatalf("by-group: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != "show-1080" {
+		t.Errorf("by-group should return only show-1080, got %+v", rows)
+	}
+
+	failOnly, err := MediaByGroup(ctx, rw, "Failonly")
+	if err != nil {
+		t.Fatalf("by-group failonly: %v", err)
+	}
+	if len(failOnly) != 0 {
+		t.Errorf("by-group should be empty for an all-failed group, got %d rows", len(failOnly))
+	}
+}

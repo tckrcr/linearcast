@@ -325,7 +325,13 @@ func ScheduleWindowEnriched(ctx context.Context, conn *sql.DB, channelID string,
 		if media, ok := mediaByID[entry.MediaID]; ok {
 			item.Path = media.Path
 			item.Title = media.Title
-			item.SchedulingGroup = media.SchedulingGroup
+			item.CollectionName = media.CollectionName
+			item.Description = media.Description
+			item.ThumbPath = media.ThumbPath
+			item.ContentRating = media.ContentRating
+			item.Genres = append([]string(nil), media.Genres...)
+			item.SeasonNumber = media.SeasonNumber
+			item.EpisodeNumber = media.EpisodeNumber
 		}
 		out = append(out, item)
 	}
@@ -391,6 +397,41 @@ func LastScheduleEntryBefore(ctx context.Context, conn *sql.DB, channelID string
 	return &e, nil
 }
 
+// FirstScheduleEntryEndingAfter returns the earliest schedule entry whose end
+// (start_ms + duration_ms) is after afterMs — the entry currently airing or the
+// next one in the future. The anchor is included so callers can splice the
+// schedule chain when inserting ahead of it. Returns (nil, nil) when the
+// channel has no such entry.
+func FirstScheduleEntryEndingAfter(ctx context.Context, conn Execer, channelID string, afterMs int64) (*ScheduleEntry, error) {
+	row := conn.QueryRowContext(ctx, `
+        SELECT id, channel_id, start_ms, media_id, offset_ms, duration_ms,
+               anchor_schedule_entry_id, created_at_ms
+        FROM schedule_entries
+        WHERE channel_id = ? AND start_ms + duration_ms > ?
+        ORDER BY start_ms ASC LIMIT 1`, channelID, afterMs)
+	var e ScheduleEntry
+	var anchor sql.NullString
+	if err := row.Scan(&e.ID, &e.ChannelID, &e.StartMs, &e.MediaID, &e.OffsetMs, &e.DurationMs, &anchor, &e.CreatedAtMs); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if anchor.Valid {
+		v := anchor.String
+		e.AnchorScheduleEntryID = &v
+	}
+	return &e, nil
+}
+
+// SetScheduleEntryAnchor sets (anchor non-nil) or clears (anchor nil) the chain
+// anchor of a single schedule entry. Used to splice newly inserted entries into
+// an existing chain.
+func SetScheduleEntryAnchor(ctx context.Context, conn Execer, id string, anchor *string) error {
+	_, err := conn.ExecContext(ctx, `UPDATE schedule_entries SET anchor_schedule_entry_id = ? WHERE id = ?`, anchor, id)
+	return err
+}
+
 // LastEntryWithMediaBefore returns the most recent filler schedule entry for the
 // given media on a channel whose start is before beforeMs. It is used to
 // continue sequential filler rotation from where the previous placement of the
@@ -451,13 +492,13 @@ func ChannelHasSchedule(ctx context.Context, conn *sql.DB, channelID string) (bo
 	return true, nil
 }
 
-// LoadGroupHistory returns one GroupCursor per scheduling_group seen in
-// the channel's schedule, plus the scheduling_group of the entry with the
+// LoadGroupHistory returns one GroupCursor per collection label seen in
+// the channel's schedule, plus the collection label of the entry with the
 // highest start_ms (the "most recent group"). The recent-group string is
 // "" when the channel has no schedule yet OR when the latest entry's media
-// has scheduling_group=NULL (treated as its own per-media group).
+// has no collection (treated as its own per-media group).
 //
-// Media with scheduling_group=NULL are bucketed under "" (caller is
+// Media with no collection are bucketed under "" (caller is
 // responsible for treating "" as a per-media singleton group).
 func LoadGroupHistory(ctx context.Context, conn Execer, channelID string) (map[string]GroupCursor, string, error) {
 	return LoadGroupHistoryBefore(ctx, conn, channelID, 0)
@@ -473,9 +514,11 @@ func LoadGroupHistoryBefore(ctx context.Context, conn Execer, channelID string, 
 		args = append(args, beforeMs)
 	}
 	rows, err := queryRows(ctx, conn, scanGroupHistoryRow, `
-        SELECT s.start_ms, s.duration_ms, s.media_id, COALESCE(m.scheduling_group, '')
+        SELECT s.start_ms, s.duration_ms, s.media_id,
+               COALESCE(CASE WHEN c.kind = 'movie' THEN 'movie:' || c.name ELSE c.name END, m.scheduling_group, '')
         FROM schedule_entries s
         JOIN media m ON m.id = s.media_id
+        LEFT JOIN collections c ON c.id = m.collection_id
         WHERE s.channel_id = ?
 		`+whereBefore+`
         ORDER BY s.start_ms DESC`, args...)

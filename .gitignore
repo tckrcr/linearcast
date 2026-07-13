@@ -11,16 +11,6 @@
 /bin/
 /build/
 /dist/
-/linearcast-admin
-/linearcast-maint
-/linearcast
-/linearcast-extender
-/linearcast-ingest
-/linearcast-packager
-/linearcast-packager-worker
-/linearcast-schedule
-/linearcast-subtitle-audit
-/linearcast-subtitle-extract
 *.exe
 *.exe~
 *.dll
@@ -67,10 +57,10 @@ pnpm-debug.log*
 /packages/
 /media/
 /hls/
-/linearcast/
 *.db
 *.db-shm
 *.db-wal
+library-merge.md
 
 # -----------------------------
 # Environment / secrets
@@ -83,6 +73,9 @@ linearcast.local.env
 
 # Native deploy scratch (created by deploy-linearcast.sh --native)
 /.local/
+
+# Host-built binaries for the dev bind-mount override (deploy/docker-compose.dev.yml)
+/.devbin/
 
 # -----------------------------
 # OS / filesystem noise
@@ -109,4 +102,5 @@ coverage/
 # Misc
 # -----------------------------
 *.log
-tmp/
+/tmp/
+Screenshot *.png

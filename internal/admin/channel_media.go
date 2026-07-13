@@ -13,7 +13,7 @@ type channelMediaItem struct {
 	MediaID            string `json:"mediaId"`
 	Title              string `json:"title,omitempty"`
 	Path               string `json:"path,omitempty"`
-	SchedulingGroup    string `json:"schedulingGroup,omitempty"`
+	CollectionName     string `json:"collectionName,omitempty"`
 	DurationMs         int64  `json:"durationMs"`
 	CodecCheckPassed   bool   `json:"codecCheckPassed"`
 	CodecCheckReason   string `json:"codecCheckReason,omitempty"`
@@ -86,8 +86,8 @@ func (a *App) handleChannelMedia(w http.ResponseWriter, r *http.Request) {
 		if row.Title != "" {
 			item.Title = row.Title
 		}
-		if row.SchedulingGroup != "" {
-			item.SchedulingGroup = row.SchedulingGroup
+		if row.CollectionName != "" {
+			item.CollectionName = row.CollectionName
 		}
 		if row.CodecCheckReason != "" {
 			item.CodecCheckReason = row.CodecCheckReason

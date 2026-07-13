@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,7 +21,7 @@ type sweeperEnv struct {
 	conn      *sql.DB
 	encoderID string
 	logBuf    *bytes.Buffer
-	logger    *log.Logger
+	logger    *slog.Logger
 }
 
 func newSweeperEnv(t *testing.T) *sweeperEnv {
@@ -58,7 +58,7 @@ func newSweeperEnv(t *testing.T) *sweeperEnv {
 		conn:      conn,
 		encoderID: id,
 		logBuf:    &buf,
-		logger:    log.New(&buf, "", 0),
+		logger:    slog.New(slog.NewJSONHandler(&buf, nil)),
 	}
 }
 
@@ -66,7 +66,7 @@ func (e *sweeperEnv) claim(t *testing.T, leaseTTL time.Duration, nowMs int64) {
 	t.Helper()
 	ok, err := db.ClaimPackage(context.Background(), e.conn, db.ClaimRequest{
 		MediaID:   "m1",
-		Profile:   "h264-main-1080p",
+		Profile:   "h264-1080p-8mbps",
 		PackageID: "pkg-m1",
 		EncoderID: e.encoderID,
 		LeaseTTL:  leaseTTL,
@@ -103,7 +103,7 @@ func TestSweeper_TransitionsExpiredLeaseToPending(t *testing.T) {
 		t.Fatalf("status=%s, want pending", got)
 	}
 	logs := env.logBuf.String()
-	if !strings.Contains(logs, "expired=1") || !strings.Contains(logs, "pending=1") {
+	if !strings.Contains(logs, `"expired":1`) || !strings.Contains(logs, `"pending":1`) {
 		t.Fatalf("log missing expected counters:\n%s", logs)
 	}
 }
@@ -125,7 +125,7 @@ func TestSweeper_PromotesToFailedAtCap(t *testing.T) {
 	if got := env.packageStatus(t); got != db.PackageStatusFailed {
 		t.Fatalf("status=%s after %d sweeps, want failed", got, cap)
 	}
-	if !strings.Contains(env.logBuf.String(), "failed=1") {
+	if !strings.Contains(env.logBuf.String(), `"failed":1`) {
 		t.Fatalf("expected failed=1 in logs:\n%s", env.logBuf.String())
 	}
 }
@@ -210,5 +210,61 @@ func TestSweeper_RespectsContextCancellation(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("Run did not exit after cancellation")
+	}
+}
+
+// TestSweeper_ResetsStaleLeaselessProcessing exercises the backstop wiring: a
+// `processing` row whose encoder_jobs lease vanished (so LeaseExpiredJobs can
+// never see it) is reclaimed once it ages past StaleProcessingTimeout.
+func TestSweeper_ResetsStaleLeaselessProcessing(t *testing.T) {
+	env := newSweeperEnv(t)
+	env.claim(t, 1*time.Hour, 1_000)
+	// Strand the row: drop the lease row and backdate updated_at so it looks
+	// like a worker that crashed between clearing its lease and updating status.
+	if _, err := env.conn.Exec(`DELETE FROM encoder_jobs WHERE package_id = 'pkg-m1'`); err != nil {
+		t.Fatalf("delete lease: %v", err)
+	}
+	if _, err := env.conn.Exec(`UPDATE media_packages SET updated_at_ms = 0 WHERE id = 'pkg-m1'`); err != nil {
+		t.Fatalf("backdate updated_at: %v", err)
+	}
+
+	s := &Sweeper{
+		DB:                     env.conn,
+		MaxAttempts:            5,
+		StaleProcessingTimeout: 15 * time.Minute,
+		Now:                    func() time.Time { return time.UnixMilli(2_000_000) },
+		Logger:                 env.logger,
+	}
+	s.sweepOnce(context.Background(), "test")
+
+	if got := env.packageStatus(t); got != db.PackageStatusPending {
+		t.Fatalf("status=%s, want pending (stranded row reclaimed)", got)
+	}
+	if logs := env.logBuf.String(); !strings.Contains(logs, `"reset":1`) {
+		t.Fatalf("log missing stale-processing reset counter:\n%s", logs)
+	}
+}
+
+// TestSweeper_SkipsStaleProcessingWithLiveLease confirms the wiring passes nowMs
+// into the live-lease guard: a long encode with a stale updated_at but a valid
+// lease is never reset by the backstop.
+func TestSweeper_SkipsStaleProcessingWithLiveLease(t *testing.T) {
+	env := newSweeperEnv(t)
+	env.claim(t, 1*time.Hour, 1_000) // lease valid until 3_601_000
+	if _, err := env.conn.Exec(`UPDATE media_packages SET updated_at_ms = 0 WHERE id = 'pkg-m1'`); err != nil {
+		t.Fatalf("backdate updated_at: %v", err)
+	}
+
+	s := &Sweeper{
+		DB:                     env.conn,
+		MaxAttempts:            5,
+		StaleProcessingTimeout: 15 * time.Minute,
+		Now:                    func() time.Time { return time.UnixMilli(2_000_000) },
+		Logger:                 env.logger,
+	}
+	s.sweepOnce(context.Background(), "test")
+
+	if got := env.packageStatus(t); got != db.PackageStatusProcessing {
+		t.Fatalf("status=%s, want processing (live lease must protect it)", got)
 	}
 }

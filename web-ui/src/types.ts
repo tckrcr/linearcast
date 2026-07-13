@@ -2,7 +2,7 @@ export type MediaWindow = {
   mediaID: string;
   title?: string;
   path?: string;
-  schedulingGroup?: string;
+  collectionName?: string;
   packageStatus?: string;
   packageError?: string;
   startMs: number;
@@ -25,7 +25,9 @@ export type CacheStatus = {
   latestGeneratedAt?: string;
 };
 
-export type ChannelStatus = "playing" | "gap" | "unscheduled" | string;
+// "live" / "down" are reported for external (live-proxy) channels by the admin
+// reachability heartbeat; "unknown" before the first probe resolves.
+export type ChannelStatus = "playing" | "gap" | "unscheduled" | "live" | "down" | "unknown" | string;
 
 export type NowPlaying = {
   title?: string;
@@ -33,6 +35,17 @@ export type NowPlaying = {
   album?: string;
   artUrl?: string;
   playing: boolean;
+};
+
+// SpotifyUrl is the singleton Spotify→HLS URL. configured is false when none is
+// set.
+export type SpotifyUrl = {
+  configured: boolean;
+  channelId?: string;
+  displayName?: string;
+  upstreamHlsUrl?: string;
+  status?: ChannelStatus;
+  nowPlaying?: NowPlaying;
 };
 
 export type ChannelNow = {
@@ -56,7 +69,7 @@ export type ChannelNow = {
   packageCoverageHours: number;
   packageReadyCount: number;
   packageProfile: string;
-  playbackMode?: "packaged" | "plex_relay" | string;
+  playbackMode?: string;
   isExternal?: boolean;
   upstreamHlsUrl?: string;
   nowPlaying?: NowPlaying;
@@ -86,6 +99,7 @@ export type PlayableSource = {
   packageProfile?: string;
   adaptiveBitrate?: boolean;
   prefillMode?: "eager" | "on_demand" | string;
+  playbackMode?: string;
   nowPlaying?: NowPlaying;
 };
 
@@ -113,6 +127,8 @@ export type GuideChannel = {
   status: ChannelStatus;
   isExternal?: boolean;
   prefillMode?: "eager" | "on_demand" | string;
+  scheduleMode?: "back_to_back" | "slot_grid" | string;
+  slotDurationMs?: number;
   nowPlaying?: NowPlaying;
   // End of the channel's last scheduled entry; used to stop paging the guide
   // past where a schedule has actually been built.
@@ -151,6 +167,10 @@ export type SubtitleSettings = {
   subtitleLanguagePreference: string[];
 };
 
+export type PublicServerURL = {
+  publicServerUrl: string;
+};
+
 export type SchedulerTunables = {
   horizonHours: number;
   lowWaterHours: number;
@@ -160,15 +180,6 @@ export type SchedulerTunables = {
 export type EncoderSweeperSettings = {
   sweepIntervalSeconds: number;
   maxAttempts: number;
-};
-
-export type OnDemandSessionSettings = {
-  graceSeconds: number;
-  maxConcurrent: number;
-  evictIdleSeconds: number;
-  stallTimeoutSeconds: number;
-  restartBudget: number;
-  keepaliveCeilingSec: number;
 };
 
 export type ChannelPolicy = {
@@ -291,6 +302,24 @@ export type OptimizeDBMaintenanceResponse = {
   sizeAfter: number;
 };
 
+export type ImportPackagesResponse = {
+  generatedAt: string;
+  scanned: number;
+  imported: Array<{
+    mediaId: string;
+    profile: string;
+    packageId: string;
+    segmentCount: number;
+    durationMs: number;
+  }>;
+  alreadyReady: number;
+  needsMedia: string[];
+  skipped: Array<{
+    path: string;
+    reason: string;
+  }>;
+};
+
 export type PackageIntegrityItem = {
   packageId: string;
   mediaId: string;
@@ -317,6 +346,49 @@ export type PackageIntegrityResponse = {
   problems: number;
   unknownDuration: number;
   packages: PackageIntegrityItem[];
+};
+
+export type PackageIntegrityRepairResponse = {
+  generatedAt: string;
+  fileReset: number;
+  durationReset: number;
+  durationSkipped: number;
+};
+
+export type PackageRequeueResponse = {
+  generatedAt: string;
+  packageId: string;
+  mediaId: string;
+  profile: string;
+  status: string;
+  requeued: boolean;
+};
+
+export type ScheduleCheckIssue = {
+  channelId: string;
+  kind: string;
+  startMs?: number;
+  endMs?: number;
+  mediaId?: string;
+  message: string;
+};
+
+export type ScheduleCheckResponse = {
+  generatedAt: string;
+  windowFromMs: number;
+  windowToMs: number;
+  gapMs: number;
+  channelsChecked: number;
+  issues: ScheduleCheckIssue[];
+};
+
+export type MediaUpdateResponse = {
+  mediaId: string;
+  path: string;
+  title: string;
+  collectionName: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
 };
 
 export type EncodeReclaimItem = {
@@ -349,6 +421,25 @@ export type PlexStatus = {
   serverName?: string;
   url?: string;
   pathMap?: string;
+};
+
+export type PlexPinStart = {
+  id: number;
+  code: string;
+  authUrl: string;
+};
+
+export type PlexServerConnection = {
+  name: string;
+  url: string;
+  token: string;
+  local: boolean;
+};
+
+export type PlexPinPoll = {
+  authorized: boolean;
+  username?: string;
+  servers?: PlexServerConnection[];
 };
 
 export type JellyfinStatus = {
@@ -392,7 +483,7 @@ export type ScheduleEntry = {
   mediaId: string;
   title?: string;
   path?: string;
-  schedulingGroup?: string;
+  collectionName?: string;
   startMs: number;
   endMs: number;
   offsetMs?: number;
@@ -403,7 +494,7 @@ export type ChannelMedia = {
   mediaId: string;
   title?: string;
   path?: string;
-  schedulingGroup?: string;
+  collectionName?: string;
   durationMs: number;
   codecCheckPassed: boolean;
   codecCheckReason?: string;
@@ -437,7 +528,7 @@ export type ChannelFillerAsset = FillerAsset & {
   channelEnabled: boolean;
   path: string;
   title?: string;
-  schedulingGroup?: string;
+  collectionName?: string;
   durationMs: number;
   packageId?: string;
   packageStatus: string;
@@ -453,24 +544,52 @@ export type ChannelFillerAssetList = {
   assets: ChannelFillerAsset[];
 };
 
+export type SubtitleWarning = {
+  code: string;
+  message: string;
+  language?: string;
+  title?: string;
+  streamIndex?: number;
+};
+
 export type MediaPackageCandidate = {
   mediaId: string;
   title?: string;
   path: string;
-  schedulingGroup?: string;
+  collectionName?: string;
+  sourceRef?: string;
   durationMs: number;
+  videoBitrateBps?: number;
   packageId?: string;
   packageStatus: "missing" | "pending" | "processing" | "failed" | string;
   packageProfile?: string;
   packageError?: string;
   packagedDurationMs?: number;
+  packageBytes?: number;
   updatedAtMs?: number;
   selectable: boolean;
+  subtitleWarnings?: SubtitleWarning[];
+  sizeEstimate?: SizeEstimate;
+};
+
+// SizeEstimate is the estimated finished package size for a media under the
+// selected profile. expectedBytes is meaningful only when expectedKnown is true
+// (exact for copy/target/cbr; unknown for crf/capped-crf until an empirical
+// bitrate exists). maxBytes is the worst-case ceiling.
+export type SizeEstimate = {
+  mode: "copy" | "crf" | "capped-crf" | "target" | "cbr" | "unknown";
+  expectedBytes: number;
+  expectedKnown: boolean;
+  maxBytes: number;
 };
 
 export type MediaPackageCandidateList = {
   profile: string;
   count: number;
+  // estimateSamples is the number of finished packages behind the empirical
+  // expected-size estimate for this profile (CRF profiles only; 0 = no data, so
+  // rows show a ceiling instead of an expected size).
+  estimateSamples?: number;
   statusCounts: Array<{
     status: string;
     count: number;
@@ -509,6 +628,11 @@ export type PackageProfile = {
     bitrate?: string;
     channels?: number;
     sampleHz?: number;
+  };
+  subtitles?: {
+    mode?: string;
+    language?: string;
+    fallback?: string;
   };
 };
 
@@ -567,6 +691,7 @@ export type LocalWorkerItem = {
 export type EncoderListResponse = {
   encoders: EncoderListItem[];
   localWorker: LocalWorkerItem;
+  onDemandEncodings?: OnDemandEncodingItem[];
 };
 
 export type EncoderRegisterResponse = {
@@ -574,6 +699,24 @@ export type EncoderRegisterResponse = {
   name: string;
   apiKey: string;
   createdAtMs: number;
+};
+
+export type OnDemandEncodingItem = {
+  encodingId: string;
+  channelId: string;
+  channelName: string;
+  scheduleEntryId: string;
+  mediaId: string;
+  mediaTitle: string;
+  profile: string;
+  state: string;
+  processRunning: boolean;
+  spawnedAtMs: number;
+  firstSegmentAtMs: number;
+  lastProgressMs: number;
+  segmentCount: number;
+  updatedAtMs: number;
+  lastError?: string;
 };
 
 export type EncoderDownloadEntry = {
@@ -629,18 +772,30 @@ export type PlaybackStats = {
   paused: boolean;
   currentTime: number;
   playbackRate: number;
+  videoWidth: number;
+  videoHeight: number;
+  playerWidth: number;
+  playerHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
   droppedFrames: number;
   totalFrames: number;
   bufferAhead: number;
   buffered: string;
   hlsLatency: number | null;
   liveSyncPosition: number | null;
+  bandwidthEstimate: number | null;
+  currentLevel: number | null;
   lastFrag: string;
   lastEvent: string;
   playbackEngine: string;
   errors: string[];
   streamUnavailable: boolean;
   streamUnavailableReason?: string;
+  // A terminal, non-retryable playback failure for the current source (e.g. the
+  // device can't decode the stream's video codec). Unlike streamUnavailable,
+  // retrying won't help, so the UI shows it without a "retrying…" hint.
+  fatalError?: string;
 };
 
 export type StreamProbe = {
@@ -668,18 +823,6 @@ export type MediaLibrary = {
   type: string;
 };
 
-export type PolicyDraft = { profile: string; prefillHours: string; mediaKind: "video" | "music"; loaded: boolean };
-
-export type ProfileReadiness = {
-  channelId: string;
-  profile: string;
-  total: number;
-  ready: number;
-  pending: number;
-  processing: number;
-  failed: number;
-  missing: number;
-};
 export type RowBusy = Record<string, boolean>;
 export type RowStatus = Record<string, string>;
 export type ScheduleEditTarget =
@@ -700,7 +843,7 @@ export type ScheduleEditTarget =
 export type DraftChannelConfig = {
   packageProfile: string;
   displayName: string;
-  playbackMode?: "packaged" | "plex_relay";
+	playbackMode?: "packaged";
   scheduleMode?: "back_to_back" | "slot_grid" | string;
   slotDurationMs?: number;
   prefillMode?: "eager" | "on_demand";
@@ -712,7 +855,7 @@ export type ScheduleInsertItem = {
   mediaId: string;
   title?: string;
   path?: string;
-  schedulingGroup?: string;
+  collectionName?: string;
   durationMs: number;
   packagedDurationMs?: number;
   packageReady: boolean;

@@ -2,10 +2,10 @@ package admin
 
 import (
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/routes"
 )
 
 type playableSourcesResponse struct {
@@ -32,6 +32,7 @@ type playableSource struct {
 	PackageProfile        string              `json:"packageProfile,omitempty"`
 	AdaptiveBitrate       bool                `json:"adaptiveBitrate"`
 	PrefillMode           string              `json:"prefillMode,omitempty"`
+	PlaybackMode          string              `json:"playbackMode,omitempty"`
 	NowPlaying            *externalNowPlaying `json:"nowPlaying,omitempty"`
 }
 
@@ -50,18 +51,18 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				nowPlaying = nil
 			}
-		sources = append(sources, playableSource{
-			ID:              ch.ID,
-			DisplayName:     ch.DisplayName,
-			ArtworkURL:      artworkForExternalChannel(ch, nowPlaying),
-			Kind:            "live",
-			PlaybackType:    "hls",
-			Status:          "live",
-			ManifestURL:     externalHLSManifestURL(ch.ID),
-			Enabled:         ch.Enabled,
-			AdaptiveBitrate: false,
-			NowPlaying:      nowPlaying,
-		})
+			sources = append(sources, playableSource{
+				ID:              ch.ID,
+				DisplayName:     ch.DisplayName,
+				ArtworkURL:      artworkForExternalChannel(ch, nowPlaying),
+				Kind:            "live",
+				PlaybackType:    "hls",
+				Status:          a.externalChannelStatus(r.Context(), ch),
+				ManifestURL:     routes.ExternalHLSManifest(ch.ID),
+				Enabled:         ch.Enabled,
+				AdaptiveBitrate: false,
+				NowPlaying:      nowPlaying,
+			})
 			continue
 		}
 		now, err := a.channelNowForRow(r.Context(), nowMs, ch, cacheByChannel[ch.ID])
@@ -76,7 +77,7 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 			Kind:                  "vod",
 			PlaybackType:          "hls",
 			Status:                now.Status,
-			ManifestURL:           hlsManifestURL(now.ID),
+			ManifestURL:           routes.HLSManifest(now.ID),
 			Enabled:               now.Enabled,
 			Current:               now.Current,
 			Next:                  now.Next,
@@ -87,6 +88,7 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 			PackageProfile:        now.PackageProfile,
 			AdaptiveBitrate:       now.AdaptiveBitrate,
 			PrefillMode:           now.PrefillMode,
+			PlaybackMode:          string(ch.PlaybackMode),
 		})
 	}
 	writeJSON(w, playableSourcesResponse{
@@ -94,12 +96,4 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 		Sources:     sources,
 		GeneratedAt: a.now().UTC().Format(time.RFC3339Nano),
 	})
-}
-
-func hlsManifestURL(channelID string) string {
-	return "/hls/channel/" + url.PathEscape(channelID) + "/stream.m3u8"
-}
-
-func externalHLSManifestURL(channelID string) string {
-	return "/hls/external/" + url.PathEscape(channelID) + "/stream.m3u8"
 }

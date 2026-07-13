@@ -102,6 +102,3 @@ func OpenReadWrite(path string) (*sql.DB, error) {
 	}
 	return db, nil
 }
-
-// ApplySchema executes the embedded schema and runs version-gated Go-side
-// migrations. Idempotent — writers may call it on every startup. The

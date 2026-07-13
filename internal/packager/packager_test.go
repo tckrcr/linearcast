@@ -8,7 +8,11 @@ import (
 	"testing"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/ffmpegexec"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
+	"github.com/tckrcr/linearcast/internal/scheduler"
+	"github.com/tckrcr/linearcast/internal/subtitlepolicy"
 )
 
 func makeStream(codecType, codecName string) probeStream {
@@ -23,6 +27,242 @@ func makeAVProbe() sourceProbe {
 	audio.Index = 1
 	audio.Tags.Language = "eng"
 	return sourceProbe{Streams: []probeStream{video, audio}}
+}
+
+func makeAVProbeWithSubtitle(streamIndex int, language string, forced bool) sourceProbe {
+	probe := makeAVProbe()
+	sub := makeStream("subtitle", "hdmv_pgs_subtitle")
+	sub.Index = streamIndex
+	sub.Tags.Language = language
+	if forced {
+		sub.Disposition.Forced = 1
+	}
+	probe.Streams = append(probe.Streams, sub)
+	return probe
+}
+
+// noBurn is the no-op burn decision for ffmpegArgs calls that don't exercise
+// subtitle burn-in.
+var noBurn subtitlepolicy.Decision
+
+func makeAVProbeWithTextSubtitles(forced bool) sourceProbe {
+	probe := makeAVProbe()
+	ara := makeStream("subtitle", "subrip")
+	ara.Index = 2
+	ara.Tags.Language = "ara"
+	eng := makeStream("subtitle", "subrip")
+	eng.Index = 3
+	eng.Tags.Language = "eng"
+	if forced {
+		eng.Disposition.Forced = 1
+	}
+	probe.Streams = append(probe.Streams, ara, eng)
+	return probe
+}
+
+func requireFFmpegTools(t *testing.T) {
+	t.Helper()
+	if _, err := ffmpegexec.Resolve("ffmpeg"); err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+	if _, err := ffmpegexec.Resolve("ffprobe"); err != nil {
+		t.Skipf("ffprobe unavailable: %v", err)
+	}
+}
+
+func generateTinySource(t *testing.T, path string) {
+	t.Helper()
+	cmd, err := ffmpegexec.CommandContext(context.Background(), "ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24",
+		"-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
+		"-t", "2",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p",
+		"-c:a", "aac",
+		path,
+	)
+	if err != nil {
+		t.Fatalf("resolve ffmpeg: %v", err)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate source: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+}
+
+func TestResolveSubtitleDecisionForcedBurn(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	got := resolveSubtitleDecision(profile, makeAVProbeWithSubtitle(4, "eng", true))
+	if got.Action != subtitlepolicy.ActionBurn || got.StreamIndex != 4 || got.Source != db.TrackSourceEmbeddedBitmap {
+		t.Fatalf("forced bitmap decision = %+v, want burn stream 4 bitmap", got)
+	}
+	got = resolveSubtitleDecision(profile, makeAVProbeWithTextSubtitles(true))
+	if got.Action != subtitlepolicy.ActionBurn || got.StreamIndex != 3 || got.Source != db.TrackSourceEmbedded {
+		t.Fatalf("forced text decision = %+v, want burn stream 3 text", got)
+	}
+	if got := resolveSubtitleDecision(profile, makeAVProbeWithSubtitle(4, "eng", false)); got.Action == subtitlepolicy.ActionBurn {
+		t.Fatalf("non-forced decision = %+v, want no burn", got)
+	}
+	copyProfile, ok := packageprofile.Lookup(packageprofile.HEVCCopySourceName)
+	if !ok {
+		t.Fatalf("missing copy profile")
+	}
+	if got := resolveSubtitleDecision(copyProfile, makeAVProbeWithSubtitle(4, "eng", true)); got.Action == subtitlepolicy.ActionBurn {
+		t.Fatalf("copy profile decision = %+v, want no burn", got)
+	}
+}
+
+func TestFFmpegArgsBurnForcedSubtitleForTranscodeProfile(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	probe := makeAVProbeWithSubtitle(4, "eng", true)
+	decision := resolveSubtitleDecision(profile, probe)
+	args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", probe, profile, nil, decision, nil)
+	if err != nil {
+		t.Fatalf("ffmpeg args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-filter_complex [0:0][0:4]overlay=eof_action=pass") {
+		t.Fatalf("args missing subtitle burn filter: %s", joined)
+	}
+	if strings.Contains(joined, "-map 0:0") {
+		t.Fatalf("args mapped raw video instead of burn filter output: %s", joined)
+	}
+}
+
+func TestFFmpegArgsBurnForcedTextSubtitle(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	probe := makeAVProbeWithTextSubtitles(true)
+	decision := resolveSubtitleDecision(profile, probe)
+	args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", probe, profile, nil, decision, nil)
+	if err != nil {
+		t.Fatalf("ffmpeg args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	// si=1: the forced eng track is the second subtitle stream in the source.
+	want := "-filter_complex [0:0]scale=-2:'min(ih,1080)',subtitles=filename=/in.mkv:si=1,format=yuv420p[v]"
+	if !strings.Contains(joined, want) {
+		t.Fatalf("args missing text burn filter %q: %s", want, joined)
+	}
+	if strings.Contains(joined, "overlay") {
+		t.Fatalf("text burn used bitmap overlay: %s", joined)
+	}
+	if strings.Contains(joined, "-map 0:0") {
+		t.Fatalf("args mapped raw video instead of burn filter output: %s", joined)
+	}
+	if strings.Contains(joined, "-pix_fmt") {
+		t.Fatalf("burn filter output should pin format in-filter, not via -pix_fmt: %s", joined)
+	}
+}
+
+func TestFFmpegArgsBurnForcedTextSubtitleTonemapsHDRSource(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	probe := makeAVProbeWithTextSubtitles(true)
+	probe.Streams[0].ColorTransfer = "smpte2084"
+	decision := resolveSubtitleDecision(profile, probe)
+	args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", probe, profile, nil, decision, nil)
+	if err != nil {
+		t.Fatalf("ffmpeg args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	tonemapIdx := strings.Index(joined, "zscale=t=linear")
+	subtitlesIdx := strings.Index(joined, "subtitles=filename=")
+	if tonemapIdx < 0 {
+		t.Fatalf("HDR text burn missing SDR tone-map: %s", joined)
+	}
+	if subtitlesIdx < tonemapIdx {
+		t.Fatalf("text must render after the tone-map, got: %s", joined)
+	}
+}
+
+func TestSubtitlesFilterPath(t *testing.T) {
+	got := subtitlesFilterPath(`/tmp/cache/Tom's file [4K], part 1: intro.mkv`)
+	want := `/tmp/cache/Tom\\\'s file \[4K\]\, part 1\\: intro.mkv`
+	if got != want {
+		t.Fatalf("subtitlesFilterPath = %q, want %q", got, want)
+	}
+}
+
+func TestExtractSubtitleTracksUsesPackageSidecarPath(t *testing.T) {
+	conn, err := db.OpenReadWrite(newWorkerTestDB(t))
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec(`INSERT INTO media
+		(id, path, directory, duration_ms, container, video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', '/tmp/m1.mkv', '/tmp', 1000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	if _, err := conn.Exec(`INSERT INTO media_packages
+		(id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
+		VALUES ('pkg', 'm1', 'prof', 'processing', 0, 0)`); err != nil {
+		t.Fatalf("insert package: %v", err)
+	}
+
+	root := t.TempDir()
+	legacyDir := filepath.Join(root, "cache", "subtitles", "m1")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	legacyPath := filepath.Join(legacyDir, "s2.vtt")
+	if err := os.WriteFile(legacyPath, []byte("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nlegacy\n"), 0o644); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+	if err := db.UpsertPackageTrack(context.Background(), conn, db.PackageTrack{
+		PackageID:   "pkg",
+		Kind:        "subtitle",
+		StreamIndex: 2,
+		Language:    "eng",
+		Codec:       "webvtt",
+		Source:      db.TrackSourceEmbedded,
+		Path:        &legacyPath,
+	}); err != nil {
+		t.Fatalf("upsert legacy track: %v", err)
+	}
+
+	packageRoot := filepath.Join(root, "cache", "packages", "m1", "prof")
+	subtitleDir := layout.PackageSubtitleDir(packageRoot)
+	wantPath := filepath.Join(subtitleDir, layout.SubtitleFileName(2))
+	if err := os.MkdirAll(subtitleDir, 0o755); err != nil {
+		t.Fatalf("mkdir canonical: %v", err)
+	}
+	if err := os.WriteFile(wantPath, []byte("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\ncanonical\n"), 0o644); err != nil {
+		t.Fatalf("write canonical: %v", err)
+	}
+
+	sub := makeStream("subtitle", "subrip")
+	sub.Index = 2
+	sub.Tags.Language = "eng"
+	probe := sourceProbe{Streams: []probeStream{sub}}
+
+	extractSubtitleTracks(context.Background(), conn, "/tmp/m1.mkv", packageRoot, "pkg", probe, []string{"eng"})
+
+	gotBytes, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatalf("read canonical sidecar: %v", err)
+	}
+	if !strings.Contains(string(gotBytes), "canonical") {
+		t.Fatalf("canonical sidecar was unexpectedly overwritten:\n%s", gotBytes)
+	}
+
+	tracks, err := db.PackageTracksByPackageID(context.Background(), conn, "pkg")
+	if err != nil {
+		t.Fatalf("tracks: %v", err)
+	}
+	if len(tracks) != 1 || tracks[0].Path == nil || *tracks[0].Path != wantPath {
+		t.Fatalf("track path = %+v, want %s", tracks, wantPath)
+	}
 }
 
 func TestPackagedDurationShortfall(t *testing.T) {
@@ -112,7 +352,7 @@ func TestFFmpegArgsForTranscodeProfile(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing default profile")
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
+	args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", makeAVProbe(), profile, nil, noBurn, nil)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -125,14 +365,36 @@ func TestFFmpegArgsForTranscodeProfile(t *testing.T) {
 		"-maxrate 8000k",
 		"-bufsize 16000k",
 		"-pix_fmt yuv420p",
-		"-g 144",
-		"-force_key_frames expr:gte(t,n_forced*6)",
+		"-g 48",
+		"-force_key_frames expr:gte(t,n_forced*2)",
 		"-c:a aac",
-		"-b:a 192k",
+		"-b:a 256k",
 		"-ac 2",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("args missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestFFmpegArgsForPackagedTranscodeProfileUsesDurableCadence(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	args, err := ffmpegArgs("/in.mkv", "/out", PackagedSegmentMs, "veryfast", makeAVProbe(), profile, nil, noBurn, nil)
+	if err != nil {
+		t.Fatalf("ffmpeg args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-g 144",
+		"-keyint_min 144",
+		"-force_key_frames expr:gte(t,n_forced*6)",
+		"-hls_time 6",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("packaged args missing %q: %s", want, joined)
 		}
 	}
 }
@@ -172,7 +434,7 @@ func TestFFmpegArgsSelectsMainAudioTrack(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing default profile")
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", probe, profile, nil, -1)
+	args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", probe, profile, nil, noBurn, nil)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -195,7 +457,7 @@ func TestFFmpegArgsForCopyProfileCopiesVideo(t *testing.T) {
 			Bitrate: "192k",
 		},
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
+	args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", makeAVProbe(), profile, nil, noBurn, nil)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -234,7 +496,7 @@ func TestFFmpegArgsForVideoToolboxProfile(t *testing.T) {
 			SampleHz: 48000,
 		},
 	}
-	args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
+	args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", makeAVProbe(), profile, nil, noBurn, nil)
 	if err != nil {
 		t.Fatalf("ffmpeg args: %v", err)
 	}
@@ -288,7 +550,7 @@ func TestFFmpegArgsForScaledBitrateProfiles(t *testing.T) {
 				SampleHz: 48000,
 			},
 		}
-		args, err := ffmpegArgs("/in.mkv", "/out", 6000, "veryfast", makeAVProbe(), profile, nil, -1)
+		args, err := ffmpegArgs("/in.mkv", "/out", scheduler.TargetSegmentMs, "veryfast", makeAVProbe(), profile, nil, noBurn, nil)
 		if err != nil {
 			t.Fatalf("%s ffmpeg args: %v", tc.name, err)
 		}
@@ -299,7 +561,7 @@ func TestFFmpegArgsForScaledBitrateProfiles(t *testing.T) {
 			tc.wantMaxrate,
 			tc.wantBufsize,
 			"-c:v libx264",
-			"-force_key_frames expr:gte(t,n_forced*6)",
+			"-force_key_frames expr:gte(t,n_forced*2)",
 		} {
 			if !strings.Contains(joined, want) {
 				t.Fatalf("%s: args missing %q:\n  %s", tc.name, want, joined)
@@ -383,7 +645,7 @@ func TestPackageOneMissingSourceFailsWithoutClearingExistingPackageRoot(t *testi
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Fatalf("sentinel should not be removed before source validation: %v", err)
 	}
-	pkg, err := db.MediaPackageByID(context.Background(), conn, "m-missing-source-h264-main-1080p")
+	pkg, err := db.MediaPackageByID(context.Background(), conn, "m-missing-source-h264-1080p-8mbps")
 	if err != nil || pkg == nil {
 		t.Fatalf("lookup package: pkg=%v err=%v", pkg, err)
 	}
@@ -392,6 +654,82 @@ func TestPackageOneMissingSourceFailsWithoutClearingExistingPackageRoot(t *testi
 	}
 	if pkg.PackageRoot == nil || *pkg.PackageRoot != packageRoot {
 		t.Fatalf("package root=%+v, want %s", pkg.PackageRoot, packageRoot)
+	}
+}
+
+func TestPackageOneUsesProfileRootWhenPackageIDHasLegacySubtitleIdentity(t *testing.T) {
+	requireFFmpegTools(t)
+	dbPath := newWorkerTestDB(t)
+	conn, err := db.OpenReadWrite(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+
+	mediaPath := filepath.Join(t.TempDir(), "source.mp4")
+	generateTinySource(t, mediaPath)
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', ?, ?, 2000, 'mp4', 'h264', 72, 'aac', 1, 0)`, mediaPath, filepath.Dir(mediaPath)); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+
+	outputRoot := t.TempDir()
+	legacyPackageID := layout.ID("m1", DefaultProfile) + "-burn-forced-disposition-s2-eng"
+	res, err := PackageOne(context.Background(), conn, Options{
+		MediaPath:       mediaPath,
+		OutputRoot:      outputRoot,
+		Profile:         DefaultProfile,
+		PackageID:       legacyPackageID,
+		TargetSegmentMs: 1000,
+		NowMs:           500,
+	})
+	if err != nil {
+		t.Fatalf("PackageOne: %v", err)
+	}
+
+	wantRoot := layout.PackageRoot(outputRoot, "m1", DefaultProfile)
+	legacyRoot := filepath.Join(outputRoot, "m1", legacyPackageID)
+	if res.PackageID != legacyPackageID {
+		t.Fatalf("result package id=%q, want %q", res.PackageID, legacyPackageID)
+	}
+	if res.PackageRoot != wantRoot || res.InitSegmentPath != layout.InitPath(wantRoot) {
+		t.Fatalf("result paths root=%q init=%q, want root=%q init=%q", res.PackageRoot, res.InitSegmentPath, wantRoot, layout.InitPath(wantRoot))
+	}
+	if _, err := os.Stat(wantRoot); err != nil {
+		t.Fatalf("canonical profile root missing: %v", err)
+	}
+	if _, err := os.Stat(legacyRoot); !os.IsNotExist(err) {
+		t.Fatalf("legacy package-id root exists: %s stat err=%v", legacyRoot, err)
+	}
+
+	pkg, err := db.MediaPackageByID(context.Background(), conn, legacyPackageID)
+	if err != nil || pkg == nil {
+		t.Fatalf("lookup package: pkg=%v err=%v", pkg, err)
+	}
+	if pkg.PackageRoot == nil || *pkg.PackageRoot != wantRoot {
+		t.Fatalf("package root=%+v, want %s", pkg.PackageRoot, wantRoot)
+	}
+	if pkg.InitSegmentPath == nil || *pkg.InitSegmentPath != layout.InitPath(wantRoot) {
+		t.Fatalf("init path=%+v, want %s", pkg.InitSegmentPath, layout.InitPath(wantRoot))
+	}
+	segs, err := db.PackagedSegments(context.Background(), conn, legacyPackageID)
+	if err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+	if len(segs) == 0 {
+		t.Fatal("no packaged segments recorded")
+	}
+	for _, seg := range segs {
+		if seg.Path == nil {
+			t.Fatalf("segment path nil: %+v", seg)
+		}
+		if !strings.HasPrefix(filepath.Clean(*seg.Path), wantRoot+string(os.PathSeparator)) {
+			t.Fatalf("segment path %q not under canonical root %q", *seg.Path, wantRoot)
+		}
+		if strings.HasPrefix(filepath.Clean(*seg.Path), legacyRoot+string(os.PathSeparator)) {
+			t.Fatalf("segment path %q under legacy package-id root %q", *seg.Path, legacyRoot)
+		}
 	}
 }
 

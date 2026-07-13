@@ -3,12 +3,10 @@ package admin
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
@@ -63,7 +61,7 @@ func TestHandleChannelPolicySetFieldsWireShape(t *testing.T) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile, package_prefill_ms
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 5000)`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 5000)`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 
@@ -72,15 +70,14 @@ func TestHandleChannelPolicySetFieldsWireShape(t *testing.T) {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 
-	want := `{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":"h264-main-1080p","adaptiveBitrate":false,"packagePrefillMs":5000,"mediaKind":"video"}` + "\n"
+	want := `{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":"h264-1080p-8mbps","adaptiveBitrate":false,"packagePrefillMs":5000,"mediaKind":"video"}` + "\n"
 	if got := res.Body.String(); got != want {
 		t.Fatalf("policy body mismatch:\n got: %s\nwant: %s", got, want)
 	}
 }
 
-func TestHandleChannelPolicyUpdateProfileNotReadyWireShape(t *testing.T) {
+func TestHandleChannelPolicyUpdateRejectsProfileChange(t *testing.T) {
 	app, conn := testAdminApp(t)
-	app.now = func() time.Time { return time.UnixMilli(0) }
 	insertDeleteFixture(t, conn, true)
 
 	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
@@ -103,47 +100,14 @@ func TestHandleChannelPolicyUpdateProfileNotReadyWireShape(t *testing.T) {
 	if res.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s, want conflict", res.Code, res.Body.String())
 	}
-	result := res.Result()
-	defer result.Body.Close()
-	if got := result.Header.Get("Content-Type"); got != "application/json" {
-		t.Fatalf("content-type=%q, want application/json", got)
+	if code := errorCode(t, res); code != "unsupported_policy_update" {
+		t.Fatalf("error code=%q, want unsupported_policy_update", code)
 	}
-	if got := result.Header.Get("Cache-Control"); got != "" {
-		t.Fatalf("cache-control=%q, want empty wire header", got)
+	ch, err := db.ChannelByID(context.Background(), conn, "ch")
+	if err != nil {
+		t.Fatalf("lookup channel: %v", err)
 	}
-	var body struct {
-		Error     string `json:"error"`
-		Code      string `json:"code"`
-		Message   string `json:"message"`
-		Readiness struct {
-			Profile    string `json:"profile"`
-			Total      int64  `json:"total"`
-			Ready      int64  `json:"ready"`
-			Pending    int64  `json:"pending"`
-			Processing int64  `json:"processing"`
-			Failed     int64  `json:"failed"`
-			Missing    int64  `json:"missing"`
-		} `json:"readiness"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if body.Error != "" {
-		t.Fatalf("body.error=%q, want custom conflict body without error field", body.Error)
-	}
-	if body.Code != "profile_not_ready" {
-		t.Fatalf("body.code=%q, want profile_not_ready", body.Code)
-	}
-	if body.Message != "1 schedule entries in the next 48h lack a ready package at custom-h264-1080p — queue packaging first or pass force:true" {
-		t.Fatalf("message=%q", body.Message)
-	}
-	if body.Readiness.Profile != "custom-h264-1080p" ||
-		body.Readiness.Total != 1 ||
-		body.Readiness.Ready != 0 ||
-		body.Readiness.Pending != 0 ||
-		body.Readiness.Processing != 0 ||
-		body.Readiness.Failed != 0 ||
-		body.Readiness.Missing != 1 {
-		t.Fatalf("unexpected readiness: %+v", body.Readiness)
+	if ch == nil || ch.RequiredPackageProfile != "h264-1080p-8mbps" {
+		t.Fatalf("channel profile changed: %+v", ch)
 	}
 }

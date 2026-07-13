@@ -30,6 +30,19 @@ func main() {
 		log.Fatal("LINEARCAST_DB is required")
 	}
 
+	// backup and restore manage their own database access: backup snapshots the
+	// live database read-only (and must not apply schema/seed to it), and
+	// restore swaps files while services are stopped and must not open the
+	// target read-write first.
+	switch sub {
+	case "backup":
+		cmdBackup(dbPath, os.Args[2:])
+		return
+	case "restore":
+		cmdRestore(dbPath, os.Args[2:])
+		return
+	}
+
 	conn, err := db.OpenReadWrite(dbPath)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
@@ -46,6 +59,8 @@ func main() {
 	switch sub {
 	case "check":
 		cmdCheck(conn, os.Args[2:])
+	case "validate-segments":
+		cmdValidateSegments(conn, os.Args[2:])
 	case "migrate":
 		cmdMigrate(conn)
 	case "set-group":
@@ -58,8 +73,11 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "Usage: linearcast-maint <maintenance-command> [args]")
 	fmt.Fprintln(os.Stderr, "  check [--channel <id>] [--hours N] [--from <iso8601>] [--gap-ms N] [--all]")
+	fmt.Fprintln(os.Stderr, "  validate-segments [--channel <id>] [--hours N] [--from <iso8601>] [--all] [--requeue]")
 	fmt.Fprintln(os.Stderr, "  migrate")
 	fmt.Fprintln(os.Stderr, "  set-group <media-path> <group | ->")
+	fmt.Fprintln(os.Stderr, "  backup [--dir <dir>] [--keep N]")
+	fmt.Fprintln(os.Stderr, "  restore [--confirm] <snapshot.db>")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Operator channel/playlist/Plex writes were removed; use the admin API/UI.")
 	fmt.Fprintln(os.Stderr, "Env: LINEARCAST_DB")
@@ -86,9 +104,9 @@ func cmdMigrate(conn *sql.DB) {
 	fmt.Printf("schema ok; normalized_channels=%d\n", n)
 }
 
-// cmdSetGroup overrides scheduling_group on a single media row. Pass "-"
-// (or the literal string "null") to clear the value, exposing it again to
-// the next ingest's automatic derivation.
+// cmdSetGroup overrides the collection on a single media row. Pass "-" (or
+// the literal string "null") to clear the value, exposing it again to the next
+// ingest's automatic derivation.
 func cmdSetGroup(conn *sql.DB, args []string) {
 	positional, _ := splitArgs(args)
 	if len(positional) != 2 {
@@ -114,13 +132,13 @@ func cmdSetGroup(conn *sql.DB, args []string) {
 		if err := db.SetMediaSchedulingGroup(context.Background(), conn, m.ID, sql.NullString{}); err != nil {
 			log.Fatalf("clear: %v", err)
 		}
-		fmt.Printf("cleared scheduling_group for media=%s (%s)\n", m.ID, pathAbs)
+		fmt.Printf("cleared collection for media=%s (%s)\n", m.ID, pathAbs)
 		return
 	}
 	if err := db.SetMediaSchedulingGroup(context.Background(), conn, m.ID, sql.NullString{String: group, Valid: true}); err != nil {
 		log.Fatalf("set: %v", err)
 	}
-	fmt.Printf("set: media=%s scheduling_group=%q\n", m.ID, group)
+	fmt.Printf("set: media=%s collection=%q\n", m.ID, group)
 }
 
 func parseISO8601(s string) (int64, error) {

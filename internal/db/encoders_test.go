@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const testProfile = "h264-main-1080p"
+const testProfile = "h264-1080p-8mbps"
 
 // encoderTestEnv bundles a writable DB + a registered encoder + a media row +
 // a channel and channel_media row, since every job-op test needs those. Tests
@@ -970,46 +970,3 @@ func TestRequeueEncoderJobs_RecoversOwnLeasesBeforeExpiry(t *testing.T) {
 	}
 }
 
-// RequeueLeaselessProcessing (transitional) drains pre-lease processing orphans
-// without touching leased rows.
-func TestRequeueLeaselessProcessing_OnlyLeaseFreeRows(t *testing.T) {
-	env := newEncoderTestEnv(t)
-	ctx := context.Background()
-	// Leased processing row — must be left alone.
-	mustClaim(t, env.conn, ClaimRequest{
-		MediaID: "m1", Profile: testProfile, PackageID: "pkg-m1",
-		EncoderID: env.encoderID, LeaseTTL: 10 * time.Second, NowMs: 1_000,
-	})
-	// Pre-lease orphan: a processing row with no encoder_jobs lease.
-	if _, err := env.conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
-		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
-		VALUES ('m2', '/tmp/m2.mkv', '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
-		t.Fatalf("seed m2: %v", err)
-	}
-	if _, err := env.conn.Exec(`INSERT INTO media_packages
-		(id, media_id, rendition_profile, status, attempts, created_at_ms, updated_at_ms)
-		VALUES ('pkg-m2', 'm2', ?, 'processing', 1, 0, 0)`, testProfile); err != nil {
-		t.Fatalf("seed orphan: %v", err)
-	}
-	n, err := RequeueLeaselessProcessing(ctx, env.conn, 5, 2_000)
-	if err != nil {
-		t.Fatalf("requeue leaseless: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("want 1 leaseless requeue, got %d", n)
-	}
-	var orphan, leased string
-	env.conn.QueryRow(`SELECT status FROM media_packages WHERE id='pkg-m2'`).Scan(&orphan)
-	env.conn.QueryRow(`SELECT status FROM media_packages WHERE id='pkg-m1'`).Scan(&leased)
-	if PackageStatus(orphan) != PackageStatusPending {
-		t.Fatalf("orphan status=%s, want pending", orphan)
-	}
-	if PackageStatus(leased) != PackageStatusProcessing {
-		t.Fatalf("leased status=%s, want processing", leased)
-	}
-	var nLease int
-	env.conn.QueryRow(`SELECT COUNT(*) FROM encoder_jobs WHERE package_id='pkg-m1'`).Scan(&nLease)
-	if nLease != 1 {
-		t.Fatalf("leased row lost its lease (%d remain)", nLease)
-	}
-}

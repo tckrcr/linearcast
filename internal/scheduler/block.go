@@ -3,6 +3,7 @@ package scheduler
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
@@ -60,7 +61,7 @@ func BuildEntriesBlock(channelID string, media []db.Media, cursors map[string]db
 		fitAny := false
 		for blockCount < BlockSize && startIdx < len(groupMedia) && cur < wantEndMs {
 			m := groupMedia[startIdx]
-			dur := ClipTo6s(m.DurationMs)
+			dur := ClipToGrid(m.DurationMs)
 			if dur <= 0 {
 				startIdx++
 				continue
@@ -100,19 +101,57 @@ func BuildEntriesBlock(channelID string, media []db.Media, cursors map[string]db
 }
 
 // groupMedia buckets media by scheduling_group, with NULL-group items
-// each given their own singleton group keyed by soloPrefix+mediaID. Bucket
-// insertion order follows the input slice, which the caller pre-orders by
-// channel_media's linked-list chain (see EligibleChannelMedia).
+// each given their own singleton group keyed by soloPrefix+mediaID. Collection
+// groups sort episode-like rows by season/episode so block playback follows
+// narrative order instead of channel insertion order.
 func groupMedia(media []db.Media) map[string][]db.Media {
 	out := map[string][]db.Media{}
 	for _, m := range media {
-		g := m.SchedulingGroup
+		g := m.CollectionName
 		if g == "" {
 			g = soloPrefix + m.ID
 		}
 		out[g] = append(out[g], m)
 	}
+	for g := range out {
+		sort.Slice(out[g], func(i, j int) bool {
+			return lessGroupMedia(out[g][i], out[g][j])
+		})
+	}
 	return out
+}
+
+func lessGroupMedia(a, b db.Media) bool {
+	if cmp := compareMaybeInt64(a.SeasonNumber, b.SeasonNumber); cmp != 0 {
+		return cmp < 0
+	}
+	if cmp := compareMaybeInt64(a.EpisodeNumber, b.EpisodeNumber); cmp != 0 {
+		return cmp < 0
+	}
+	if cmp := strings.Compare(a.Title, b.Title); cmp != 0 {
+		return cmp < 0
+	}
+	if cmp := strings.Compare(a.Path, b.Path); cmp != 0 {
+		return cmp < 0
+	}
+	return a.ID < b.ID
+}
+
+func compareMaybeInt64(a, b *int64) int {
+	switch {
+	case a != nil && b == nil:
+		return -1
+	case a == nil && b != nil:
+		return 1
+	case a == nil && b == nil:
+		return 0
+	case *a < *b:
+		return -1
+	case *a > *b:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // pickNextGroup picks the group with the smallest LastEndMs (zero for

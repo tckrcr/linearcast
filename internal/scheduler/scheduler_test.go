@@ -145,6 +145,89 @@ func TestExtendChannelContinuesFromExistingSchedule(t *testing.T) {
 	}
 }
 
+func TestExtendChannelSkipsDeletedTailMedia(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linearcast.db")
+	conn, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+	if err := db.ApplySchema(context.Background(), conn); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
+		ID:              "ch",
+		DisplayName:     "Channel",
+		SourceDirectory: "/tmp",
+		Ordering:        "alphabetical",
+		CreatedAtMs:     1,
+	}); err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	for _, id := range []string{"m1", "m2"} {
+		if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+			video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+			VALUES (?, ?, '/tmp', 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`, id, "/tmp/"+id+".mkv"); err != nil {
+			t.Fatalf("insert media %s: %v", id, err)
+		}
+		if _, err := db.AddChannelMedia(context.Background(), conn, "ch", id, 0); err != nil {
+			t.Fatalf("add channel media %s: %v", id, err)
+		}
+	}
+	seedReadyPackage(t, conn, "m1")
+	seedReadyPackage(t, conn, "m2")
+
+	start := Align6s(time.Now().UTC().Add(10 * time.Minute).UnixMilli())
+	seed := []db.ScheduleEntry{
+		{ID: "se1", ChannelID: "ch", StartMs: start, MediaID: "m1", OffsetMs: 0, DurationMs: 12000, CreatedAtMs: 0},
+		{ID: "se2", ChannelID: "ch", StartMs: start + 12000, MediaID: "m2", OffsetMs: 0, DurationMs: 12000, CreatedAtMs: 0},
+	}
+	if _, err := db.InsertScheduleEntries(context.Background(), conn, seed); err != nil {
+		t.Fatalf("seed schedule: %v", err)
+	}
+
+	if _, err := conn.Exec(`DELETE FROM media WHERE id = 'm2'`); err == nil {
+		t.Fatalf("delete scheduled media unexpectedly succeeded with foreign keys enabled")
+	}
+	if _, err := conn.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	if _, err := conn.Exec(`DELETE FROM media WHERE id = 'm2'`); err != nil {
+		t.Fatalf("force delete media: %v", err)
+	}
+	if _, err := conn.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatalf("enable foreign keys: %v", err)
+	}
+
+	res, err := ExtendChannel(context.Background(), conn, "ch", ServiceOptions{HorizonHours: 1, NowMs: start})
+	if err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	if res.Inserted == 0 {
+		t.Fatalf("inserted=0, want continuation with remaining media")
+	}
+
+	entries, err := db.ScheduleWindow(context.Background(), conn, "ch", start, res.LastEndMs)
+	if err != nil {
+		t.Fatalf("schedule window: %v", err)
+	}
+	if len(entries) < 3 {
+		t.Fatalf("entries=%+v, want existing entries plus continuation", entries)
+	}
+	if got := entries[2].MediaID; got != "m1" {
+		t.Fatalf("first continuation media=%s, want remaining media m1", got)
+	}
+	deletedCount := 0
+	for _, e := range entries {
+		if e.MediaID == "m2" {
+			deletedCount++
+		}
+	}
+	if deletedCount != 1 {
+		t.Fatalf("deleted media scheduled %d times, want only pre-existing tail row", deletedCount)
+	}
+}
+
 func TestExtendAllEnabledContinuesAfterChannelError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "linearcast.db")
 	conn, err := db.OpenReadWrite(path)
@@ -247,6 +330,219 @@ func TestExtendChannelUsesChannelSlotGridMode(t *testing.T) {
 	}
 	if entries[0].StartMs != nowMs || entries[1].StartMs != nowMs+slotMs {
 		t.Fatalf("starts=%d,%d want %d,%d", entries[0].StartMs, entries[1].StartMs, nowMs, nowMs+slotMs)
+	}
+}
+
+func TestExtendChannelSlotGridLeadingPrimaryOnCreate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linearcast.db")
+	conn, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+	if err := db.ApplySchema(context.Background(), conn); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+	slotMs := int64(30 * 60 * 1000)
+	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
+		ID:              "ch",
+		DisplayName:     "Channel",
+		SourceDirectory: "/tmp",
+		Ordering:        "alphabetical",
+		CreatedAtMs:     1,
+		ScheduleMode:    "slot_grid",
+		SlotDurationMs:  &slotMs,
+	}); err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	durations := map[string]int64{
+		"e04": 19*60*1000 + 36*1000,
+		"e05": 22*60*1000 + 30*1000,
+		"e06": 28*60*1000 + 6*1000,
+	}
+	for _, id := range []string{"e04", "e05", "e06"} {
+		if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+			video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+			VALUES (?, ?, '/tmp', ?, 'mkv', 'h264', 1080, 'aac', 1, 0)`,
+			id, "/tmp/"+id+".mkv", durations[id]); err != nil {
+			t.Fatalf("insert media %s: %v", id, err)
+		}
+		if _, err := db.AddChannelMedia(context.Background(), conn, "ch", id, 0); err != nil {
+			t.Fatalf("add channel media %s: %v", id, err)
+		}
+		seedReadyPackageDuration(t, conn, id, durations[id])
+	}
+
+	fillerDur := int64(5 * 60 * 1000)
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('fA', '/tmp/fA.mkv', '/tmp', ?, 'mkv', 'h264', 1080, 'aac', 1, 0)`, fillerDur); err != nil {
+		t.Fatalf("insert filler media: %v", err)
+	}
+	seedReadyPackageDuration(t, conn, "fA", fillerDur)
+	asset, err := db.UpsertFillerAsset(context.Background(), conn, db.FillerAsset{
+		MediaID: "fA", Label: "Filler A", Kind: db.FillerKindFiller, Enabled: true, CreatedAtMs: 1,
+	})
+	if err != nil {
+		t.Fatalf("upsert filler asset: %v", err)
+	}
+	if err := db.AttachChannelFillerAsset(context.Background(), conn, "ch", asset.ID, 1, true); err != nil {
+		t.Fatalf("attach filler asset: %v", err)
+	}
+
+	// Create the channel 6 minutes after a slot boundary; the 24-minute leading
+	// gap should be filled primarily with e05 (22m30s) plus a little filler.
+	nowMs := slotMs*100 + 6*60*1000
+	res, err := ExtendChannel(context.Background(), conn, "ch", ServiceOptions{
+		HorizonHours:        2,
+		NowMs:               nowMs,
+		AllowLeadingPrimary: true,
+	})
+	if err != nil {
+		t.Fatalf("extend: %v", err)
+	}
+	if res.Inserted == 0 {
+		t.Fatal("inserted=0")
+	}
+
+	entries, err := db.ScheduleEntriesOrdered(context.Background(), conn, "ch")
+	if err != nil {
+		t.Fatalf("schedule entries: %v", err)
+	}
+	if len(entries) < 3 {
+		t.Fatalf("got %d entries, want at least 3", len(entries))
+	}
+	firstBoundary := AlignToSlot(nowMs, slotMs)
+	if entries[0].MediaID != "e05" || entries[0].StartMs != nowMs {
+		t.Fatalf("leading primary = %s@%d, want e05@%d", entries[0].MediaID, entries[0].StartMs, nowMs)
+	}
+	if entries[0].StartMs%slotMs == 0 {
+		t.Fatalf("leading primary unexpectedly on slot boundary at %d", entries[0].StartMs)
+	}
+	// First slot-boundary primary must resume rotation after e05 -> e06.
+	if entries[1].MediaID != "fA" || entries[2].MediaID != "e06" {
+		t.Fatalf("expected filler then e06 at boundary, got %s then %s", entries[1].MediaID, entries[2].MediaID)
+	}
+	if entries[2].StartMs != firstBoundary {
+		t.Fatalf("first boundary primary start=%d, want %d", entries[2].StartMs, firstBoundary)
+	}
+}
+
+func TestExtendChannelSlotGridBackfillsLeadingGap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linearcast.db")
+	conn, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+	if err := db.ApplySchema(context.Background(), conn); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+	slotMs := int64(30 * 60 * 1000)
+	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
+		ID:              "ch",
+		DisplayName:     "Channel",
+		SourceDirectory: "/tmp",
+		Ordering:        "alphabetical",
+		CreatedAtMs:     1,
+		ScheduleMode:    "slot_grid",
+		SlotDurationMs:  &slotMs,
+	}); err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	// One primary that is longer than the leading gap, so no leading primary
+	// fits — the gap can only be filled by filler.
+	primaryDur := int64(28*60*1000 + 6*1000)
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('e06', '/tmp/e06.mkv', '/tmp', ?, 'mkv', 'h264', 1080, 'aac', 1, 0)`, primaryDur); err != nil {
+		t.Fatalf("insert primary media: %v", err)
+	}
+	if _, err := db.AddChannelMedia(context.Background(), conn, "ch", "e06", 0); err != nil {
+		t.Fatalf("add channel media: %v", err)
+	}
+	seedReadyPackageDuration(t, conn, "e06", primaryDur)
+
+	// Attach a filler asset whose package is NOT ready yet — this reproduces the
+	// create-before-packaged condition that leaves the leading gap empty.
+	fillerDur := int64(5 * 60 * 1000)
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('fA', '/tmp/fA.mkv', '/tmp', ?, 'mkv', 'h264', 1080, 'aac', 1, 0)`, fillerDur); err != nil {
+		t.Fatalf("insert filler media: %v", err)
+	}
+	asset, err := db.UpsertFillerAsset(context.Background(), conn, db.FillerAsset{
+		MediaID: "fA", Label: "Filler A", Kind: db.FillerKindFiller, Enabled: true, CreatedAtMs: 1,
+	})
+	if err != nil {
+		t.Fatalf("upsert filler asset: %v", err)
+	}
+	if err := db.AttachChannelFillerAsset(context.Background(), conn, "ch", asset.ID, 1, true); err != nil {
+		t.Fatalf("attach filler asset: %v", err)
+	}
+
+	nowMs := slotMs*100 + 6*60*1000
+	firstBoundary := AlignToSlot(nowMs, slotMs)
+	opts := ServiceOptions{HorizonHours: 2, NowMs: nowMs, AllowLeadingPrimary: true}
+
+	// Create: filler not ready, no primary fits -> leading gap left empty.
+	if _, err := ExtendChannel(context.Background(), conn, "ch", opts); err != nil {
+		t.Fatalf("create extend: %v", err)
+	}
+	entries, err := db.ScheduleEntriesOrdered(context.Background(), conn, "ch")
+	if err != nil {
+		t.Fatalf("schedule entries: %v", err)
+	}
+	if len(entries) == 0 || entries[0].StartMs != firstBoundary {
+		t.Fatalf("expected empty leading gap with first entry at boundary %d, got %+v", firstBoundary, entries)
+	}
+
+	// Filler finishes packaging; the next extension pass should heal the gap.
+	seedReadyPackageDuration(t, conn, "fA", fillerDur)
+	res, err := ExtendChannel(context.Background(), conn, "ch", opts)
+	if err != nil {
+		t.Fatalf("heal extend: %v", err)
+	}
+	if res.Inserted == 0 {
+		t.Fatal("expected backfill to insert filler, inserted=0")
+	}
+
+	entries, err = db.ScheduleEntriesOrdered(context.Background(), conn, "ch")
+	if err != nil {
+		t.Fatalf("schedule entries after heal: %v", err)
+	}
+	if entries[0].MediaID != "fA" || entries[0].StartMs != Align6s(nowMs) {
+		t.Fatalf("leading gap not healed: first entry = %s@%d, want fA@%d", entries[0].MediaID, entries[0].StartMs, Align6s(nowMs))
+	}
+	// The healed leading run must be contiguous and land exactly on the boundary
+	// where the existing head begins.
+	cur := Align6s(nowMs)
+	for _, e := range entries {
+		if e.StartMs >= firstBoundary {
+			break
+		}
+		if e.StartMs != cur {
+			t.Fatalf("leading run not contiguous at %d (want %d)", e.StartMs, cur)
+		}
+		if e.MediaID != "fA" {
+			t.Fatalf("leading run entry %d is %s, want filler fA", e.StartMs, e.MediaID)
+		}
+		cur = e.StartMs + e.DurationMs
+	}
+	if cur != firstBoundary {
+		t.Fatalf("leading run ends at %d, want boundary %d", cur, firstBoundary)
+	}
+	if issues, err := db.ValidateScheduleEntryChains(context.Background(), conn); err != nil || len(issues) != 0 {
+		t.Fatalf("chain invalid after backfill: issues=%+v err=%v", issues, err)
+	}
+
+	// Idempotent: another pass with the gap now covered inserts nothing more.
+	res2, err := ExtendChannel(context.Background(), conn, "ch", opts)
+	if err != nil {
+		t.Fatalf("third extend: %v", err)
+	}
+	if res2.Inserted != 0 {
+		t.Fatalf("expected no further inserts, got %d", res2.Inserted)
 	}
 }
 

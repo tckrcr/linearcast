@@ -1,14 +1,17 @@
 import { ChannelArtwork } from "./ChannelArtwork";
-import { formatClock, formatMs, mediaTitle, sourceNowSubtitle, sourceNowTitle } from "./format";
+import { formatClock, formatMs, mediaTitle, sourceNowSubtitle } from "./format";
+import type { LiveSlot } from "./playbackClock";
 import type { PlayableSource } from "./types";
 
 type Props = {
   channel: PlayableSource | null;
+  slot: LiveSlot;
   visible: boolean;
 };
 
-export function ChannelBanner({ channel, visible }: Props) {
+export function ChannelBanner({ channel, slot, visible }: Props) {
   if (!channel) return null;
+  const nowTitle = channel.nowPlaying?.title ?? mediaTitle(slot.now);
   return (
     <div className={`tv-banner${visible ? " is-visible" : ""}`} aria-hidden={!visible}>
       <div className="tv-banner-channel">
@@ -26,19 +29,19 @@ export function ChannelBanner({ channel, visible }: Props) {
       </div>
       <div className="tv-banner-slot">
         <span className="label">now</span>
-        <span className="tv-banner-title">{sourceNowTitle(channel)}</span>
+        <span className="tv-banner-title">{nowTitle}</span>
         {sourceNowSubtitle(channel) && (
           <span className="muted">{sourceNowSubtitle(channel)}</span>
         )}
-        {channel.current?.remainingMs != null && (
-          <span className="muted">{formatMs(channel.current.remainingMs)} left</span>
+        {slot.remainingMs != null && (
+          <span className="muted">{formatMs(slot.remainingMs)} left</span>
         )}
       </div>
       <div className="tv-banner-slot">
         <span className="label">next</span>
-        <span className="tv-banner-title">{mediaTitle(channel.next)}</span>
-        {channel.next?.startMs != null && (
-          <span className="muted">@ {formatClock(channel.next.startMs)}</span>
+        <span className="tv-banner-title">{mediaTitle(slot.next)}</span>
+        {slot.next?.startMs != null && (
+          <span className="muted">@ {formatClock(slot.next.startMs)}</span>
         )}
       </div>
     </div>

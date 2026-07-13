@@ -15,7 +15,7 @@ type scheduleEntryItem struct {
 	MediaID         string `json:"mediaId"`
 	Title           string `json:"title,omitempty"`
 	Path            string `json:"path,omitempty"`
-	SchedulingGroup string `json:"schedulingGroup,omitempty"`
+	CollectionName string `json:"collectionName,omitempty"`
 	StartMs         int64  `json:"startMs"`
 	EndMs           int64  `json:"endMs"`
 	OffsetMs        int64  `json:"offsetMs,omitempty"`
@@ -109,7 +109,7 @@ func (a *App) handleChannelSchedule(w http.ResponseWriter, r *http.Request) {
 			DurationMs: e.DurationMs,
 		}
 		item.Title = e.Title
-		item.SchedulingGroup = e.SchedulingGroup
+		item.CollectionName = e.CollectionName
 		entries = append(entries, item)
 	}
 
@@ -198,16 +198,18 @@ func (a *App) handleChannelSchedulePreview(w http.ResponseWriter, r *http.Reques
 }
 
 type previewMediaDetail struct {
-	Path            string
-	Title           string
-	SchedulingGroup string
+	Path           string
+	Title          string
+	CollectionName string
 }
 
 func previewMediaDetails(conn *sql.DB, channelID string) (map[string]previewMediaDetail, error) {
 	rows, err := conn.Query(`
-		SELECT m.id, m.path, m.title, m.scheduling_group
+		SELECT m.id, m.path, m.title,
+		       COALESCE(CASE WHEN c.kind = 'movie' THEN 'movie:' || c.name ELSE c.name END, m.scheduling_group)
 		FROM channel_media cm
 		JOIN media m ON m.id = cm.media_id
+		LEFT JOIN collections c ON c.id = m.collection_id
 		WHERE cm.channel_id = ?`, channelID)
 	if err != nil {
 		return nil, err
@@ -226,7 +228,7 @@ func previewMediaDetails(conn *sql.DB, channelID string) (map[string]previewMedi
 			detail.Title = title.String
 		}
 		if group.Valid {
-			detail.SchedulingGroup = group.String
+			detail.CollectionName = group.String
 		}
 		out[id] = detail
 	}
@@ -235,15 +237,15 @@ func previewMediaDetails(conn *sql.DB, channelID string) (map[string]previewMedi
 
 func schedulePreviewEntryItem(entry db.ScheduleEntry, detail previewMediaDetail) scheduleEntryItem {
 	return scheduleEntryItem{
-		EntryID:         entry.ID,
-		MediaID:         entry.MediaID,
-		Title:           detail.Title,
-		Path:            detail.Path,
-		SchedulingGroup: detail.SchedulingGroup,
-		StartMs:         entry.StartMs,
-		EndMs:           entry.StartMs + entry.DurationMs,
-		OffsetMs:        entry.OffsetMs,
-		DurationMs:      entry.DurationMs,
+		EntryID:        entry.ID,
+		MediaID:        entry.MediaID,
+		Title:          detail.Title,
+		Path:           detail.Path,
+		CollectionName: detail.CollectionName,
+		StartMs:        entry.StartMs,
+		EndMs:          entry.StartMs + entry.DurationMs,
+		OffsetMs:       entry.OffsetMs,
+		DurationMs:     entry.DurationMs,
 	}
 }
 
@@ -260,7 +262,7 @@ func buildSchedulePreviewDiff(planned []scheduleEntryItem, current []db.Schedule
 			DurationMs: entry.DurationMs,
 		}
 		item.Title = entry.Title
-		item.SchedulingGroup = entry.SchedulingGroup
+		item.CollectionName = entry.CollectionName
 		currentByKey[scheduleDiffKey(item)] = item
 	}
 

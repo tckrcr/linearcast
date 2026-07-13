@@ -59,6 +59,23 @@ func TestHandleChannelProbeUpstreamUnreachable(t *testing.T) {
 	}
 }
 
+func TestHandleChannelProbeUpstreamAllowsPrivateAddresses(t *testing.T) {
+	// The Spotify URL is an operator-set, private-by-nature service (e.g. a LAN
+	// Spotify→HLS bridge), so the probe must reach loopback/LAN rather than refuse
+	// it. httptest serves on loopback; a deny-private policy would block it.
+	app, _ := testAdminApp(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte("#EXTM3U\n"))
+	}))
+	defer upstream.Close()
+
+	resp := runProbe(t, app, upstream.URL+"/stream.m3u8")
+	if !resp.Reachable {
+		t.Fatalf("want loopback upstream reachable, got %+v", resp)
+	}
+}
+
 func TestHandleChannelProbeUpstreamRejectsBadScheme(t *testing.T) {
 	app, _ := testAdminApp(t)
 	body := strings.NewReader(`{"upstreamHlsUrl": "ftp://example.com/x.m3u8"}`)

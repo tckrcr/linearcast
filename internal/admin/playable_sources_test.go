@@ -26,9 +26,9 @@ func TestHandlePlayableSourcesReturnsVODManifestURLs(t *testing.T) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile, hidden_from_guide
 		)
-		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0),
-		       ('hidden', 'Hidden', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 1),
-		       ('disabled', 'Disabled', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-main-1080p', 0)`); err != nil {
+		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0),
+		       ('hidden', 'Hidden', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 1),
+		       ('disabled', 'Disabled', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-1080p-8mbps', 0)`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -87,7 +87,7 @@ func TestHandlePlayableSourcesReturnsVODManifestURLs(t *testing.T) {
 	if got.ID != "vod one" || got.DisplayName != "VOD One" || got.Kind != "vod" || got.PlaybackType != "hls" {
 		t.Fatalf("unexpected source identity: %+v", got)
 	}
-	if got.ManifestURL != "/hls/channel/vod%20one/stream.m3u8" {
+	if got.ManifestURL != "/hls/channels/vod%20one/stream.m3u8" {
 		t.Fatalf("manifestUrl=%q", got.ManifestURL)
 	}
 	if got.Status != "playing" || got.Current == nil || got.Current.MediaID != "m1" {
@@ -112,7 +112,7 @@ func TestHandlePlayableSourcesIncludesCurrentPackageFailure(t *testing.T) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile
 		)
-		VALUES ('vod', 'VOD', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		VALUES ('vod', 'VOD', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -168,12 +168,17 @@ func TestHandlePlayableSourcesIncludesCurrentPackageFailure(t *testing.T) {
 
 func TestHandlePlayableSourcesReturnsExternalHLSManifestURL(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/now-playing" {
+		switch r.URL.Path {
+		case "/now-playing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"title":"Song","artist":"Artist","album":"Album","artUrl":"http://example.test/art.jpg","playing":true}`))
+		case "/hls/stream.m3u8":
+			// The heartbeat probes the upstream manifest to derive live/down.
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:3\n"))
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"title":"Song","artist":"Artist","album":"Album","artUrl":"http://example.test/art.jpg","playing":true}`))
 	}))
 	defer upstream.Close()
 

@@ -7,23 +7,24 @@ import (
 	"github.com/tckrcr/linearcast/internal/packageprofile"
 )
 
-func TestLiveSessionArgsSeekAndPacingBeforeInput(t *testing.T) {
+func TestLiveEncodingArgsSeekAndPacingBeforeInput(t *testing.T) {
 	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
 	if !ok {
 		t.Fatalf("missing default profile")
 	}
-	spec := LiveSessionSpec{
+	spec := LiveEncodingSpec{
 		MediaPath:       "/in.mkv",
 		OutDir:          "/sess",
 		SeekMs:          1_815_500,
 		LimitMs:         1_004_500,
 		TargetSegmentMs: 6000,
+		RealtimePacing:  true,
 		BurstSec:        90,
 		Profile:         profile,
 	}
-	args, err := liveSessionArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
 	if err != nil {
-		t.Fatalf("live session args: %v", err)
+		t.Fatalf("live encoding args: %v", err)
 	}
 	joined := strings.Join(args, " ")
 	inputAt := strings.Index(joined, "-i /in.mkv")
@@ -58,20 +59,20 @@ func TestLiveSessionArgsSeekAndPacingBeforeInput(t *testing.T) {
 	}
 }
 
-func TestLiveSessionArgsZeroBurstAndLimitSkipFlags(t *testing.T) {
+func TestLiveEncodingArgsZeroBurstAndLimitSkipFlags(t *testing.T) {
 	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
 	if !ok {
 		t.Fatalf("missing default profile")
 	}
-	spec := LiveSessionSpec{
+	spec := LiveEncodingSpec{
 		MediaPath:       "/in.mkv",
 		OutDir:          "/sess",
 		TargetSegmentMs: 6000,
 		Profile:         profile,
 	}
-	args, err := liveSessionArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
 	if err != nil {
-		t.Fatalf("live session args: %v", err)
+		t.Fatalf("live encoding args: %v", err)
 	}
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "-readrate") {
@@ -85,7 +86,32 @@ func TestLiveSessionArgsZeroBurstAndLimitSkipFlags(t *testing.T) {
 	}
 }
 
-func TestLiveSessionArgsAcceptsCopyProfile(t *testing.T) {
+func TestLiveEncodingArgsRealtimePacingWithoutBurst(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	spec := LiveEncodingSpec{
+		MediaPath:       "/in.mkv",
+		OutDir:          "/sess",
+		TargetSegmentMs: 6000,
+		RealtimePacing:  true,
+		Profile:         profile,
+	}
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	if err != nil {
+		t.Fatalf("live encoding args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-readrate 1.0") {
+		t.Fatalf("realtime pacing should include readrate: %s", joined)
+	}
+	if strings.Contains(joined, "-readrate_initial_burst") {
+		t.Fatalf("zero burst should omit initial burst: %s", joined)
+	}
+}
+
+func TestLiveEncodingArgsAcceptsCopyProfile(t *testing.T) {
 	profile := packageprofile.Profile{
 		Name: "h264-copy-source",
 		Video: packageprofile.VideoSettings{
@@ -97,18 +123,19 @@ func TestLiveSessionArgsAcceptsCopyProfile(t *testing.T) {
 			Codec: "aac",
 		},
 	}
-	spec := LiveSessionSpec{
+	spec := LiveEncodingSpec{
 		MediaPath:       "/in.mkv",
 		OutDir:          "/sess",
 		SeekMs:          30_500,
 		LimitMs:         60_250,
 		TargetSegmentMs: 6000,
+		RealtimePacing:  true,
 		BurstSec:        90,
 		Profile:         profile,
 	}
-	args, err := liveSessionArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
 	if err != nil {
-		t.Fatalf("copy-mode profile must build live session args: %v", err)
+		t.Fatalf("copy-mode profile must build live encoding args: %v", err)
 	}
 	joined := strings.Join(args, " ")
 	for _, want := range []string{"-ss 30.500", "-t 60.250", "-c:v copy", "-c:a aac", "-hls_segment_type fmp4"} {
@@ -120,9 +147,88 @@ func TestLiveSessionArgsAcceptsCopyProfile(t *testing.T) {
 	if strings.Contains(joined, "-force_key_frames") {
 		t.Fatalf("copy mode must not force keyframes: %s", joined)
 	}
+	if !strings.Contains(joined, "-readrate 1.0") {
+		t.Fatalf("copy mode must include -readrate 1.0: %s", joined)
+	}
+	if !strings.Contains(joined, "-readrate_initial_burst 90") {
+		t.Fatalf("copy mode must include initial burst: %s", joined)
+	}
 }
 
-func TestLiveSessionArgsCopyRejectsCodecMismatch(t *testing.T) {
+func TestLiveEncodingArgsCopyReadrateBurst(t *testing.T) {
+	profile := packageprofile.Profile{
+		Name:  "h264-copy-source",
+		Video: packageprofile.VideoSettings{Mode: packageprofile.VideoModeCopy, CodecRequired: "h264"},
+		Audio: packageprofile.AudioSettings{Mode: packageprofile.AudioModeTranscode, Codec: "aac"},
+	}
+	spec := LiveEncodingSpec{
+		MediaPath:       "/in.mkv",
+		OutDir:          "/sess",
+		TargetSegmentMs: 6000,
+		RealtimePacing:  true,
+		BurstSec:        90,
+		Profile:         profile,
+	}
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	if err != nil {
+		t.Fatalf("live encoding args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-readrate 1.0") {
+		t.Fatalf("copy burst must include readrate pacing: %s", joined)
+	}
+	if !strings.Contains(joined, "-readrate_initial_burst 90") {
+		t.Fatalf("copy burst must include initial burst: %s", joined)
+	}
+}
+
+func TestLiveEncodingArgsCopyAddsNoAccurateSeek(t *testing.T) {
+	// Copy mode must use -noaccurate_seek so audio and video both start at the
+	// prior source keyframe; without it the transcoded audio is trimmed to the
+	// playhead while copied video snaps back, leaving a leading audio edit-list
+	// skew that MSE/hls.js surface as a startup buffer hole.
+	profile := packageprofile.Profile{
+		Name:  "h264-copy-source",
+		Video: packageprofile.VideoSettings{Mode: packageprofile.VideoModeCopy, CodecRequired: "h264"},
+		Audio: packageprofile.AudioSettings{Mode: packageprofile.AudioModeTranscode, Codec: "aac"},
+	}
+	spec := LiveEncodingSpec{MediaPath: "/in.mkv", OutDir: "/sess", SeekMs: 30_500, TargetSegmentMs: 6000, Profile: profile}
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	if err != nil {
+		t.Fatalf("live encoding args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	na := strings.Index(joined, "-noaccurate_seek")
+	ss := strings.Index(joined, "-ss 30.500")
+	in := strings.Index(joined, "-i /in.mkv")
+	if na < 0 {
+		t.Fatalf("copy mode must add -noaccurate_seek: %s", joined)
+	}
+	// -noaccurate_seek is an input option and must precede the seek and -i so it
+	// applies to this input.
+	if !(na < ss && ss < in) {
+		t.Fatalf("-noaccurate_seek must precede -ss and -i: %s", joined)
+	}
+}
+
+func TestLiveEncodingArgsTranscodeOmitsNoAccurateSeek(t *testing.T) {
+	// Transcode profiles re-keyframe at output t=0 and must keep frame-accurate
+	// seeking to the requested playhead, so they must not use -noaccurate_seek.
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	spec := LiveEncodingSpec{MediaPath: "/in.mkv", OutDir: "/sess", SeekMs: 30_500, TargetSegmentMs: 6000, Profile: profile}
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	if err != nil {
+		t.Fatalf("live encoding args: %v", err)
+	}
+	if strings.Contains(strings.Join(args, " "), "-noaccurate_seek") {
+		t.Fatalf("transcode mode must not add -noaccurate_seek: %s", strings.Join(args, " "))
+	}
+}
+
+func TestLiveEncodingArgsCopyRejectsCodecMismatch(t *testing.T) {
 	// A copy profile that requires hevc cannot serve an h264 source: -c:v copy
 	// can't change the codec, so this must be rejected up front.
 	profile := packageprofile.Profile{
@@ -133,28 +239,28 @@ func TestLiveSessionArgsCopyRejectsCodecMismatch(t *testing.T) {
 		},
 		Audio: packageprofile.AudioSettings{Mode: packageprofile.AudioModeCopy},
 	}
-	spec := LiveSessionSpec{MediaPath: "/in.mkv", OutDir: "/sess", TargetSegmentMs: 6000, Profile: profile}
-	if _, err := liveSessionArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe()); err == nil {
+	spec := LiveEncodingSpec{MediaPath: "/in.mkv", OutDir: "/sess", TargetSegmentMs: 6000, Profile: profile}
+	if _, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe()); err == nil {
 		t.Fatalf("copy profile with mismatched source codec must be rejected")
 	}
 }
 
-func TestLiveSessionArgsBurnsSubtitleWithOverlayFilter(t *testing.T) {
+func TestLiveEncodingArgsBurnsSubtitleWithOverlayFilter(t *testing.T) {
 	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
 	if !ok {
 		t.Fatalf("missing default profile")
 	}
 	streamIndex := 3
-	spec := LiveSessionSpec{
+	spec := LiveEncodingSpec{
 		MediaPath:               "/in.mkv",
 		OutDir:                  "/sess",
 		TargetSegmentMs:         6000,
 		Profile:                 profile,
 		BurnSubtitleStreamIndex: &streamIndex,
 	}
-	args, err := liveSessionArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
 	if err != nil {
-		t.Fatalf("live session args: %v", err)
+		t.Fatalf("live encoding args: %v", err)
 	}
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
@@ -171,7 +277,7 @@ func TestLiveSessionArgsBurnsSubtitleWithOverlayFilter(t *testing.T) {
 	}
 }
 
-func TestLiveSessionArgsCopyRejectsSubtitleBurn(t *testing.T) {
+func TestLiveEncodingArgsCopyRejectsSubtitleBurn(t *testing.T) {
 	profile := packageprofile.Profile{
 		Name: "h264-copy-source",
 		Video: packageprofile.VideoSettings{
@@ -181,14 +287,47 @@ func TestLiveSessionArgsCopyRejectsSubtitleBurn(t *testing.T) {
 		Audio: packageprofile.AudioSettings{Mode: packageprofile.AudioModeCopy},
 	}
 	streamIndex := 3
-	spec := LiveSessionSpec{
+	spec := LiveEncodingSpec{
 		MediaPath:               "/in.mkv",
 		OutDir:                  "/sess",
 		TargetSegmentMs:         6000,
 		Profile:                 profile,
 		BurnSubtitleStreamIndex: &streamIndex,
 	}
-	if _, err := liveSessionArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe()); err == nil {
+	if _, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe()); err == nil {
 		t.Fatalf("copy profile with subtitle burn must be rejected")
+	}
+}
+
+func TestLiveEncodingArgsAddsSubtitleOutputs(t *testing.T) {
+	profile, ok := packageprofile.Lookup(packageprofile.DefaultName)
+	if !ok {
+		t.Fatalf("missing default profile")
+	}
+	spec := LiveEncodingSpec{
+		MediaPath:             "/in.mkv",
+		OutDir:                "/sess",
+		TargetSegmentMs:       6000,
+		Profile:               profile,
+		SubtitleStreamIndexes: []int{2, 3},
+	}
+	args, err := liveEncodingArgsFromProbe("/in.mkv", "/sess", spec, makeAVProbe())
+	if err != nil {
+		t.Fatalf("live encoding args: %v", err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-map 0:2",
+		"-map 0:3",
+		"-c:s webvtt",
+		"-segment_format webvtt",
+		"-segment_list /sess/subs/s2/playlist.m3u8",
+		"-segment_list /sess/subs/s3/playlist.m3u8",
+		"/sess/subs/s2/seg_%06d.vtt",
+		"/sess/subs/s3/seg_%06d.vtt",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("args missing %q: %s", want, joined)
+		}
 	}
 }

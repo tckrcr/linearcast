@@ -158,7 +158,7 @@ func (a *App) handleCacheSummary(w http.ResponseWriter, r *http.Request) {
 
 	resp := cacheSummaryResponse{
 		GeneratedAt:      a.now().UTC().Format(time.RFC3339Nano),
-		CacheRoot:        a.cacheDir,
+		CacheRoot:        a.cache.Root(),
 		PackageRootCount: len(packageRoots),
 		EncoderCount:     encoderCount,
 		StatusCounts:     make([]cachePackageStatusSummary, 0, len(statusRows)),
@@ -167,12 +167,14 @@ func (a *App) handleCacheSummary(w http.ResponseWriter, r *http.Request) {
 		ChannelNeeds:     make([]cacheChannelPackageNeed, 0, len(needRows)),
 	}
 	if resp.CacheRoot != "" {
-		resp.PackageRoot = filepath.Join(resp.CacheRoot, "packages")
+		resp.PackageRoot = a.cache.PackagesDir()
 		if n, err := dirSize(resp.CacheRoot); err == nil {
 			resp.CacheRootBytes = &n
 		} else {
 			resp.Warnings = append(resp.Warnings, fmt.Sprintf("cache root size unavailable: %v", err))
 		}
+	}
+	if resp.PackageRoot != "" {
 		if n, err := dirSize(resp.PackageRoot); err == nil {
 			resp.PackageRootBytes = &n
 		} else {
@@ -270,8 +272,8 @@ func (a *App) handleCacheInvalidProfilesCleanup(w http.ResponseWriter, r *http.R
 	}
 
 	globalPkgRoot := ""
-	if a.cacheDir != "" {
-		globalPkgRoot = filepath.Clean(filepath.Join(a.cacheDir, "packages"))
+	if a.cache.Root() != "" {
+		globalPkgRoot = filepath.Clean(a.cache.PackagesDir())
 	}
 
 	resp := invalidProfileCleanupResponse{
@@ -336,8 +338,8 @@ func (a *App) handleCacheUnreferenced(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var globalRoot string
-	if a.cacheDir != "" {
-		globalRoot = filepath.Clean(filepath.Join(a.cacheDir, "packages"))
+	if a.cache.Root() != "" {
+		globalRoot = filepath.Clean(a.cache.PackagesDir())
 	}
 
 	for _, p := range pkgs {

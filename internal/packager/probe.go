@@ -9,6 +9,7 @@ type SubtitleStreamInfo struct {
 	Language string `json:"language"`
 	Title    string `json:"title"`
 	IsBitmap bool   `json:"isBitmap"`
+	Forced   bool   `json:"forced"`
 }
 
 // ProbeSubtitleStreams runs ffprobe on path and returns all subtitle streams.
@@ -32,6 +33,7 @@ func ProbeSubtitleStreams(ctx context.Context, path string) ([]SubtitleStreamInf
 			Language: lang,
 			Title:    s.Tags.Title,
 			IsBitmap: isBitmapSubtitle(s.CodecName),
+			Forced:   s.Disposition.Forced == 1,
 		})
 	}
 	return out, nil

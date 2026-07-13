@@ -18,7 +18,10 @@ services:
     restart: unless-stopped
     init: true
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null"]
+      # /status proxies through nginx to the playback backend, so a dead or hung
+      # backend (502) flips the container unhealthy. The nginx-static /healthz
+      # would stay 200 even with the backend down.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/status >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 5

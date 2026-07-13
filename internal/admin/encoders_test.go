@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,13 +15,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/packager"
 )
 
 // encoderHandlerEnv mirrors testAdminApp but pre-seeds an authenticated
-// admin session, plus a media row and channel so the /claim handler has
+// admin encoding, plus a media row and channel so the /claim handler has
 // real candidates to walk. Auth is disabled (no password) so the cookie
 // middleware short-circuits — encoder routes still go through bearer auth.
 type encoderHandlerEnv struct {
@@ -41,7 +44,7 @@ func newEncoderHandlerEnv(t *testing.T) *encoderHandlerEnv {
 		t.Fatalf("insert media: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode, required_package_profile)
-		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -254,7 +257,7 @@ func TestEncoderClaim_HappyPathReturnsJobAndCreatesLease(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.MediaID != "m1" || resp.RenditionProfile != "h264-main-1080p" {
+	if resp.MediaID != "m1" || resp.RenditionProfile != "h264-1080p-8mbps" {
 		t.Fatalf("claim mismatch: %+v", resp)
 	}
 	if resp.Profile.Name == "" {
@@ -352,7 +355,7 @@ func TestEncoderMediaDownload_WrongEncoderRejected(t *testing.T) {
 func TestEncoderComplete_FinalizesUploadedPackage(t *testing.T) {
 	requireFFmpeg(t)
 	app, conn := testAdminApp(t)
-	app.packageRoot = filepath.Join(t.TempDir(), "packages")
+	app.cache = layout.NewCache(t.TempDir())
 	mediaPath := filepath.Join(t.TempDir(), "source.mp4")
 	generateTinyMedia(t, mediaPath)
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -361,7 +364,7 @@ func TestEncoderComplete_FinalizesUploadedPackage(t *testing.T) {
 		t.Fatalf("insert media: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode, required_package_profile)
-		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -403,6 +406,17 @@ func TestEncoderComplete_FinalizesUploadedPackage(t *testing.T) {
 	if !complete.OK || complete.SegmentCount == 0 || complete.DurationMs == 0 {
 		t.Fatalf("complete response mismatch: %+v", complete)
 	}
+	wantRoot := app.cache.PackageRoot(claim.MediaID, claim.RenditionProfile)
+	legacyRoot := filepath.Join(app.cache.PackagesDir(), claim.MediaID, claim.PackageID)
+	if complete.PackageRoot != wantRoot || complete.InitSegmentPath != layout.InitPath(wantRoot) {
+		t.Fatalf("complete paths root=%q init=%q, want root=%q init=%q", complete.PackageRoot, complete.InitSegmentPath, wantRoot, layout.InitPath(wantRoot))
+	}
+	if _, err := os.Stat(wantRoot); err != nil {
+		t.Fatalf("canonical uploaded package root missing: %v", err)
+	}
+	if _, err := os.Stat(legacyRoot); !os.IsNotExist(err) {
+		t.Fatalf("legacy package-id upload root exists: %s stat err=%v", legacyRoot, err)
+	}
 	pkg, err := db.MediaPackageByID(context.Background(), conn, claim.PackageID)
 	if err != nil {
 		t.Fatalf("lookup package: %v", err)
@@ -410,12 +424,353 @@ func TestEncoderComplete_FinalizesUploadedPackage(t *testing.T) {
 	if pkg == nil || pkg.Status != db.PackageStatusReady {
 		t.Fatalf("package not ready: %+v", pkg)
 	}
+	if pkg.PackageRoot == nil || *pkg.PackageRoot != wantRoot {
+		t.Fatalf("package root=%+v, want %s", pkg.PackageRoot, wantRoot)
+	}
+	segs, err := db.PackagedSegments(context.Background(), conn, claim.PackageID)
+	if err != nil {
+		t.Fatalf("lookup segments: %v", err)
+	}
+	if len(segs) == 0 {
+		t.Fatal("no packaged segments after complete")
+	}
+	for _, seg := range segs {
+		if seg.Path == nil {
+			t.Fatalf("segment path nil: %+v", seg)
+		}
+		if !strings.HasPrefix(filepath.Clean(*seg.Path), wantRoot+string(os.PathSeparator)) {
+			t.Fatalf("segment path %q not under canonical root %q", *seg.Path, wantRoot)
+		}
+	}
 	var jobs int
 	if err := conn.QueryRow(`SELECT COUNT(*) FROM encoder_jobs WHERE package_id = ?`, claim.PackageID).Scan(&jobs); err != nil {
 		t.Fatalf("count jobs: %v", err)
 	}
 	if jobs != 0 {
 		t.Fatalf("encoder job count=%d, want 0", jobs)
+	}
+}
+
+func TestEncoderComplete_InvalidTarPreservesExistingPackageRoot(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	env.app.cache = layout.NewCache(t.TempDir())
+	_, key := env.registerEncoder(t, "test")
+	claim := env.claim(t, key)
+
+	packageRoot := env.app.cache.PackageRoot(claim.MediaID, claim.RenditionProfile)
+	if err := os.MkdirAll(packageRoot, 0o755); err != nil {
+		t.Fatalf("create existing package root: %v", err)
+	}
+	sentinel := filepath.Join(packageRoot, "keep.txt")
+	if err := os.WriteFile(sentinel, []byte("existing"), 0o644); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+
+	var body bytes.Buffer
+	writeRawTar(t, &body, map[string]string{
+		"init.mp4": "init",
+		// No stream.m3u8: receivePackageTar must reject before clearing the
+		// existing package root.
+		"seg000000.m4s": "segment",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/encoder/jobs/"+claim.PackageID+"/complete", &body)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/x-tar")
+	rr := httptest.NewRecorder()
+	env.app.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("complete status=%d, want 400 body=%s", rr.Code, rr.Body.String())
+	}
+	got, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("sentinel should remain after invalid tar: %v", err)
+	}
+	if string(got) != "existing" {
+		t.Fatalf("sentinel=%q, want existing", string(got))
+	}
+	pkg, err := db.MediaPackageByID(context.Background(), env.conn, claim.PackageID)
+	if err != nil || pkg == nil {
+		t.Fatalf("lookup package: pkg=%v err=%v", pkg, err)
+	}
+	if pkg.Status != db.PackageStatusProcessing {
+		t.Fatalf("package status=%s, want processing so encoder can report failure", pkg.Status)
+	}
+}
+
+func TestEncoderComplete_FinalizeFailureCleansUnpromotedUpload(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	env.app.cache = layout.NewCache(t.TempDir())
+	_, key := env.registerEncoder(t, "test")
+	claim := env.claim(t, key)
+
+	packageRoot := env.app.cache.PackageRoot(claim.MediaID, claim.RenditionProfile)
+	var body bytes.Buffer
+	writeRawTar(t, &body, map[string]string{
+		"init.mp4": "init",
+		// This satisfies the upload contract, then fails HLS finalization
+		// because the segment URI has no preceding EXTINF.
+		"stream.m3u8":   "#EXTM3U\nseg000000.m4s\n",
+		"seg000000.m4s": "segment",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/encoder/jobs/"+claim.PackageID+"/complete", &body)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/x-tar")
+	rr := httptest.NewRecorder()
+	env.app.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("complete status=%d, want 400 body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(packageRoot); !os.IsNotExist(err) {
+		t.Fatalf("unpromoted package root still exists after finalize failure: stat err=%v", err)
+	}
+	segs, err := db.PackagedSegments(context.Background(), env.conn, claim.PackageID)
+	if err != nil {
+		t.Fatalf("lookup segments: %v", err)
+	}
+	if len(segs) != 0 {
+		t.Fatalf("segments were promoted after failed finalize: %+v", segs)
+	}
+	pkg, err := db.MediaPackageByID(context.Background(), env.conn, claim.PackageID)
+	if err != nil || pkg == nil {
+		t.Fatalf("lookup package: pkg=%v err=%v", pkg, err)
+	}
+	if pkg.Status != db.PackageStatusProcessing {
+		t.Fatalf("package status=%s, want processing so encoder can report failure", pkg.Status)
+	}
+}
+
+func TestEncoderComplete_CompleteFailureCleansUploadedFilesAndSegments(t *testing.T) {
+	requireFFmpeg(t)
+	app, conn := testAdminApp(t)
+	app.cache = layout.NewCache(t.TempDir())
+	mediaPath := filepath.Join(t.TempDir(), "source.mp4")
+	generateTinyMedia(t, mediaPath)
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', ?, ?, 2000, 'mp4', 'h264', 72, 'aac', 1, 0)`, mediaPath, filepath.Dir(mediaPath)); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode, required_package_profile)
+		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
+		VALUES ('ch1', 'm1', NULL, 0)`); err != nil {
+		t.Fatalf("insert channel_media: %v", err)
+	}
+	_, key := registerEncoderHelper(t, app, "test")
+	claimReq := httptest.NewRequest(http.MethodPost, "/api/encoder/claim", strings.NewReader(`{}`))
+	claimReq.Header.Set("Authorization", "Bearer "+key)
+	claimReq.Header.Set("Content-Type", "application/json")
+	claimRR := httptest.NewRecorder()
+	app.Handler().ServeHTTP(claimRR, claimReq)
+	if claimRR.Code != http.StatusOK {
+		t.Fatalf("claim status=%d body=%s", claimRR.Code, claimRR.Body.String())
+	}
+	var claim encoderClaimResponse
+	if err := json.NewDecoder(claimRR.Body).Decode(&claim); err != nil {
+		t.Fatalf("decode claim: %v", err)
+	}
+
+	encodedDir := filepath.Join(t.TempDir(), "encoded")
+	if err := packager.EncodePackageOutput(t.Context(), mediaPath, encodedDir, 6000, "veryfast", claim.Profile); err != nil {
+		t.Fatalf("encode package output: %v", err)
+	}
+	if _, err := conn.Exec(`CREATE TRIGGER drop_lease_after_segment_insert
+		AFTER INSERT ON packaged_segments
+		BEGIN
+			DELETE FROM encoder_jobs WHERE package_id = NEW.package_id;
+		END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	var body bytes.Buffer
+	writeTestPackageTar(t, &body, encodedDir)
+	completeReq := httptest.NewRequest(http.MethodPost, "/api/encoder/jobs/"+claim.PackageID+"/complete", &body)
+	completeReq.Header.Set("Authorization", "Bearer "+key)
+	completeReq.Header.Set("Content-Type", "application/x-tar")
+	completeRR := httptest.NewRecorder()
+	app.Handler().ServeHTTP(completeRR, completeReq)
+	if completeRR.Code != http.StatusConflict {
+		t.Fatalf("complete status=%d, want 409 body=%s", completeRR.Code, completeRR.Body.String())
+	}
+	packageRoot := app.cache.PackageRoot(claim.MediaID, claim.RenditionProfile)
+	if _, err := os.Stat(packageRoot); !os.IsNotExist(err) {
+		t.Fatalf("unpromoted package root still exists after complete failure: stat err=%v", err)
+	}
+	segs, err := db.PackagedSegments(context.Background(), conn, claim.PackageID)
+	if err != nil {
+		t.Fatalf("lookup segments: %v", err)
+	}
+	if len(segs) != 0 {
+		t.Fatalf("segments still exist after complete failure: %+v", segs)
+	}
+	pkg, err := db.MediaPackageByID(context.Background(), conn, claim.PackageID)
+	if err != nil || pkg == nil {
+		t.Fatalf("lookup package: pkg=%v err=%v", pkg, err)
+	}
+	if pkg.Status != db.PackageStatusPending {
+		t.Fatalf("package status=%s, want pending after failed complete with no lease", pkg.Status)
+	}
+	if pkg.LastAttemptError == nil || !strings.Contains(*pkg.LastAttemptError, "encoder complete failed before ready") {
+		t.Fatalf("last_attempt_error=%+v, want completion cleanup reason", pkg.LastAttemptError)
+	}
+}
+
+func TestEncoderComplete_ReadOnlyDBFailureCleansUploadedFiles(t *testing.T) {
+	requireFFmpeg(t)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "linearcast.db")
+	rw, err := db.OpenReadWrite(dbPath)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	if err := db.ApplySchema(ctx, rw); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+	cacheDir := t.TempDir()
+	packageRoot := layout.NewCache(cacheDir).PackagesDir()
+	mediaPath := filepath.Join(t.TempDir(), "source.mp4")
+	generateTinyMedia(t, mediaPath)
+	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('m1', ?, ?, 2000, 'mp4', 'h264', 72, 'aac', 1, 0)`, mediaPath, filepath.Dir(mediaPath)); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	encID, key, err := db.RegisterEncoder(ctx, rw, "test", `{}`, 1_000)
+	if err != nil {
+		t.Fatalf("register encoder: %v", err)
+	}
+	pkg := db.MediaPackage{
+		ID:               "pkg-m1",
+		MediaID:          "m1",
+		RenditionProfile: "h264-1080p-8mbps",
+		Status:           db.PackageStatusProcessing,
+		CreatedAtMs:      1_000,
+		UpdatedAtMs:      1_000,
+	}
+	if err := db.UpsertMediaPackage(ctx, rw, pkg); err != nil {
+		t.Fatalf("seed processing package: %v", err)
+	}
+	if _, err := rw.Exec(`INSERT INTO encoder_jobs
+		(package_id, encoder_id, claimed_at_ms, lease_expires_ms, last_heartbeat_ms)
+		VALUES (?, ?, 1000, 61000, 1000)`, pkg.ID, encID); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+	profile, err := db.GetPackageProfile(ctx, rw, pkg.RenditionProfile)
+	if err != nil || profile == nil {
+		t.Fatalf("lookup profile: profile=%v err=%v", profile, err)
+	}
+	if _, err := rw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatalf("close rw: %v", err)
+	}
+
+	encodedDir := filepath.Join(t.TempDir(), "encoded")
+	if err := packager.EncodePackageOutput(t.Context(), mediaPath, encodedDir, 6000, "veryfast", *profile); err != nil {
+		t.Fatalf("encode package output: %v", err)
+	}
+	ro, err := db.OpenReadOnly(dbPath)
+	if err != nil {
+		t.Fatalf("open ro: %v", err)
+	}
+	defer ro.Close()
+	app := New(Config{DB: ro, CacheDir: cacheDir})
+
+	var body bytes.Buffer
+	writeTestPackageTar(t, &body, encodedDir)
+	req := httptest.NewRequest(http.MethodPost, "/api/encoder/jobs/"+pkg.ID+"/complete", &body)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/x-tar")
+	rr := httptest.NewRecorder()
+	app.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("complete status=%d, want 400 body=%s", rr.Code, rr.Body.String())
+	}
+	finalPath := filepath.Join(packageRoot, pkg.MediaID, pkg.RenditionProfile)
+	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+		t.Fatalf("uploaded package root still exists after read-only DB failure: stat err=%v", err)
+	}
+	got, err := db.MediaPackageByID(ctx, ro, pkg.ID)
+	if err != nil || got == nil {
+		t.Fatalf("lookup package: pkg=%v err=%v", got, err)
+	}
+	if got.Status != db.PackageStatusProcessing {
+		t.Fatalf("package status=%s, want processing after failed readonly finalize", got.Status)
+	}
+}
+
+func TestCleanupUnpromotedPackageUploadRemovesFilesAndSegments(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	packageRoot := filepath.Join(t.TempDir(), "packages", "m1", "h264-1080p-8mbps")
+	if err := os.MkdirAll(packageRoot, 0o755); err != nil {
+		t.Fatalf("create package root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "seg000000.m4s"), []byte("segment"), 0o644); err != nil {
+		t.Fatalf("write segment: %v", err)
+	}
+	if err := db.UpsertMediaPackage(context.Background(), env.conn, db.MediaPackage{
+		ID:               "pkg-cleanup",
+		MediaID:          "m1",
+		RenditionProfile: "h264-1080p-8mbps",
+		Status:           db.PackageStatusProcessing,
+		CreatedAtMs:      1,
+		UpdatedAtMs:      1,
+	}); err != nil {
+		t.Fatalf("seed package: %v", err)
+	}
+	if err := db.ReplacePackagedSegments(context.Background(), env.conn, "pkg-cleanup", []db.PackagedSegment{
+		{PackageID: "pkg-cleanup", SegmentNumber: 0, MediaStartMs: 0, DurationMs: 6000, Path: strptr(filepath.Join(packageRoot, "seg000000.m4s"))},
+	}); err != nil {
+		t.Fatalf("seed segments: %v", err)
+	}
+
+	env.app.cleanupUnpromotedPackageUpload("pkg-cleanup", packageRoot, "test")
+
+	if _, err := os.Stat(packageRoot); !os.IsNotExist(err) {
+		t.Fatalf("package root still exists after cleanup: stat err=%v", err)
+	}
+	segs, err := db.PackagedSegments(context.Background(), env.conn, "pkg-cleanup")
+	if err != nil {
+		t.Fatalf("lookup segments: %v", err)
+	}
+	if len(segs) != 0 {
+		t.Fatalf("segments still exist after cleanup: %+v", segs)
+	}
+}
+
+func TestCleanupUnpromotedPackageUploadKeepsActivelyLeasedPackageProcessing(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	encID, _, err := db.RegisterEncoder(context.Background(), env.conn, "cleanup-test", `{}`, 1_000)
+	if err != nil {
+		t.Fatalf("register encoder: %v", err)
+	}
+	if err := db.UpsertMediaPackage(context.Background(), env.conn, db.MediaPackage{
+		ID:               "pkg-cleanup-leased",
+		MediaID:          "m1",
+		RenditionProfile: "h264-1080p-8mbps",
+		Status:           db.PackageStatusProcessing,
+		CreatedAtMs:      1,
+		UpdatedAtMs:      1,
+	}); err != nil {
+		t.Fatalf("seed package: %v", err)
+	}
+	if _, err := env.conn.Exec(`INSERT INTO encoder_jobs
+		(package_id, encoder_id, claimed_at_ms, lease_expires_ms, last_heartbeat_ms)
+		VALUES ('pkg-cleanup-leased', ?, 1000, 61000, 1000)`, encID); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	env.app.cleanupUnpromotedPackageUpload("pkg-cleanup-leased", filepath.Join(t.TempDir(), "missing-package-root"), "test")
+
+	pkg, err := db.MediaPackageByID(context.Background(), env.conn, "pkg-cleanup-leased")
+	if err != nil || pkg == nil {
+		t.Fatalf("lookup package: pkg=%v err=%v", pkg, err)
+	}
+	if pkg.Status != db.PackageStatusProcessing {
+		t.Fatalf("package status=%s, want still processing while lease exists", pkg.Status)
 	}
 }
 
@@ -501,6 +856,22 @@ func addTestTarFile(t *testing.T, tw *tar.Writer, filePath, name string) {
 	}
 	if _, err := io.Copy(tw, f); err != nil {
 		t.Fatalf("write tar %s: %v", name, err)
+	}
+}
+
+func writeRawTar(t *testing.T, w io.Writer, files map[string]string) {
+	t.Helper()
+	tw := tar.NewWriter(w)
+	for name, contents := range files {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(contents))}); err != nil {
+			t.Fatalf("write header %s: %v", name, err)
+		}
+		if _, err := tw.Write([]byte(contents)); err != nil {
+			t.Fatalf("write tar %s: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
 	}
 }
 
@@ -615,6 +986,198 @@ func TestEncoderClaim_RevokedAfterClaimBlocksHeartbeat(t *testing.T) {
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status=%d, want 403 body=%s", rr.Code, rr.Body.String())
 	}
+}
+
+// TestEncoderFail_DoubleFailIdempotent verifies that failing an already-failed
+// package returns 409 Conflict because the lease was already released.
+func TestEncoderFail_DoubleFailIdempotent(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	_, key := env.registerEncoder(t, "test")
+	claimRR := env.authedPost(t, "/api/encoder/claim", key, `{}`)
+	var claim encoderClaimResponse
+	_ = json.NewDecoder(claimRR.Body).Decode(&claim)
+
+	failRR := env.authedPost(t, "/api/encoder/jobs/"+claim.PackageID+"/fail", key,
+		`{"kind":"transient","reason":"first failure"}`)
+	if failRR.Code != http.StatusOK {
+		t.Fatalf("first fail status=%d body=%s", failRR.Code, failRR.Body.String())
+	}
+
+	fail2RR := env.authedPost(t, "/api/encoder/jobs/"+claim.PackageID+"/fail", key,
+		`{"kind":"transient","reason":"second failure"}`)
+	if fail2RR.Code != http.StatusConflict {
+		t.Fatalf("second fail status=%d body=%s, want 409", fail2RR.Code, fail2RR.Body.String())
+	}
+}
+
+// TestEncoderComplete_CompleteOnReadyPackageRejected verifies that sending
+// /complete for a package with no active lease returns 409 Conflict instead of
+// corrupting state.
+func TestEncoderComplete_CompleteOnReadyPackageRejected(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	_, key := env.registerEncoder(t, "test")
+	claim := env.claim(t, key)
+
+	if _, err := env.conn.ExecContext(context.Background(),
+		`DELETE FROM encoder_jobs WHERE package_id = ?`, claim.PackageID); err != nil {
+		t.Fatalf("delete lease: %v", err)
+	}
+
+	var body bytes.Buffer
+	writeRawTar(t, &body, map[string]string{
+		"init.mp4":      "init",
+		"stream.m3u8":   "#EXTM3U\n#EXTINF:6.000,\nseg000000.m4s\n",
+		"seg000000.m4s": "segment",
+	})
+	rr := env.authedPostRaw(t, "/api/encoder/jobs/"+claim.PackageID+"/complete", key, "application/x-tar", body.Bytes())
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("complete with no lease status=%d body=%s, want 409", rr.Code, rr.Body.String())
+	}
+}
+
+// TestEncoderFail_FailOnReadyPackageRejected verifies that sending /fail for a
+// package with no active lease returns 409 Conflict.
+func TestEncoderFail_FailOnReadyPackageRejected(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	_, key := env.registerEncoder(t, "test")
+	claim := env.claim(t, key)
+
+	if _, err := env.conn.ExecContext(context.Background(),
+		`DELETE FROM encoder_jobs WHERE package_id = ?`, claim.PackageID); err != nil {
+		t.Fatalf("delete lease: %v", err)
+	}
+
+	rr := env.authedPost(t, "/api/encoder/jobs/"+claim.PackageID+"/fail", key,
+		`{"kind":"terminal","reason":"lease already gone"}`)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("fail with no lease status=%d body=%s, want 409", rr.Code, rr.Body.String())
+	}
+}
+
+// TestEncoderFail_ReclaimAfterFailure verifies that an encoder can claim a
+// package after the previous claim was failed back to pending.
+func TestEncoderFail_ReclaimAfterFailure(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	_, key := env.registerEncoder(t, "test")
+
+	claim1 := env.claim(t, key)
+
+	failRR := env.authedPost(t, "/api/encoder/jobs/"+claim1.PackageID+"/fail", key,
+		`{"kind":"transient","reason":"first attempt"}`)
+	if failRR.Code != http.StatusOK {
+		t.Fatalf("first fail status=%d body=%s", failRR.Code, failRR.Body.String())
+	}
+
+	claim2 := env.claim(t, key)
+	if claim2.PackageID == "" {
+		t.Fatal("reclaim returned empty package id")
+	}
+
+	hbRR := env.authedPost(t, "/api/encoder/jobs/"+claim2.PackageID+"/heartbeat", key, `{}`)
+	if hbRR.Code != http.StatusOK {
+		t.Fatalf("heartbeat after reclaim status=%d body=%s", hbRR.Code, hbRR.Body.String())
+	}
+}
+
+// TestEncoder_StaleHeartbeatSweeperReclaims verifies that an encoder which
+// stops heartbeating eventually has its lease expired and the sweeper reclaims
+// the package. This is an integration test that composes the HTTP handlers
+// (claim, heartbeat) with the sweeper's lease expiry logic.
+func TestEncoder_StaleHeartbeatSweeperReclaims(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	now := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	env.app.now = func() time.Time { return now }
+
+	_, key := env.registerEncoder(t, "test")
+
+	// Claim with a 1-second lease TTL so we don't have to wait in real time.
+	claimRR := env.authedPost(t, "/api/encoder/claim", key, `{"leaseTtlSeconds":1}`)
+	if claimRR.Code != http.StatusOK {
+		t.Fatalf("claim: %d %s", claimRR.Code, claimRR.Body.String())
+	}
+	var claim encoderClaimResponse
+	if err := json.NewDecoder(claimRR.Body).Decode(&claim); err != nil {
+		t.Fatalf("decode claim: %v", err)
+	}
+
+	// Heartbeat to confirm the lease is active.
+	hbRR := env.authedPost(t, "/api/encoder/jobs/"+claim.PackageID+"/heartbeat", key, `{}`)
+	if hbRR.Code != http.StatusOK {
+		t.Fatalf("heartbeat: %d %s", hbRR.Code, hbRR.Body.String())
+	}
+
+	// Advance past the lease expiry. Heartbeat extends the lease to
+	// defaultEncoderLeaseTTL (60s), so advance past that.
+	now = now.Add(70 * time.Second)
+
+	// Run the sweeper with the advanced clock.
+	var logBuf bytes.Buffer
+	s := &Sweeper{
+		DB:          env.conn,
+		Interval:    30 * time.Second,
+		MaxAttempts: 5,
+		Now:         func() time.Time { return now },
+		Logger:      slog.New(slog.NewJSONHandler(&logBuf, nil)),
+	}
+	s.sweepOnce(context.Background(), "test")
+
+	// Verify the sweeper reclaimed the package.
+	pkg, err := db.MediaPackageByID(context.Background(), env.conn, claim.PackageID)
+	if err != nil || pkg == nil {
+		t.Fatalf("lookup package: err=%v", err)
+	}
+	if pkg.Status != db.PackageStatusPending {
+		t.Fatalf("package status=%s after stale heartbeat, want pending", pkg.Status)
+	}
+	if !strings.Contains(logBuf.String(), `"expired":1`) {
+		t.Fatalf("sweeper log missing expired counter:\n%s", logBuf.String())
+	}
+}
+
+// TestEncoderComplete_TruncatedTarRejected verifies that an interrupted upload
+// (truncated tar) is rejected with 400 Bad Request and does not corrupt state.
+func TestEncoderComplete_TruncatedTarRejected(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	env.app.cache = layout.NewCache(t.TempDir())
+	_, key := env.registerEncoder(t, "test")
+	claim := env.claim(t, key)
+
+	// Build a valid tar then truncate it mid-stream.
+	var full bytes.Buffer
+	writeRawTar(t, &full, map[string]string{
+		"init.mp4":      "init content here",
+		"stream.m3u8":   "#EXTM3U\n#EXTINF:6.000,\nseg000000.m4s\n",
+		"seg000000.m4s": "segment data",
+	})
+	if full.Len() < 100 {
+		t.Fatalf("generated tar too small (%d bytes)", full.Len())
+	}
+	// Truncate to only include the first header + partial data.
+	truncated := full.Bytes()[:full.Len()/2]
+
+	rr := env.authedPostRaw(t, "/api/encoder/jobs/"+claim.PackageID+"/complete", key, "application/x-tar", truncated)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("truncated tar status=%d body=%s, want 400", rr.Code, rr.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["error"] != "invalid_package_tar" {
+		t.Fatalf("error code=%q, want invalid_package_tar", resp["error"])
+	}
+}
+
+func (e *encoderHandlerEnv) authedPostRaw(t *testing.T, path, apiKey, contentType string, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", contentType)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	rr := httptest.NewRecorder()
+	e.app.Handler().ServeHTTP(rr, req)
+	return rr
 }
 
 // Sanity that encoder routes use bearer auth, not cookie auth, even when the

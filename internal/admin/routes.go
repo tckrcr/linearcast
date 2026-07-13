@@ -1,6 +1,9 @@
 package admin
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 // Handler returns an http.Handler with all admin routes registered.
 func (a *App) Handler() http.Handler {
@@ -10,17 +13,16 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/auth/logout", a.handleAuthLogout)
 	mux.HandleFunc("POST /api/auth/change-password", a.handleChangePassword)
 	mux.HandleFunc("GET /api/admin/write-log", a.handleAdminWriteLog)
-	mux.HandleFunc("GET /api/schedule-builder/source-status", a.handleScheduleBuilderSourceStatus)
-	mux.HandleFunc("GET /api/schedule-builder/package-profiles", a.handleMediaPackageProfiles)
-	mux.HandleFunc("GET /api/schedule-builder/package-candidates", a.handleMediaPackageCandidates)
-	mux.HandleFunc("GET /api/schedule-builder/shows", a.handleMediaShows)
-	mux.HandleFunc("GET /api/schedule-builder/albums", a.handleMediaAlbums)
-	mux.HandleFunc("GET /api/schedule-builder/by-group", a.handleMediaByGroup)
-	mux.HandleFunc("POST /api/schedule-builder/channels", a.handleScheduleBuilderCreateChannel)
+	mux.HandleFunc("GET /api/admin/media-sources/status", a.handleMediaSourceStatus)
 	mux.HandleFunc("GET /api/healthz", a.handleHealth)
 	mux.HandleFunc("GET /api/status", a.handleStatus)
 	mux.HandleFunc("GET /api/playable-sources", a.handlePlayableSources)
 	mux.HandleFunc("GET /api/guide", a.handleGuide)
+	mux.HandleFunc("GET /api/public-server-url", a.handlePublicServerURL)
+	mux.HandleFunc("PUT /api/public-server-url", a.handlePublicServerURLUpdate)
+	mux.HandleFunc("GET /api/m3u", a.handleM3U)
+	mux.HandleFunc("GET /api/xmltv", a.handleXMLTV)
+	mux.HandleFunc("GET /api/art/media/{mediaID}", a.handleMediaArtwork)
 	mux.HandleFunc("GET /api/now", a.handleNow)
 	mux.HandleFunc("GET /api/playing", a.handlePlaying)
 	mux.HandleFunc("GET /api/queue-depth", a.handleQueueDepth)
@@ -36,11 +38,14 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/channels/{channelID}/history", a.handleChannelHistory)
 	mux.HandleFunc("GET /api/channels/{channelID}/policy", a.handleChannelPolicy)
 	mux.HandleFunc("PUT /api/channels/{channelID}/policy", a.handleChannelPolicyUpdate)
+	mux.HandleFunc("PUT /api/channels/{channelID}/on-demand-profile", a.handleChannelOnDemandProfileUpdate)
 	mux.HandleFunc("PUT /api/channels/{channelID}/upstream-hls", a.handleChannelUpstreamHLSUpdate)
 	mux.HandleFunc("GET /api/channels/{channelID}/artwork", a.handleChannelArtwork)
 	mux.HandleFunc("PUT /api/channels/{channelID}/artwork", a.handleChannelArtworkUpdate)
 	mux.HandleFunc("DELETE /api/channels/{channelID}/artwork", a.handleChannelArtworkReset)
 	mux.HandleFunc("GET /api/admin/plex/status", a.handleAdminPlexStatus)
+	mux.HandleFunc("POST /api/admin/plex/pin", a.handlePlexPinStart)
+	mux.HandleFunc("GET /api/admin/plex/pin/{id}", a.handlePlexPinPoll)
 	mux.HandleFunc("PUT /api/admin/plex/config", a.handleAdminPlexConfigSet)
 	mux.HandleFunc("DELETE /api/admin/plex/config", a.handleAdminPlexConfigClear)
 	mux.HandleFunc("GET /api/admin/plex/libraries", a.handlePlexLibraries)
@@ -54,16 +59,17 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/admin/local-sources", a.handleLocalSourceCreate)
 	mux.HandleFunc("PUT /api/admin/local-sources/{id}", a.handleLocalSourceUpdate)
 	mux.HandleFunc("DELETE /api/admin/local-sources/{id}", a.handleLocalSourceDelete)
+	mux.HandleFunc("POST /api/admin/local-sources/scan", a.handleLocalSourcesScanAll)
 	mux.HandleFunc("POST /api/admin/local-sources/{id}/scan", a.handleLocalSourceScan)
 	mux.HandleFunc("POST /api/channels", a.handleCreateChannel)
 	mux.HandleFunc("POST /api/channels/probe-upstream", a.handleChannelProbeUpstream)
+	mux.HandleFunc("GET /api/spotify-url", a.handleSpotifyUrlGet)
+	mux.HandleFunc("PUT /api/spotify-url", a.handleSpotifyUrlSet)
+	mux.HandleFunc("DELETE /api/spotify-url", a.handleSpotifyUrlClear)
 	mux.HandleFunc("GET /api/channels", a.handleChannelList)
 	mux.HandleFunc("DELETE /api/channels/{channelID}", a.handleChannelDelete)
+	mux.HandleFunc("PATCH /api/channels/{channelID}", a.handleChannelPatch)
 	mux.HandleFunc("POST /api/channels/{channelID}/clone", a.handleChannelClone)
-	mux.HandleFunc("POST /api/channels/{channelID}/disable", a.handleChannelDisable)
-	mux.HandleFunc("POST /api/channels/{channelID}/enable", a.handleChannelEnable)
-	mux.HandleFunc("POST /api/channels/{channelID}/hide-from-guide", a.handleChannelHideFromGuide)
-	mux.HandleFunc("POST /api/channels/{channelID}/show-in-guide", a.handleChannelShowInGuide)
 	mux.HandleFunc("POST /api/channels/{channelID}/extend", a.handleChannelExtend)
 	mux.HandleFunc("DELETE /api/channels/{channelID}/schedule", a.handleChannelClearSchedule)
 	mux.HandleFunc("DELETE /api/channels/{channelID}/schedule/range", a.handleChannelDeleteScheduleRange)
@@ -75,26 +81,27 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/channels/{channelID}/schedule/entries/{entryId}/before", a.handleChannelInsertScheduleEntryBefore)
 	mux.HandleFunc("DELETE /api/channels/{channelID}/schedule/entries/{entryId}", a.handleChannelDeleteScheduleEntry)
 	mux.HandleFunc("POST /api/channels/{channelID}/restart-playback", a.handleChannelRestartPlayback)
+	mux.HandleFunc("POST /api/channels/{channelID}/stop-encoder", a.handleChannelStopEncoder)
 	mux.HandleFunc("GET /api/subtitle-settings", a.handleSubtitleSettings)
 	mux.HandleFunc("PUT /api/subtitle-settings", a.handleSubtitleSettingsUpdate)
 	mux.HandleFunc("GET /api/admin/subtitle-scan", a.handleSubtitleScanGet)
 	mux.HandleFunc("POST /api/admin/subtitle-scan", a.handleSubtitleScanStart)
-	mux.HandleFunc("GET /api/admin/subtitle-extract-all", a.handleSubtitleExtractAllGet)
-	mux.HandleFunc("POST /api/admin/subtitle-extract-all", a.handleSubtitleExtractAllStart)
-	mux.HandleFunc("POST /api/media/{mediaID}/subtitles/extract", a.handleMediaSubtitlesExtract)
-	mux.HandleFunc("GET /api/media/{mediaID}/subtitles", a.handleMediaSubtitlesList)
-	mux.HandleFunc("DELETE /api/media/{mediaID}/subtitles/{language}", a.handleMediaSubtitlesDelete)
 	mux.HandleFunc("GET /api/fs/browse", a.handleFSBrowse)
 	mux.HandleFunc("POST /api/ingest", a.handleIngestStart)
 	mux.HandleFunc("GET /api/ingest/{id}", a.handleIngestStatus)
 	mux.HandleFunc("POST /api/ingest/{id}/cancel", a.handleIngestCancel)
+	mux.HandleFunc("PATCH /api/media/{mediaID}", a.handleMediaUpdate)
+	mux.HandleFunc("DELETE /api/media/{mediaID}", a.handleMediaDelete)
 	mux.HandleFunc("GET /api/media", a.handleMediaSearch)
+	mux.HandleFunc("GET /api/media/inventory", a.handleMediaInventory)
+	mux.HandleFunc("POST /api/media/collections/bulk", a.handleMediaCollectionBulk)
 	mux.HandleFunc("GET /api/media/groups", a.handleMediaGroups)
-	mux.HandleFunc("GET /api/media/shows", a.handleMediaShows)
+	mux.HandleFunc("GET /api/media/movies", a.handleMediaMovies)
 	mux.HandleFunc("GET /api/media/albums", a.handleMediaAlbums)
 	mux.HandleFunc("GET /api/media/by-group", a.handleMediaByGroup)
 	mux.HandleFunc("GET /api/media/package-profiles", a.handleMediaPackageProfiles)
 	mux.HandleFunc("PUT /api/package-profiles/{name}", a.handlePackageProfileUpdate)
+	mux.HandleFunc("POST /api/package-profiles/{name}/enable", a.handlePackageProfileEnable)
 	mux.HandleFunc("DELETE /api/package-profiles/{name}", a.handlePackageProfileDelete)
 	mux.HandleFunc("PUT /api/admin/default-packaged-profile", a.handleDefaultPackagedProfileUpdate)
 	mux.HandleFunc("GET /api/media/package-candidates", a.handleMediaPackageCandidates)
@@ -102,11 +109,16 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/media/package/cancel", a.handleMediaPackageCancel)
 	mux.HandleFunc("GET /api/channels/{channelID}/profile-migration", a.handleChannelProfileMigrationStatus)
 	mux.HandleFunc("POST /api/channels/{channelID}/profile-migration", a.handleChannelProfileMigrationQueue)
-	mux.HandleFunc("GET /api/schedule-builder/filler-candidates", a.handleScheduleBuilderFillerCandidates)
 	mux.HandleFunc("GET /api/filler-assets", a.handleFillerAssets)
+	mux.HandleFunc("GET /api/filler-assets/candidates", a.handleFillerAssetCandidates)
 	mux.HandleFunc("POST /api/filler-assets", a.handleFillerAssetCreate)
 	mux.HandleFunc("GET /api/admin/chain-integrity", a.handleChainIntegrity)
+	mux.HandleFunc("GET /api/admin/maintenance/schedule-check", a.handleMaintenanceScheduleCheck)
 	mux.HandleFunc("GET /api/admin/maintenance/package-integrity", a.handleMaintenancePackageIntegrity)
+	mux.HandleFunc("POST /api/admin/maintenance/package-integrity", a.handleMaintenancePackageIntegrityRepair)
+	mux.HandleFunc("POST /api/admin/maintenance/media-ordering", a.handleMaintenanceMediaOrderingBackfill)
+	mux.HandleFunc("POST /api/admin/maintenance/import-packages", a.handleMaintenanceImportPackages)
+	mux.HandleFunc("POST /api/admin/maintenance/packages/{packageID}/requeue", a.handleMaintenancePackageRequeue)
 	mux.HandleFunc("DELETE /api/admin/maintenance/missing-media", a.handleMaintenanceMissingMedia)
 	mux.HandleFunc("DELETE /api/admin/maintenance/orphan-packages", a.handleMaintenanceOrphanPackages)
 	mux.HandleFunc("DELETE /api/admin/maintenance/packages", a.handleMaintenancePackageDelete)
@@ -123,6 +135,7 @@ func (a *App) Handler() http.Handler {
 	// encoders from the UI.
 	mux.HandleFunc("POST /api/admin/encoders", a.handleEncoderRegister)
 	mux.HandleFunc("GET /api/admin/encoders", a.handleEncoderList)
+	mux.HandleFunc("GET /api/admin/encoder-events", a.handleEncoderEvents)
 	mux.HandleFunc("PATCH /api/admin/encoders/{id}", a.handleEncoderUpdate)
 	mux.HandleFunc("POST /api/admin/encoders/{id}/revoke", a.handleEncoderRevoke)
 	mux.HandleFunc("DELETE /api/admin/encoders/{id}", a.handleEncoderDelete)
@@ -133,8 +146,6 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/admin/scheduler-tunables", a.handleSchedulerTunablesUpdate)
 	mux.HandleFunc("GET /api/admin/encoder-sweeper-settings", a.handleEncoderSweeperSettings)
 	mux.HandleFunc("PUT /api/admin/encoder-sweeper-settings", a.handleEncoderSweeperSettingsUpdate)
-	mux.HandleFunc("GET /api/admin/on-demand-session-settings", a.handleOnDemandSessionSettings)
-	mux.HandleFunc("PUT /api/admin/on-demand-session-settings", a.handleOnDemandSessionSettingsUpdate)
 
 	// Remote encoder polling API (bearer-token auth via /api/encoder/* prefix).
 	mux.HandleFunc("GET /api/encoder/ping", a.handleEncoderPing)
@@ -144,5 +155,22 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/encoder/jobs/{packageID}/heartbeat", a.handleEncoderHeartbeat)
 	mux.HandleFunc("POST /api/encoder/jobs/{packageID}/complete", a.handleEncoderComplete)
 	mux.HandleFunc("POST /api/encoder/jobs/{packageID}/fail", a.handleEncoderFail)
-	return a.writeLogMiddleware(a.csrfMiddleware(a.authMiddleware(mux)))
+	return a.requestLogMiddleware(a.writeLogMiddleware(a.csrfMiddleware(a.authMiddleware(mux))))
+}
+
+// requestLogMiddleware logs every HTTP request (method, path, status, duration)
+// as structured JSON for Loki. It wraps the entire middleware chain so both
+// successful and rejected (auth, CSRF) requests are recorded.
+func (a *App) requestLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		crw := &captureResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(crw, r)
+		a.logger.Info("http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", crw.status,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	})
 }

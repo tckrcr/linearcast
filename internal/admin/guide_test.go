@@ -27,8 +27,8 @@ func TestHandleGuideReturnsTrimmedScheduleEntries(t *testing.T) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile, hidden_from_guide
 		)
-		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 0),
-		       ('hidden', 'Hidden', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 1)`); err != nil {
+		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0),
+		       ('hidden', 'Hidden', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 1)`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -94,12 +94,17 @@ func TestHandleGuideReturnsTrimmedScheduleEntries(t *testing.T) {
 
 func TestHandleGuideReturnsExternalChannelAsLive(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/now-playing" {
+		switch r.URL.Path {
+		case "/now-playing":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"title":"Song","artist":"Artist","playing":true}`))
+		case "/hls/stream.m3u8":
+			// The heartbeat probes the upstream manifest to derive live/down.
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte("#EXTM3U\n#EXT-X-VERSION:3\n"))
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"title":"Song","artist":"Artist","playing":true}`))
 	}))
 	defer upstream.Close()
 
@@ -149,6 +154,53 @@ func TestHandleGuideReturnsExternalChannelAsLive(t *testing.T) {
 	}
 	if ch.NowPlaying == nil || ch.NowPlaying.Title != "Song" || !ch.NowPlaying.Playing {
 		t.Fatalf("nowPlaying=%+v", ch.NowPlaying)
+	}
+}
+
+func TestHandleGuideReportsExternalChannelDownWhenUpstreamUnreachable(t *testing.T) {
+	// Start then immediately close so the upstream address refuses connections.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	upstreamURL := upstream.URL
+	upstream.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "linearcast.db")
+	conn, err := db.OpenReadWrite(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := db.ApplySchema(context.Background(), conn); err != nil {
+		t.Fatalf("apply schema: %v", err)
+	}
+	if _, err := conn.Exec(`INSERT INTO channels (
+			id, display_name, source_directory, ordering, enabled, created_at_ms,
+			playback_mode, media_kind, upstream_hls_url
+		)
+		VALUES ('spotify', 'Spotify', '', 'alphabetical', 1, 0, 'packaged', 'music', ?)`,
+		upstreamURL+"/hls/stream.m3u8"); err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+
+	app := New(Config{
+		DB:  conn,
+		Now: func() time.Time { return time.UnixMilli(6000).UTC() },
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/guide", nil)
+	res := httptest.NewRecorder()
+	app.handleGuide(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	var body guideResponse
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Channels) != 1 {
+		t.Fatalf("channels=%+v, want one", body.Channels)
+	}
+	if ch := body.Channels[0]; !ch.IsExternal || ch.Status != "down" {
+		t.Fatalf("want external channel down, got %+v", ch)
 	}
 }
 

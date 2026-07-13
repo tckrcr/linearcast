@@ -43,7 +43,7 @@ func insertDeleteFixture(t *testing.T, conn *sql.DB, enabled bool) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', ?, 0, 'packaged', 'h264-main-1080p')`, enabledInt); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', ?, 0, 'packaged', 'h264-1080p-8mbps')`, enabledInt); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -62,8 +62,8 @@ func insertDeleteFixture(t *testing.T, conn *sql.DB, enabled bool) {
 	if err := db.BackfillScheduleEntryAnchorsForChannel(conn, "ch"); err != nil {
 		t.Fatalf("backfill schedule anchors: %v", err)
 	}
-	pkgRoot := "/cache/packages/m1/h264-main-1080p"
-	initPath := "/cache/packages/m1/h264-main-1080p/init.mp4"
+	pkgRoot := "/cache/packages/m1/h264-1080p-8mbps"
+	initPath := "/cache/packages/m1/h264-1080p-8mbps/init.mp4"
 	pkgDur := int64(18000)
 	pkg := db.MediaPackage{
 		ID:                 "pkg-m1",
@@ -80,7 +80,7 @@ func insertDeleteFixture(t *testing.T, conn *sql.DB, enabled bool) {
 		t.Fatalf("insert package: %v", err)
 	}
 	if err := db.ReplacePackagedSegments(context.Background(), conn, pkg.ID, []db.PackagedSegment{
-		{PackageID: pkg.ID, SegmentNumber: 0, MediaStartMs: 0, DurationMs: 18000, Path: strptr("/cache/packages/m1/h264-main-1080p/segments/0.m4s")},
+		{PackageID: pkg.ID, SegmentNumber: 0, MediaStartMs: 0, DurationMs: 18000, Path: strptr("/cache/packages/m1/h264-1080p-8mbps/segments/0.m4s")},
 	}); err != nil {
 		t.Fatalf("insert packaged segment: %v", err)
 	}
@@ -98,8 +98,8 @@ func insertMedia(t *testing.T, conn *sql.DB, mediaID string, durationMs int64) {
 
 func insertReadyPackage(t *testing.T, conn *sql.DB, mediaID string, durationMs int64) {
 	t.Helper()
-	pkgRoot := "/cache/packages/" + mediaID + "/h264-main-1080p"
-	initPath := "/cache/packages/" + mediaID + "/h264-main-1080p/init.mp4"
+	pkgRoot := "/cache/packages/" + mediaID + "/h264-1080p-8mbps"
+	initPath := "/cache/packages/" + mediaID + "/h264-1080p-8mbps/init.mp4"
 	pkg := db.MediaPackage{
 		ID:                 "pkg-" + mediaID,
 		MediaID:            mediaID,
@@ -122,7 +122,7 @@ func insertFutureRangeFixture(t *testing.T, conn *sql.DB) int64 {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	for _, mediaID := range []string{"m1", "m2", "m3", "m4"} {

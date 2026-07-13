@@ -1,8 +1,16 @@
-import type { MediaLibrary, PlexStatus } from "../types";
+import type { MediaLibrary, PlexPinPoll, PlexPinStart, PlexStatus } from "../types";
 import { apiFetch } from "./client";
 
 export async function getPlexStatus() {
   return apiFetch<PlexStatus>("/api/admin/plex/status", { cache: "no-store" });
+}
+
+export async function startPlexPin() {
+  return apiFetch<PlexPinStart>("/api/admin/plex/pin", { method: "POST" });
+}
+
+export async function pollPlexPin(id: number, code: string, signal?: AbortSignal) {
+  return apiFetch<PlexPinPoll>(`/api/admin/plex/pin/${id}?code=${encodeURIComponent(code)}`, { cache: "no-store", signal });
 }
 
 export async function setPlexConfig(url: string, token: string, pathMap?: string) {

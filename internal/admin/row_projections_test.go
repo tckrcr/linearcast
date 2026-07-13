@@ -24,7 +24,7 @@ func TestHandleChannelMediaNullFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertMedia(t, conn, "ep1", 12000)
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-null', 'Null Field', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		playback_mode, required_package_profile) VALUES ('ch-null', 'Null Field', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -40,7 +40,7 @@ func TestHandleChannelMediaNullFieldsWireShape(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	want := `{"channelId":"ch-null","displayName":"Null Field","requiredPackageProfile":"h264-main-1080p","count":1,"media":[{"mediaId":"ep1","path":"/tmp/ep1.mkv","durationMs":12000,"codecCheckPassed":true,"packageStatus":"missing","packageReady":false}]}` + "\n"
+	want := `{"channelId":"ch-null","displayName":"Null Field","requiredPackageProfile":"h264-1080p-8mbps","count":1,"media":[{"mediaId":"ep1","path":"/tmp/ep1.mkv","durationMs":12000,"codecCheckPassed":true,"packageStatus":"missing","packageReady":false}]}` + "\n"
 	if got := res.Body.String(); got != want {
 		t.Fatalf("body mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -53,7 +53,7 @@ func TestHandleChannelMediaSetFieldsWireShape(t *testing.T) {
 		t.Fatalf("set fields: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-set', 'Set Field', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		playback_mode, required_package_profile) VALUES ('ch-set', 'Set Field', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -70,7 +70,7 @@ func TestHandleChannelMediaSetFieldsWireShape(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	want := `{"channelId":"ch-set","displayName":"Set Field","requiredPackageProfile":"h264-main-1080p","count":1,"media":[{"mediaId":"ep2","title":"My Episode","path":"/tmp/ep2.mkv","schedulingGroup":"Season 1","durationMs":12000,"codecCheckPassed":true,"codecCheckReason":"fast-pics","packageId":"pkg-ep2","packageStatus":"ready","packageReady":true,"packagedDurationMs":12000}]}` + "\n"
+	want := `{"channelId":"ch-set","displayName":"Set Field","requiredPackageProfile":"h264-1080p-8mbps","count":1,"media":[{"mediaId":"ep2","title":"My Episode","path":"/tmp/ep2.mkv","collectionName":"Season 1","durationMs":12000,"codecCheckPassed":true,"codecCheckReason":"fast-pics","packageId":"pkg-ep2","packageStatus":"ready","packageReady":true,"packagedDurationMs":12000}]}` + "\n"
 	if got := res.Body.String(); got != want {
 		t.Fatalf("body mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -81,7 +81,7 @@ func TestHandleChannelMediaSetFieldsWireShape(t *testing.T) {
 func TestHandleChannelFillerAssetsNullFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-fa-null', 'Null FA', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		playback_mode, required_package_profile) VALUES ('ch-fa-null', 'Null FA', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	insertMedia(t, conn, "fa1", 30000)
@@ -102,7 +102,7 @@ func TestHandleChannelFillerAssetsNullFieldsWireShape(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	want := `{"assets":[{"id":"fa-null","mediaId":"fa1","label":"Null Filler","kind":"bumper","enabled":true,"createdAtMs":0,"channelId":"ch-fa-null","weight":10,"channelEnabled":true,"path":"/tmp/fa1.mkv","durationMs":30000,"packageStatus":"missing","packageReady":false}],"channelId":"ch-fa-null","count":1,"requiredPackageProfile":"h264-main-1080p"}` + "\n"
+	want := `{"assets":[{"id":"fa-null","mediaId":"fa1","label":"Null Filler","kind":"bumper","enabled":true,"createdAtMs":0,"channelId":"ch-fa-null","weight":10,"channelEnabled":true,"path":"/tmp/fa1.mkv","durationMs":30000,"packageStatus":"missing","packageReady":false}],"channelId":"ch-fa-null","count":1,"requiredPackageProfile":"h264-1080p-8mbps"}` + "\n"
 	if got := res.Body.String(); got != want {
 		t.Fatalf("body mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -111,7 +111,7 @@ func TestHandleChannelFillerAssetsNullFieldsWireShape(t *testing.T) {
 func TestHandleChannelFillerAssetsSetFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-fa-set', 'Set FA', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		playback_mode, required_package_profile) VALUES ('ch-fa-set', 'Set FA', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	insertMedia(t, conn, "fa2", 45000)
@@ -136,7 +136,7 @@ func TestHandleChannelFillerAssetsSetFieldsWireShape(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	want := `{"assets":[{"id":"fa-set","mediaId":"fa2","label":"Set Filler","kind":"filler","enabled":true,"createdAtMs":0,"channelId":"ch-fa-set","weight":5,"channelEnabled":true,"path":"/tmp/fa2.mkv","title":"My Filler","schedulingGroup":"Group F","durationMs":45000,"packageId":"pkg-fa2","packageStatus":"ready","packageReady":true,"packagedDurationMs":45000}],"channelId":"ch-fa-set","count":1,"requiredPackageProfile":"h264-main-1080p"}` + "\n"
+	want := `{"assets":[{"id":"fa-set","mediaId":"fa2","label":"Set Filler","kind":"filler","enabled":true,"createdAtMs":0,"channelId":"ch-fa-set","weight":5,"channelEnabled":true,"path":"/tmp/fa2.mkv","title":"My Filler","collectionName":"Group F","durationMs":45000,"packageId":"pkg-fa2","packageStatus":"ready","packageReady":true,"packagedDurationMs":45000}],"channelId":"ch-fa-set","count":1,"requiredPackageProfile":"h264-1080p-8mbps"}` + "\n"
 	if got := res.Body.String(); got != want {
 		t.Fatalf("body mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -163,7 +163,7 @@ func TestHandleMediaPackageCandidatesNullTitleGroupWireShape(t *testing.T) {
 		t.Fatalf("want 1 candidate, got %d", len(body.Media))
 	}
 	e := body.Media[0]
-	if e.MediaID != "cand-null" || e.Title != "" || e.SchedulingGroup != "" || e.PackageStatus != "missing" || e.PackageProfile != db.DefaultPackageProfile {
+	if e.MediaID != "cand-null" || e.Title != "" || e.CollectionName != "" || e.PackageStatus != "missing" || e.PackageProfile != db.DefaultPackageProfile {
 		t.Fatalf("null candidate mismatch: %+v", e)
 	}
 }
@@ -171,11 +171,25 @@ func TestHandleMediaPackageCandidatesNullTitleGroupWireShape(t *testing.T) {
 func TestHandleMediaPackageCandidatesSetTitleGroupWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertMedia(t, conn, "cand-set", 24000)
-	if _, err := conn.Exec(`UPDATE media SET title = 'Candidate Title', scheduling_group = 'Group C' WHERE id = 'cand-set'`); err != nil {
+	if _, err := conn.Exec(`UPDATE media SET title = 'Candidate Title', scheduling_group = 'Group C', source_ref = 'plex://101' WHERE id = 'cand-set'`); err != nil {
 		t.Fatalf("set fields: %v", err)
 	}
+	pkgBytes := int64(123456)
+	pkgDur := int64(24000)
+	if err := db.UpsertMediaPackage(context.Background(), conn, db.MediaPackage{
+		ID:                 "pkg-cand-set",
+		MediaID:            "cand-set",
+		RenditionProfile:   db.DefaultPackageProfile,
+		Status:             db.PackageStatusReady,
+		PackagedDurationMs: &pkgDur,
+		PackageBytes:       &pkgBytes,
+		CreatedAtMs:        1,
+		UpdatedAtMs:        2,
+	}); err != nil {
+		t.Fatalf("insert package: %v", err)
+	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/media/package-candidates", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/media/package-candidates?status=ready", nil)
 	res := httptest.NewRecorder()
 	app.handleMediaPackageCandidates(res, req)
 
@@ -190,8 +204,11 @@ func TestHandleMediaPackageCandidatesSetTitleGroupWireShape(t *testing.T) {
 		t.Fatalf("want 1 candidate, got %d", len(body.Media))
 	}
 	e := body.Media[0]
-	if e.MediaID != "cand-set" || e.Title != "Candidate Title" || e.SchedulingGroup != "Group C" {
+	if e.MediaID != "cand-set" || e.Title != "Candidate Title" || e.CollectionName != "Group C" || e.SourceRef != "plex://101" {
 		t.Fatalf("set candidate mismatch: %+v", e)
+	}
+	if e.PackageBytes == nil || *e.PackageBytes != pkgBytes {
+		t.Fatalf("packageBytes=%v, want %d", e.PackageBytes, pkgBytes)
 	}
 }
 

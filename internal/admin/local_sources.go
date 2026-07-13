@@ -89,10 +89,68 @@ func (a *App) handleLocalSourceScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jobID, job := a.ingestJobs.create()
-	go a.runLocalSourceScan(job, source.MediaKind, paths)
+	go a.runLocalSourcesScan(job, []localScanGroup{{mediaKind: source.MediaKind, paths: paths}})
 
 	w.Header().Set("Content-Type", "application/json")
 	writeJSONStatus(w, http.StatusAccepted, map[string]string{"jobId": jobID})
+}
+
+// handleLocalSourcesScanAll scans every configured local media source in a
+// single job. Unlike a per-source scan it is lenient about paths: missing or
+// out-of-root directories are skipped rather than failing the request, so one
+// stale source can't block scanning the rest.
+func (a *App) handleLocalSourcesScanAll(w http.ResponseWriter, r *http.Request) {
+	sources, err := db.ListLocalMediaSources(r.Context(), a.dbConn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	var groups []localScanGroup
+	for _, source := range sources {
+		paths := a.existingScanPaths(source.Paths)
+		if len(paths) == 0 {
+			continue
+		}
+		groups = append(groups, localScanGroup{mediaKind: source.MediaKind, paths: paths})
+	}
+	if len(groups) == 0 {
+		writeError(w, http.StatusBadRequest, "no_sources", "no local media sources with readable paths to scan")
+		return
+	}
+
+	jobID, job := a.ingestJobs.create()
+	go a.runLocalSourcesScan(job, groups)
+
+	w.Header().Set("Content-Type", "application/json")
+	writeJSONStatus(w, http.StatusAccepted, map[string]string{"jobId": jobID})
+}
+
+// existingScanPaths returns the cleaned, de-duplicated subset of rawPaths that
+// are readable directories under the media root. Invalid entries are dropped
+// silently — used by scan-all where partial coverage beats failing outright.
+func (a *App) existingScanPaths(rawPaths []string) []string {
+	var paths []string
+	seen := map[string]bool{}
+	for _, raw := range rawPaths {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		clean := filepath.Clean(raw)
+		if a.mediaRoot != "" && !isUnderRoot(clean, filepath.Clean(a.mediaRoot)) {
+			continue
+		}
+		info, err := os.Stat(clean)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		paths = append(paths, clean)
+	}
+	return paths
 }
 
 func (a *App) decodeLocalSourceRequest(w http.ResponseWriter, r *http.Request, id string) (db.LocalMediaSource, bool) {
@@ -176,61 +234,74 @@ func normalizeLocalMediaKind(kind string) string {
 	}
 }
 
-func (a *App) runLocalSourceScan(job *ingestJob, mediaKind string, paths []string) {
+// localScanGroup pairs a media kind with the paths to scan under it, so one
+// ingest job can cover several sources (each with its own kind) at once.
+type localScanGroup struct {
+	mediaKind string
+	paths     []string
+}
+
+func (a *App) runLocalSourcesScan(job *ingestJob, groups []localScanGroup) {
 	ctx := job.ctx
 
 	var total int
-	for _, path := range paths {
-		var n int
-		var err error
-		if mediaKind == "music" {
-			n, err = lcingest.CountMusicFiles(path)
-		} else {
-			n, err = lcingest.CountMediaFiles(path)
+	for _, g := range groups {
+		for _, path := range g.paths {
+			var n int
+			var err error
+			if g.mediaKind == "music" {
+				n, err = lcingest.CountMusicFiles(path)
+			} else {
+				n, err = lcingest.CountMediaFiles(path)
+			}
+			if err != nil {
+				job.Printf("error counting files in %s: %v", path, err)
+				continue
+			}
+			total += n
 		}
-		if err != nil {
-			job.Printf("error counting files in %s: %v", path, err)
-			continue
-		}
-		total += n
 	}
 	job.setTotal(total)
 
 	acc := lcingest.Result{}
 	cancelled := false
-	for _, path := range paths {
-		if ctx.Err() != nil {
-			cancelled = true
+	for _, g := range groups {
+		if cancelled {
 			break
 		}
-		job.Printf("scanning local source path=%s", path)
-		var (
-			res lcingest.Result
-			err error
-		)
-		if mediaKind == "music" {
-			res, err = lcingest.IngestMusic(ctx, a.dbConn, path, job)
-		} else {
-			res, err = lcingest.Ingest(ctx, a.dbConn, path, job)
-		}
-		acc.Total += res.Total
-		acc.Passed += res.Passed
-		acc.Failed += res.Failed
-		acc.Failures = append(acc.Failures, res.Failures...)
-		if err != nil {
+		for _, path := range g.paths {
 			if ctx.Err() != nil {
 				cancelled = true
 				break
 			}
-			job.Printf("error scanning %s: %v", path, err)
-			acc.Failed++
-			acc.Failures = append(acc.Failures, err.Error())
-			continue
-		}
-		if mediaKind == "filler" {
-			nowMs := a.now().UTC().UnixMilli()
-			if err := db.RegisterFillerAssetsFromDirectory(ctx, a.dbConn, path, nowMs); err != nil {
-				job.Printf("error registering filler assets for %s: %v", path, err)
+			job.Printf("scanning local source path=%s kind=%s", path, g.mediaKind)
+			var (
+				res lcingest.Result
+				err error
+			)
+			if g.mediaKind == "music" {
+				res, err = lcingest.IngestMusic(ctx, a.dbConn, path, job)
+			} else {
+				res, err = lcingest.Ingest(ctx, a.dbConn, path, job)
+			}
+			acc.Add(res)
+			if err != nil {
+				if ctx.Err() != nil {
+					cancelled = true
+					break
+				}
+				job.Printf("error scanning %s: %v", path, err)
+				acc.Add(lcingest.Result{
+					Failed:         1,
+					FailureReasons: map[string]int{err.Error(): 1},
+				})
+				continue
+			}
+			if g.mediaKind == "filler" {
+				nowMs := a.now().UTC().UnixMilli()
+				if err := db.RegisterFillerAssetsFromDirectory(ctx, a.dbConn, path, nowMs); err != nil {
+					job.Printf("error registering filler assets for %s: %v", path, err)
+				}
 			}
 		}
 	}

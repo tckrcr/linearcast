@@ -9,13 +9,13 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/metrics"
-	"github.com/tckrcr/linearcast/internal/packageid"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
-	"github.com/tckrcr/linearcast/internal/scheduler"
 )
 
 // Worker keeps package coverage ahead of schedule for every enabled packaged
@@ -48,7 +48,7 @@ type Worker struct {
 
 // default worker tunables. These used to be env vars; they are now baked-in
 // constants because changing them independently would break cross-component
-// assumptions (e.g. target segment duration must match the scheduler's 6s grid).
+// assumptions.
 const (
 	defaultPollInterval      = 5 * time.Second
 	defaultPreset            = "veryfast"
@@ -74,7 +74,7 @@ func (w *Worker) Validate() error {
 		w.Concurrency = 0
 	}
 	if w.TargetSegmentMs <= 0 {
-		w.TargetSegmentMs = scheduler.TargetSegmentMs
+		w.TargetSegmentMs = PackagedSegmentMs
 	}
 	if w.Preset == "" {
 		w.Preset = defaultPreset
@@ -246,7 +246,7 @@ func (w *Worker) tryClaim(ctx context.Context, mediaID, profile string, nowMs in
 	return db.ClaimPackage(ctx, w.DB, db.ClaimRequest{
 		MediaID:   mediaID,
 		Profile:   profile,
-		PackageID: packageid.For(mediaID, profile),
+		PackageID: layout.ID(mediaID, profile),
 		EncoderID: w.EncoderID,
 		Local:     true,
 		LeaseTTL:  w.LeaseTTL,
@@ -256,7 +256,7 @@ func (w *Worker) tryClaim(ctx context.Context, mediaID, profile string, nowMs in
 
 func (w *Worker) markFailed(ctx context.Context, mediaID, profile string, cause error) error {
 	nowMs := time.Now().UTC().UnixMilli()
-	packageID := packageid.For(mediaID, profile)
+	packageID := layout.ID(mediaID, profile)
 	reason := ""
 	if cause != nil {
 		reason = cause.Error()
@@ -269,37 +269,27 @@ func (w *Worker) markFailed(ctx context.Context, mediaID, profile string, cause 
 // process so a redeploy mid-encode resumes within a poll interval instead of
 // waiting out a lease TTL (or, pre-lease, sticking in processing forever — the
 // failure mode this replaced, where the old 60-minute startup cutoff skipped
-// freshly-killed encodes). A just-started worker holds no live jobs, so:
-//
-//  1. Every lease under this worker's own encoder ID is an orphan; force-requeue
-//     it now rather than waiting for the sweeper to time it out.
-//  2. TRANSITIONAL: processing rows with no lease are pre-lease local jobs.
-//     Since every claim now creates a lease, this drains the pre-deploy backlog
-//     once and is a no-op after. Remove with db.RequeueLeaselessProcessing.
+// freshly-killed encodes). A just-started worker holds no live jobs, so every
+// lease under this worker's own encoder ID is an orphan: force-requeue it now
+// rather than waiting for the sweeper to time it out.
 func (w *Worker) recoverOrphans(ctx context.Context) error {
+	if w.EncoderID == "" {
+		return nil
+	}
 	nowMs := time.Now().UTC().UnixMilli()
-	if w.EncoderID != "" {
-		results, err := db.RequeueEncoderJobs(ctx, w.DB, w.EncoderID, w.MaxAttempts, nowMs)
-		if err != nil {
-			return fmt.Errorf("requeue own leases: %w", err)
-		}
-		if len(results) > 0 {
-			log.Printf("recovered own leased jobs count=%d encoder=%s", len(results), w.EncoderID)
-		}
-	}
-	n, err := db.RequeueLeaselessProcessing(ctx, w.DB, w.MaxAttempts, nowMs)
+	results, err := db.RequeueEncoderJobs(ctx, w.DB, w.EncoderID, w.MaxAttempts, nowMs)
 	if err != nil {
-		return fmt.Errorf("requeue leaseless processing: %w", err)
+		return fmt.Errorf("requeue own leases: %w", err)
 	}
-	if n > 0 {
-		log.Printf("recovered pre-lease processing rows count=%d", n)
+	if len(results) > 0 {
+		log.Printf("recovered own leased jobs count=%d encoder=%s", len(results), w.EncoderID)
 	}
 	return nil
 }
 
 func (w *Worker) runOne(ctx context.Context, idx int, job claimedJob) {
 	started := time.Now()
-	packageID := packageid.For(job.Media.ID, job.Profile)
+	packageID := layout.ID(job.Media.ID, job.Profile)
 	log.Printf("worker=%d packaging media=%s profile=%s path=%s", idx, job.Media.ID, job.Profile, job.Media.Path)
 
 	// Heartbeat the lease for the life of the encode. jobCtx lets the heartbeat
@@ -307,24 +297,39 @@ func (w *Worker) runOne(ctx context.Context, idx int, job claimedJob) {
 	// long stall), so two workers never package the same media.
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// progress holds the latest 0–99 encode percentage written by the ffmpeg
+	// progress callback and read by the heartbeat goroutine. -1 = not yet known.
+	var progressVal int32 = -1
+
 	var hb sync.WaitGroup
 	if w.EncoderID != "" {
 		hb.Add(1)
 		go func() {
 			defer hb.Done()
-			w.heartbeat(jobCtx, packageID, cancel)
+			w.heartbeat(jobCtx, packageID, cancel, func() *int {
+				v := int(atomic.LoadInt32(&progressVal))
+				if v < 0 {
+					return nil
+				}
+				return &v
+			})
 		}()
 	}
 
 	res, err := PackageOne(jobCtx, w.DB, Options{
 		MediaPath:       job.Media.Path,
 		Profile:         job.Profile,
+		PackageID:       packageID,
 		OutputRoot:      w.OutputRoot,
 		WorkDir:         w.WorkDir,
 		TargetSegmentMs: w.TargetSegmentMs,
 		Preset:          w.Preset,
 		FailKind:        "transient",
 		MaxAttempts:     w.MaxAttempts,
+		ProgressFunc: func(pct int) {
+			atomic.StoreInt32(&progressVal, int32(pct))
+		},
 	})
 
 	if w.EncoderID != "" {
@@ -378,7 +383,7 @@ func leaseLost(err error) bool {
 // a single failed write proves nothing while the lease TTL has slack, and
 // aborting on one SQLITE_BUSY killed healthy encodes. A failure once ctx is
 // already cancelled is the normal end-of-job race and is ignored.
-func (w *Worker) heartbeat(ctx context.Context, packageID string, onLost func()) {
+func (w *Worker) heartbeat(ctx context.Context, packageID string, onLost func(), getProgress func() *int) {
 	interval := w.LeaseTTL / 3
 	if interval <= 0 {
 		interval = defaultLeaseTTL / 3
@@ -392,7 +397,7 @@ func (w *Worker) heartbeat(ctx context.Context, packageID string, onLost func())
 			return
 		case <-ticker.C:
 			nowMs := time.Now().UTC().UnixMilli()
-			_, err := db.HeartbeatEncoderJob(ctx, w.DB, packageID, w.EncoderID, w.LeaseTTL, nil, nowMs)
+			_, err := db.HeartbeatEncoderJob(ctx, w.DB, packageID, w.EncoderID, w.LeaseTTL, getProgress(), nowMs)
 			if err == nil {
 				misses = 0
 				continue
@@ -472,27 +477,24 @@ needed AS (
     )
     WHERE c.enabled = 1
       AND c.upstream_hls_url IS NULL
-      AND c.playback_mode != 'plex_relay'
       AND c.prefill_mode = 'eager'
       AND COALESCE(NULLIF(TRIM(json_each.value), ''), COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)) != ''
     GROUP BY cm.media_id, COALESCE(NULLIF(TRIM(json_each.value), ''), COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)), c.media_kind
 )
-SELECT media_id, rendition_profile, media_kind
+SELECT media_id, rendition_profile, media_kind, status
 FROM (
     SELECT n.media_id, n.rendition_profile, COALESCE(m.media_kind, 'video') AS media_kind,
+           NULL AS status,
            0 AS priority, n.first_position AS sort_key
     FROM needed n
     JOIN media m ON m.id = n.media_id
-    LEFT JOIN media_packages p
-           ON p.media_id = n.media_id
-          AND p.rendition_profile = n.rendition_profile
     WHERE m.codec_check_passed = 1
       AND COALESCE(m.media_kind, 'video') = n.media_kind
-      AND (p.status IS NULL OR p.status = 'pending')
 
     UNION ALL
 
     SELECT p.media_id, p.rendition_profile, COALESCE(m.media_kind, 'video') AS media_kind,
+           p.status,
            1 AS priority, printf('%020d', p.updated_at_ms) || char(31) || p.media_id AS sort_key
     FROM media_packages p
     JOIN media m ON m.id = p.media_id
@@ -511,22 +513,57 @@ ORDER BY priority, sort_key`,
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Candidate
+	type rawCandidate struct {
+		Candidate
+		mediaKind string
+		status    sql.NullString
+	}
+	var raw []rawCandidate
 	for rows.Next() {
-		var c Candidate
-		var mediaKind string
-		if err := rows.Scan(&c.MediaID, &c.Profile, &mediaKind); err != nil {
+		var c rawCandidate
+		if err := rows.Scan(&c.MediaID, &c.Profile, &c.mediaKind, &c.status); err != nil {
 			return nil, err
 		}
+		raw = append(raw, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	var out []Candidate
+	for _, c := range raw {
 		if !active[c.Profile] {
 			continue
 		}
-		if profileKinds[c.Profile] != packageprofile.NormalizeMediaKind(packageprofile.MediaKind(mediaKind)) {
+		if profileKinds[c.Profile] != packageprofile.NormalizeMediaKind(packageprofile.MediaKind(c.mediaKind)) {
 			continue
 		}
-		out = append(out, c)
+		// Priority-1 rows are operator-requested pending package rows (the query
+		// already filtered them to status='pending'), identified by a non-NULL
+		// status. Priority-0 rows are channel demand: skip any that are already
+		// ready or sitting in a non-pending state so we don't re-enqueue them.
+		if !c.status.Valid {
+			pkg, err := db.ReadyMediaPackage(ctx, conn, c.MediaID, c.Profile)
+			if err != nil {
+				return nil, err
+			}
+			if pkg != nil {
+				continue
+			}
+			status, err := db.MediaPackageStatus(ctx, conn, c.MediaID, c.Profile)
+			if err != nil {
+				return nil, err
+			}
+			if status != "" && status != db.PackageStatusPending {
+				continue
+			}
+		}
+		out = append(out, c.Candidate)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // sweepWorkDir removes all subdirectories under WorkDir. Called on startup

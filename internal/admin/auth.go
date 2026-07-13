@@ -193,13 +193,19 @@ func (s *authService) verifyPassword(password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
-// updateHash replaces the in-memory hash and clears the must-change flag after
-// a successful password change. Callers must persist to DB before calling this.
-func (s *authService) updateHash(hash string) {
+// updateHash replaces the in-memory hash, clears the must-change flag, and
+// revokes all other sessions after a successful password change. Callers must
+// persist to DB before calling this.
+func (s *authService) updateHash(hash, keepSession string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.passwordHash = hash
 	s.mustChange = false
+	for token := range s.sessions {
+		if token != keepSession {
+			delete(s.sessions, token)
+		}
+	}
 }
 
 func (a *App) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -258,6 +264,14 @@ func clientID(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+func sessionToken(r *http.Request) string {
+	cookie, err := r.Cookie(adminSessionCookie)
+	if err != nil || cookie.Value == "" {
+		return ""
+	}
+	return cookie.Value
+}
+
 func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	if !a.auth.authenticated(r) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "admin authentication required")
@@ -280,7 +294,7 @@ func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "current password is incorrect")
 		return
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcryptCost)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "hash_error", "failed to hash new password")
 		return
@@ -293,7 +307,7 @@ func (a *App) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "db_error", "failed to clear must-change flag")
 		return
 	}
-	a.auth.updateHash(string(hash))
+	a.auth.updateHash(string(hash), sessionToken(r))
 	writeJSON(w, map[string]any{
 		"enabled":       true,
 		"authenticated": true,
@@ -329,11 +343,19 @@ func (a *App) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r2)
 			return
 		}
-		if a.isPublicRoute(r) || a.auth.authenticated(r) {
+		if a.isPublicRoute(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		writeError(w, http.StatusUnauthorized, "unauthorized", "admin authentication required")
+		if !a.auth.authenticated(r) {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "admin authentication required")
+			return
+		}
+		if a.auth.mustChangePassword() {
+			writeError(w, http.StatusForbidden, "password_must_change", "admin password must be changed before using this endpoint")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -388,7 +410,10 @@ func (a *App) isPublicRoute(r *http.Request) bool {
 	}
 	if r.Method == http.MethodGet {
 		switch path {
-		case "/api/healthz", "/api/playable-sources", "/api/guide", "/api/subtitle-settings":
+		case "/api/healthz", "/api/playable-sources", "/api/guide", "/api/public-server-url", "/api/subtitle-settings", "/api/m3u", "/api/xmltv":
+			return true
+		}
+		if strings.HasPrefix(path, "/api/art/media/") {
 			return true
 		}
 		if strings.HasPrefix(path, "/api/channels/") && strings.HasSuffix(path, "/now") {

@@ -7,7 +7,18 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
+
+func mustHash(t *testing.T, password string) string {
+	t.Helper()
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	return string(h)
+}
 
 type routeInventoryCase struct {
 	method string
@@ -23,16 +34,14 @@ var adminRouteInventory = []routeInventoryCase{
 	{http.MethodPost, "/api/auth/logout", "/api/auth/logout", true, "public write"},
 	{http.MethodPost, "/api/auth/change-password", "/api/auth/change-password", true, "public write"},
 	{http.MethodGet, "/api/admin/write-log", "/api/admin/write-log", false, "protected admin read"},
-	{http.MethodGet, "/api/schedule-builder/source-status", "/api/schedule-builder/source-status", false, "protected schedule-builder read"},
-	{http.MethodGet, "/api/schedule-builder/package-profiles", "/api/schedule-builder/package-profiles", false, "protected schedule-builder read"},
-	{http.MethodGet, "/api/schedule-builder/package-candidates", "/api/schedule-builder/package-candidates", false, "protected schedule-builder read"},
-	{http.MethodGet, "/api/schedule-builder/shows", "/api/schedule-builder/shows", false, "protected schedule-builder read"},
-	{http.MethodGet, "/api/schedule-builder/albums", "/api/schedule-builder/albums", false, "protected schedule-builder read"},
-	{http.MethodGet, "/api/schedule-builder/by-group", "/api/schedule-builder/by-group", false, "protected schedule-builder read"},
-	{http.MethodGet, "/api/schedule-builder/filler-candidates", "/api/schedule-builder/filler-candidates", false, "protected schedule-builder read"},
-	{http.MethodPost, "/api/schedule-builder/channels", "/api/schedule-builder/channels", false, "protected schedule-builder write"},
+	{http.MethodGet, "/api/admin/media-sources/status", "/api/admin/media-sources/status", false, "protected admin read"},
 	{http.MethodGet, "/api/admin/chain-integrity", "/api/admin/chain-integrity", false, "protected admin read"},
+	{http.MethodGet, "/api/admin/maintenance/schedule-check", "/api/admin/maintenance/schedule-check", false, "protected admin read"},
 	{http.MethodGet, "/api/admin/maintenance/package-integrity", "/api/admin/maintenance/package-integrity", false, "protected admin read"},
+	{http.MethodPost, "/api/admin/maintenance/package-integrity", "/api/admin/maintenance/package-integrity", false, "protected admin write"},
+	{http.MethodPost, "/api/admin/maintenance/media-ordering", "/api/admin/maintenance/media-ordering", false, "protected admin write"},
+	{http.MethodPost, "/api/admin/maintenance/import-packages", "/api/admin/maintenance/import-packages", false, "protected admin write"},
+	{http.MethodPost, "/api/admin/maintenance/packages/{packageID}/requeue", "/api/admin/maintenance/packages/pkg-1/requeue", false, "protected admin write"},
 	{http.MethodDelete, "/api/admin/maintenance/missing-media", "/api/admin/maintenance/missing-media", false, "protected admin write"},
 	{http.MethodDelete, "/api/admin/maintenance/orphan-packages", "/api/admin/maintenance/orphan-packages", false, "protected admin write"},
 	{http.MethodDelete, "/api/admin/maintenance/packages", "/api/admin/maintenance/packages", false, "protected admin write"},
@@ -42,6 +51,11 @@ var adminRouteInventory = []routeInventoryCase{
 	{http.MethodGet, "/api/status", "/api/status", false, "protected admin read"},
 	{http.MethodGet, "/api/playable-sources", "/api/playable-sources", true, "public viewer read"},
 	{http.MethodGet, "/api/guide", "/api/guide", true, "public viewer read"},
+	{http.MethodGet, "/api/public-server-url", "/api/public-server-url", true, "public viewer read"},
+	{http.MethodPut, "/api/public-server-url", "/api/public-server-url", false, "protected admin write"},
+	{http.MethodGet, "/api/m3u", "/api/m3u", true, "public viewer read"},
+	{http.MethodGet, "/api/xmltv", "/api/xmltv", true, "public viewer read"},
+	{http.MethodGet, "/api/art/media/{mediaID}", "/api/art/media/m1", true, "public viewer artwork"},
 	{http.MethodGet, "/api/now", "/api/now", false, "protected admin read"},
 	{http.MethodGet, "/api/playing", "/api/playing", false, "protected admin read"},
 	{http.MethodGet, "/api/queue-depth", "/api/queue-depth", false, "protected admin read"},
@@ -57,11 +71,14 @@ var adminRouteInventory = []routeInventoryCase{
 	{http.MethodGet, "/api/channels/{channelID}/history", "/api/channels/ch/history?since=0", false, "protected admin read"},
 	{http.MethodGet, "/api/channels/{channelID}/policy", "/api/channels/ch/policy", false, "protected admin read"},
 	{http.MethodPut, "/api/channels/{channelID}/policy", "/api/channels/ch/policy", false, "protected admin write"},
+	{http.MethodPut, "/api/channels/{channelID}/on-demand-profile", "/api/channels/ch/on-demand-profile", false, "protected admin write"},
 	{http.MethodPut, "/api/channels/{channelID}/upstream-hls", "/api/channels/ch/upstream-hls", false, "protected admin write"},
 	{http.MethodGet, "/api/channels/{channelID}/artwork", "/api/channels/ch/artwork", false, "protected admin read"},
 	{http.MethodPut, "/api/channels/{channelID}/artwork", "/api/channels/ch/artwork", false, "protected admin write"},
 	{http.MethodDelete, "/api/channels/{channelID}/artwork", "/api/channels/ch/artwork", false, "protected admin write"},
 	{http.MethodGet, "/api/admin/plex/status", "/api/admin/plex/status", false, "protected admin read"},
+	{http.MethodPost, "/api/admin/plex/pin", "/api/admin/plex/pin", false, "protected admin write"},
+	{http.MethodGet, "/api/admin/plex/pin/{id}", "/api/admin/plex/pin/123?code=ABCD", false, "protected admin read"},
 	{http.MethodPut, "/api/admin/plex/config", "/api/admin/plex/config", false, "protected admin write"},
 	{http.MethodDelete, "/api/admin/plex/config", "/api/admin/plex/config", false, "protected admin write"},
 	{http.MethodGet, "/api/admin/plex/libraries", "/api/admin/plex/libraries", false, "protected admin read"},
@@ -75,16 +92,17 @@ var adminRouteInventory = []routeInventoryCase{
 	{http.MethodPost, "/api/admin/local-sources", "/api/admin/local-sources", false, "protected admin write"},
 	{http.MethodPut, "/api/admin/local-sources/{id}", "/api/admin/local-sources/local1", false, "protected admin write"},
 	{http.MethodDelete, "/api/admin/local-sources/{id}", "/api/admin/local-sources/local1", false, "protected admin write"},
+	{http.MethodPost, "/api/admin/local-sources/scan", "/api/admin/local-sources/scan", false, "protected admin write"},
 	{http.MethodPost, "/api/admin/local-sources/{id}/scan", "/api/admin/local-sources/local1/scan", false, "protected admin write"},
 	{http.MethodPost, "/api/channels", "/api/channels", false, "protected admin write"},
 	{http.MethodPost, "/api/channels/probe-upstream", "/api/channels/probe-upstream", false, "protected admin write"},
+	{http.MethodGet, "/api/spotify-url", "/api/spotify-url", false, "protected admin read"},
+	{http.MethodPut, "/api/spotify-url", "/api/spotify-url", false, "protected admin write"},
+	{http.MethodDelete, "/api/spotify-url", "/api/spotify-url", false, "protected admin write"},
 	{http.MethodGet, "/api/channels", "/api/channels", false, "protected admin read"},
 	{http.MethodDelete, "/api/channels/{channelID}", "/api/channels/ch", false, "protected admin write"},
+	{http.MethodPatch, "/api/channels/{channelID}", "/api/channels/ch", false, "protected admin write"},
 	{http.MethodPost, "/api/channels/{channelID}/clone", "/api/channels/ch/clone", false, "protected admin write"},
-	{http.MethodPost, "/api/channels/{channelID}/disable", "/api/channels/ch/disable", false, "protected admin write"},
-	{http.MethodPost, "/api/channels/{channelID}/enable", "/api/channels/ch/enable", false, "protected admin write"},
-	{http.MethodPost, "/api/channels/{channelID}/hide-from-guide", "/api/channels/ch/hide-from-guide", false, "protected admin write"},
-	{http.MethodPost, "/api/channels/{channelID}/show-in-guide", "/api/channels/ch/show-in-guide", false, "protected admin write"},
 	{http.MethodPost, "/api/channels/{channelID}/extend", "/api/channels/ch/extend", false, "protected admin write"},
 	{http.MethodDelete, "/api/channels/{channelID}/schedule", "/api/channels/ch/schedule", false, "protected admin write"},
 	{http.MethodDelete, "/api/channels/{channelID}/schedule/range", "/api/channels/ch/schedule/range", false, "protected admin write"},
@@ -96,32 +114,34 @@ var adminRouteInventory = []routeInventoryCase{
 	{http.MethodPost, "/api/channels/{channelID}/schedule/entries/{entryId}/before", "/api/channels/ch/schedule/entries/1000/before", false, "protected admin write"},
 	{http.MethodDelete, "/api/channels/{channelID}/schedule/entries/{entryId}", "/api/channels/ch/schedule/entries/1000", false, "protected admin write"},
 	{http.MethodPost, "/api/channels/{channelID}/restart-playback", "/api/channels/ch/restart-playback", false, "protected admin write"},
+	{http.MethodPost, "/api/channels/{channelID}/stop-encoder", "/api/channels/ch/stop-encoder", false, "protected admin write"},
 	{http.MethodGet, "/api/subtitle-settings", "/api/subtitle-settings", true, "public viewer read"},
 	{http.MethodPut, "/api/subtitle-settings", "/api/subtitle-settings", false, "protected admin write"},
 	{http.MethodGet, "/api/admin/subtitle-scan", "/api/admin/subtitle-scan", false, "protected admin read"},
 	{http.MethodPost, "/api/admin/subtitle-scan", "/api/admin/subtitle-scan", false, "protected admin write"},
-	{http.MethodGet, "/api/admin/subtitle-extract-all", "/api/admin/subtitle-extract-all", false, "protected admin read"},
-	{http.MethodPost, "/api/admin/subtitle-extract-all", "/api/admin/subtitle-extract-all", false, "protected admin write"},
-	{http.MethodPost, "/api/media/{mediaID}/subtitles/extract", "/api/media/m1/subtitles/extract", false, "protected admin write"},
-	{http.MethodGet, "/api/media/{mediaID}/subtitles", "/api/media/m1/subtitles", false, "protected admin read"},
-	{http.MethodDelete, "/api/media/{mediaID}/subtitles/{language}", "/api/media/m1/subtitles/eng", false, "protected admin write"},
 	{http.MethodGet, "/api/fs/browse", "/api/fs/browse", false, "protected admin read"},
 	{http.MethodPost, "/api/ingest", "/api/ingest", false, "protected admin write"},
 	{http.MethodGet, "/api/ingest/{id}", "/api/ingest/job1", false, "protected admin read"},
 	{http.MethodPost, "/api/ingest/{id}/cancel", "/api/ingest/job1/cancel", false, "protected admin write"},
+	{http.MethodPatch, "/api/media/{mediaID}", "/api/media/m1", false, "protected admin write"},
+	{http.MethodDelete, "/api/media/{mediaID}", "/api/media/m1", false, "protected admin write"},
 	{http.MethodGet, "/api/media", "/api/media", false, "protected admin read"},
+	{http.MethodGet, "/api/media/inventory", "/api/media/inventory", false, "protected admin read"},
+	{http.MethodPost, "/api/media/collections/bulk", "/api/media/collections/bulk", false, "protected admin write"},
 	{http.MethodGet, "/api/media/groups", "/api/media/groups", false, "protected admin read"},
-	{http.MethodGet, "/api/media/shows", "/api/media/shows", false, "protected admin read"},
+	{http.MethodGet, "/api/media/movies", "/api/media/movies", false, "protected admin read"},
 	{http.MethodGet, "/api/media/albums", "/api/media/albums", false, "protected admin read"},
 	{http.MethodGet, "/api/media/by-group", "/api/media/by-group", false, "protected admin read"},
 	{http.MethodGet, "/api/media/package-profiles", "/api/media/package-profiles", false, "protected admin read"},
-	{http.MethodPut, "/api/package-profiles/{name}", "/api/package-profiles/h264-main-1080p", false, "protected admin write"},
-	{http.MethodDelete, "/api/package-profiles/{name}", "/api/package-profiles/h264-main-1080p", false, "protected admin write"},
+	{http.MethodGet, "/api/filler-assets/candidates", "/api/filler-assets/candidates", false, "protected admin read"},
+	{http.MethodPut, "/api/package-profiles/{name}", "/api/package-profiles/h264-1080p-8mbps", false, "protected admin write"},
+	{http.MethodPost, "/api/package-profiles/{name}/enable", "/api/package-profiles/h264-1080p-8mbps/enable", false, "protected admin write"},
+	{http.MethodDelete, "/api/package-profiles/{name}", "/api/package-profiles/h264-1080p-8mbps", false, "protected admin write"},
 	{http.MethodPut, "/api/admin/default-packaged-profile", "/api/admin/default-packaged-profile", false, "protected admin write"},
 	{http.MethodGet, "/api/media/package-candidates", "/api/media/package-candidates", false, "protected admin read"},
 	{http.MethodPost, "/api/media/package", "/api/media/package", false, "protected admin write"},
 	{http.MethodPost, "/api/media/package/cancel", "/api/media/package/cancel", false, "protected admin write"},
-	{http.MethodGet, "/api/channels/{channelID}/profile-migration", "/api/channels/ch/profile-migration?profile=h264-main-1080p", false, "protected admin read"},
+	{http.MethodGet, "/api/channels/{channelID}/profile-migration", "/api/channels/ch/profile-migration?profile=h264-1080p-8mbps", false, "protected admin read"},
 	{http.MethodPost, "/api/channels/{channelID}/profile-migration", "/api/channels/ch/profile-migration", false, "protected admin write"},
 	{http.MethodGet, "/api/filler-assets", "/api/filler-assets", false, "protected admin read"},
 	{http.MethodPost, "/api/filler-assets", "/api/filler-assets", false, "protected admin write"},
@@ -133,6 +153,7 @@ var adminRouteInventory = []routeInventoryCase{
 	{http.MethodDelete, "/api/channels/{channelID}/filler-assets/{assetID}", "/api/channels/ch/filler-assets/a1", false, "protected admin write"},
 	{http.MethodPost, "/api/admin/encoders", "/api/admin/encoders", false, "protected admin write"},
 	{http.MethodGet, "/api/admin/encoders", "/api/admin/encoders", false, "protected admin read"},
+	{http.MethodGet, "/api/admin/encoder-events", "/api/admin/encoder-events", false, "protected admin read"},
 	{http.MethodPatch, "/api/admin/encoders/{id}", "/api/admin/encoders/enc_x", false, "protected admin write"},
 	{http.MethodPost, "/api/admin/encoders/{id}/revoke", "/api/admin/encoders/enc_x/revoke", false, "protected admin write"},
 	{http.MethodDelete, "/api/admin/encoders/{id}", "/api/admin/encoders/enc_x", false, "protected admin write"},
@@ -143,8 +164,6 @@ var adminRouteInventory = []routeInventoryCase{
 	{http.MethodPut, "/api/admin/scheduler-tunables", "/api/admin/scheduler-tunables", false, "protected admin write"},
 	{http.MethodGet, "/api/admin/encoder-sweeper-settings", "/api/admin/encoder-sweeper-settings", false, "protected admin read"},
 	{http.MethodPut, "/api/admin/encoder-sweeper-settings", "/api/admin/encoder-sweeper-settings", false, "protected admin write"},
-	{http.MethodGet, "/api/admin/on-demand-session-settings", "/api/admin/on-demand-session-settings", false, "protected admin read"},
-	{http.MethodPut, "/api/admin/on-demand-session-settings", "/api/admin/on-demand-session-settings", false, "protected admin write"},
 	{http.MethodGet, "/api/encoder/ping", "/api/encoder/ping", false, "protected encoder read"},
 	{http.MethodPost, "/api/encoder/ping", "/api/encoder/ping", false, "protected encoder write"},
 	{http.MethodPost, "/api/encoder/claim", "/api/encoder/claim", false, "protected encoder write"},
@@ -224,6 +243,10 @@ func TestAdminAuthAllowsPublicRoutes(t *testing.T) {
 		"/api/healthz",
 		"/api/playable-sources",
 		"/api/guide",
+		"/api/public-server-url",
+		"/api/m3u",
+		"/api/xmltv",
+		"/api/art/media/m1",
 		"/api/channels/ch/now",
 		"/api/auth/status",
 	}
@@ -467,5 +490,96 @@ func TestAdminAuthCorrectPasswordClearsFailureCounter(t *testing.T) {
 	handler.ServeHTTP(badRR, badReq)
 	if badRR.Code != http.StatusUnauthorized {
 		t.Fatalf("post-success bad login status=%d, want %d", badRR.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAdminMustChangeBlocksProtectedRoutes(t *testing.T) {
+	app, _ := testAdminApp(t)
+	app.auth = newAuthServiceFromHash(mustHash(t, "secret"), true, app.now)
+	handler := app.Handler()
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"secret"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRR := httptest.NewRecorder()
+	handler.ServeHTTP(loginRR, loginReq)
+	if loginRR.Code != http.StatusOK {
+		t.Fatalf("login status=%d, want %d", loginRR.Code, http.StatusOK)
+	}
+	cookie := loginRR.Result().Cookies()[0]
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
+		req := httptest.NewRequest(method, "/api/media/package-candidates", nil)
+		req.AddCookie(cookie)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("mustChange %s /api/media/package-candidates status=%d, want %d", method, rr.Code, http.StatusForbidden)
+		}
+	}
+}
+
+func TestAdminMustChangeAllowsChangePassword(t *testing.T) {
+	app, _ := testAdminApp(t)
+	app.auth = newAuthServiceFromHash(mustHash(t, "secret"), true, app.now)
+	handler := app.Handler()
+
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"secret"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginRR := httptest.NewRecorder()
+	handler.ServeHTTP(loginRR, loginReq)
+	cookie := loginRR.Result().Cookies()[0]
+
+	changeReq := httptest.NewRequest(http.MethodPost, "/api/auth/change-password",
+		strings.NewReader(`{"currentPassword":"secret","newPassword":"newsecret1"}`))
+	changeReq.Header.Set("Content-Type", "application/json")
+	changeReq.AddCookie(cookie)
+	changeRR := httptest.NewRecorder()
+	handler.ServeHTTP(changeRR, changeReq)
+	if changeRR.Code != http.StatusOK {
+		t.Fatalf("change-password status=%d, want %d body=%s", changeRR.Code, http.StatusOK, changeRR.Body.String())
+	}
+}
+
+func TestAdminPasswordChangeRevokesOtherSessions(t *testing.T) {
+	app, _ := testAdminApp(t)
+	app.auth = newAuthService("secret", app.now)
+	handler := app.Handler()
+
+	loginA := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"secret"}`))
+	loginA.Header.Set("Content-Type", "application/json")
+	loginARR := httptest.NewRecorder()
+	handler.ServeHTTP(loginARR, loginA)
+	cookieA := loginARR.Result().Cookies()[0]
+
+	loginB := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"secret"}`))
+	loginB.Header.Set("Content-Type", "application/json")
+	loginBRR := httptest.NewRecorder()
+	handler.ServeHTTP(loginBRR, loginB)
+	cookieB := loginBRR.Result().Cookies()[0]
+
+	changeReq := httptest.NewRequest(http.MethodPost, "/api/auth/change-password",
+		strings.NewReader(`{"currentPassword":"secret","newPassword":"newsecret1"}`))
+	changeReq.Header.Set("Content-Type", "application/json")
+	changeReq.AddCookie(cookieA)
+	changeRR := httptest.NewRecorder()
+	handler.ServeHTTP(changeRR, changeReq)
+	if changeRR.Code != http.StatusOK {
+		t.Fatalf("change-password status=%d, want %d", changeRR.Code, http.StatusOK)
+	}
+
+	authedA := httptest.NewRequest(http.MethodGet, "/api/media/package-candidates", nil)
+	authedA.AddCookie(cookieA)
+	authedARR := httptest.NewRecorder()
+	handler.ServeHTTP(authedARR, authedA)
+	if authedARR.Code == http.StatusUnauthorized {
+		t.Fatalf("session A (changer) was revoked, should still work")
+	}
+
+	authedB := httptest.NewRequest(http.MethodGet, "/api/media/package-candidates", nil)
+	authedB.AddCookie(cookieB)
+	authedBRR := httptest.NewRecorder()
+	handler.ServeHTTP(authedBRR, authedB)
+	if authedBRR.Code != http.StatusUnauthorized {
+		t.Fatalf("session B (other) status=%d, want %d (should be revoked)", authedBRR.Code, http.StatusUnauthorized)
 	}
 }

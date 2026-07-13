@@ -44,11 +44,9 @@ web UI together in one Docker container.
 ## Documentation
 
 - [docs/api.md](docs/api.md) - playback and admin endpoints, plus Prometheus metrics
-- [docs/architecture.md](docs/architecture.md) - system design, scheduler principles, and invariants
 - [docs/database.md](docs/database.md) - schema and state machines
 - [docs/deploy.md](docs/deploy.md) - deploy and configuration reference
 - [docs/usage.md](docs/usage.md) - ingest, building channels, scheduling, and maintenance
-- [docs/tests.md](docs/tests.md) - CI, smoke scripts, and release checks
 
 ## License
 

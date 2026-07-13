@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 
 	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/lcingest"
@@ -86,7 +87,13 @@ func main() {
 	}
 
 	fmt.Printf("\ningest summary: total=%d passed=%d failed=%d\n", res.Total, res.Passed, res.Failed)
-	for _, f := range res.Failures {
-		fmt.Printf("  - %s\n", f)
+	reasons := make([]string, 0, len(res.FailureReasons))
+	for reason := range res.FailureReasons {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	for _, reason := range reasons {
+		count := res.FailureReasons[reason]
+		fmt.Printf("  - %s: %d\n", reason, count)
 	}
 }

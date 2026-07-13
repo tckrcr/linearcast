@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/tckrcr/linearcast/internal/db"
 )
 
 type upstreamSummary struct {
@@ -142,7 +145,7 @@ func (a *App) fetchUpstreamStatusOnce(ctx context.Context) (*upstreamSummary, ma
 			LatestGeneratedAt:      ch.LatestGeneratedAt,
 		}
 		if ch.LookaheadDepthSegments != nil {
-			seconds := *ch.LookaheadDepthSegments * (segmentMs / 1000)
+			seconds := *ch.LookaheadDepthSegments * (db.ScheduleGridMs / 1000)
 			cache.LookaheadDepthSeconds = &seconds
 		}
 		cacheByChannel[ch.ID] = cache
@@ -169,17 +172,22 @@ func (c *upstreamStatusCache) recordFailure(now time.Time, err string) {
 	c.lastError = err
 }
 
-func (c *upstreamStatusCache) logFailure(logger interface{ Printf(string, ...any) }, now time.Time) {
+func (c *upstreamStatusCache) logFailure(logger *slog.Logger, now time.Time) {
 	if logger == nil {
 		return
 	}
 	if c.lastLogAt.IsZero() || now.Sub(c.lastLogAt) >= upstreamStatusFailureLogEach {
 		if c.suppressedLogs > 0 {
-			logger.Printf("upstream status unavailable error=%q next_retry=%s suppressed=%d",
-				c.lastError, c.nextAttempt.Format(time.RFC3339), c.suppressedLogs)
+			logger.Warn("upstream status unavailable",
+				"err", c.lastError,
+				"next_retry", c.nextAttempt.Format(time.RFC3339),
+				"suppressed", c.suppressedLogs,
+			)
 		} else {
-			logger.Printf("upstream status unavailable error=%q next_retry=%s",
-				c.lastError, c.nextAttempt.Format(time.RFC3339))
+			logger.Warn("upstream status unavailable",
+				"err", c.lastError,
+				"next_retry", c.nextAttempt.Format(time.RFC3339),
+			)
 		}
 		c.lastLogAt = now
 		c.suppressedLogs = 0

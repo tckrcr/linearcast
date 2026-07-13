@@ -8,22 +8,22 @@ func TestDeriveMusicTitle(t *testing.T) {
 	tests := []struct {
 		name string
 		path string
-		mp   musicProbeResult
+		mp   MusicProbeResult
 		want string
 	}{
 		{
 			name: "tagged track",
-			path: "/music/Kanye West - Graduation (2007)/01 - Good Morning.mp3",
-			mp: musicProbeResult{
+			path: "/music/Example Artist - First Light (2007)/01 - Morning Signal.mp3",
+			mp: MusicProbeResult{
 				DurationMs: 195_000,
-				Tags:       musicTags{Title: "Good Morning", Track: "1"},
+				Tags:       musicTags{Title: "Morning Signal", Track: "1"},
 			},
-			want: "01. Good Morning",
+			want: "01. Morning Signal",
 		},
 		{
 			name: "tagged track no number",
 			path: "/music/Band/Album/03 Song.flac",
-			mp: musicProbeResult{
+			mp: MusicProbeResult{
 				DurationMs: 200_000,
 				Tags:       musicTags{Title: "Song"},
 			},
@@ -32,7 +32,7 @@ func TestDeriveMusicTitle(t *testing.T) {
 		{
 			name: "track/total format",
 			path: "/music/Band/Album/04 Song.flac",
-			mp: musicProbeResult{
+			mp: MusicProbeResult{
 				DurationMs: 200_000,
 				Tags:       musicTags{Title: "Song", Track: "4/12"},
 			},
@@ -41,36 +41,36 @@ func TestDeriveMusicTitle(t *testing.T) {
 		{
 			name: "filename fallback with leading number",
 			path: "/music/Band/Album/03 - My Track.flac",
-			mp:   musicProbeResult{DurationMs: 200_000},
+			mp:   MusicProbeResult{DurationMs: 200_000},
 			want: "My Track",
 		},
 		{
 			name: "single file album via cue sidecar",
-			path: "/music/Coldplay/2000 Parachutes/Coldplay - Parachutes.flac",
-			mp: musicProbeResult{
+			path: "/music/Example Artist/2000 First Light/Example Artist - First Light.flac",
+			mp: MusicProbeResult{
 				DurationMs:    38 * 60 * 1000,
 				HasCueSidecar: true,
-				Tags:          musicTags{Album: "Parachutes", Artist: "Coldplay"},
+				Tags:          musicTags{Album: "First Light", Artist: "Example Artist"},
 			},
-			want: "[Full Album] Parachutes",
+			want: "[Full Album] First Light",
 		},
 		{
 			name: "single file album via duration",
-			path: "/music/Coldplay/2008 Viva La Vida/Coldplay - Viva La Vida.flac",
-			mp: musicProbeResult{
+			path: "/music/Example Artist/2008 Signals Across The Silent City/Example Artist - Signals Across The Silent City.flac",
+			mp: MusicProbeResult{
 				DurationMs: 46 * 60 * 1000,
-				Tags:       musicTags{Album: "Viva La Vida Or Death And All His Friends", Artist: "Coldplay"},
+				Tags:       musicTags{Album: "Signals Across The Silent City", Artist: "Example Artist"},
 			},
-			want: "[Full Album] Viva La Vida Or Death And All His Friends",
+			want: "[Full Album] Signals Across The Silent City",
 		},
 		{
 			name: "single file album no album tag uses path",
-			path: "/music/Coldplay/2000 Parachutes/Coldplay - Parachutes.flac",
-			mp: musicProbeResult{
+			path: "/music/Example Artist/2000 First Light/Example Artist - First Light.flac",
+			mp: MusicProbeResult{
 				DurationMs:    38 * 60 * 1000,
 				HasCueSidecar: true,
 			},
-			want: "[Full Album] Parachutes",
+			want: "[Full Album] First Light",
 		},
 	}
 
@@ -88,22 +88,22 @@ func TestDeriveMusicSchedulingGroup(t *testing.T) {
 	tests := []struct {
 		name string
 		path string
-		mp   musicProbeResult
+		mp   MusicProbeResult
 		want string
 	}{
 		{
 			name: "tags present",
-			path: "/music/Kanye West - Graduation (2007)/01 - Good Morning.mp3",
-			mp: musicProbeResult{
+			path: "/music/Example Artist - First Light (2007)/01 - Morning Signal.mp3",
+			mp: MusicProbeResult{
 				DurationMs: 195_000,
-				Tags:       musicTags{Artist: "Kanye West", Album: "Graduation"},
+				Tags:       musicTags{Artist: "Example Artist", Album: "First Light"},
 			},
-			want: "Kanye West — Graduation",
+			want: "Example Artist — First Light",
 		},
 		{
 			name: "album artist takes priority over track artist",
 			path: "/music/Various/01 Song.flac",
-			mp: musicProbeResult{
+			mp: MusicProbeResult{
 				DurationMs: 200_000,
 				Tags:       musicTags{Artist: "Some Guest", AlbumArtist: "Various Artists", Album: "Compilation"},
 			},
@@ -111,51 +111,51 @@ func TestDeriveMusicSchedulingGroup(t *testing.T) {
 		},
 		{
 			name: "full album with tags",
-			path: "/music/Coldplay/2008 Viva La Vida/Coldplay - Viva La Vida.flac",
-			mp: musicProbeResult{
+			path: "/music/Example Artist/2008 Signals Across The Silent City/Example Artist - Signals Across The Silent City.flac",
+			mp: MusicProbeResult{
 				DurationMs: 46 * 60 * 1000,
-				Tags:       musicTags{Artist: "Coldplay", Album: "Viva La Vida Or Death And All His Friends"},
+				Tags:       musicTags{Artist: "Example Artist", Album: "Signals Across The Silent City"},
 			},
-			want: "Coldplay — Viva La Vida Or Death And All His Friends [Full Album]",
+			want: "Example Artist — Signals Across The Silent City [Full Album]",
 		},
 		{
 			name: "path fallback artist-album split",
-			path: "/music/Kanye West - Graduation (2007)/01 - Good Morning.mp3",
-			mp:   musicProbeResult{DurationMs: 195_000},
-			want: "Kanye West — Graduation",
+			path: "/music/Example Artist - First Light (2007)/01 - Morning Signal.mp3",
+			mp:   MusicProbeResult{DurationMs: 195_000},
+			want: "Example Artist — First Light",
 		},
 		{
 			name: "path fallback year-prefixed dir with artist grandparent",
-			path: "/music/Coldplay/2008 Viva La Vida Or Death And All His Friends/01 Life In Technicolor.flac",
-			mp:   musicProbeResult{DurationMs: 200_000},
-			want: "Coldplay — Viva La Vida Or Death And All His Friends",
+			path: "/music/Example Artist/2008 Signals Across The Silent City/01 Opening Track.flac",
+			mp:   MusicProbeResult{DurationMs: 200_000},
+			want: "Example Artist — Signals Across The Silent City",
 		},
 		{
-			name: "Beatles stereo remaster keeps suffix",
-			path: "/music/The Beatles - Stereo and Mono Box Sets + Extras/The Beatles - A Hard Day's Night [2009 Stereo Remaster]/01 A Hard Day's Night.flac",
-			mp:   musicProbeResult{DurationMs: 150_000},
-			want: "The Beatles — A Hard Day's Night [2009 Stereo Remaster]",
+			name: "stereo remaster keeps suffix",
+			path: "/music/The Example Band - Stereo and Mono Box Sets + Extras/The Example Band - Midnight Signals [2009 Stereo Remaster]/01 Midnight Signals.flac",
+			mp:   MusicProbeResult{DurationMs: 150_000},
+			want: "The Example Band — Midnight Signals [2009 Stereo Remaster]",
 		},
 		{
-			name: "Beatles mono remaster separate group",
-			path: "/music/The Beatles - Stereo and Mono Box Sets + Extras/The Beatles - A Hard Day's Night [2009 Mono Remaster]/01 A Hard Day's Night.flac",
-			mp:   musicProbeResult{DurationMs: 150_000},
-			want: "The Beatles — A Hard Day's Night [2009 Mono Remaster]",
+			name: "mono remaster separate group",
+			path: "/music/The Example Band - Stereo and Mono Box Sets + Extras/The Example Band - Midnight Signals [2009 Mono Remaster]/01 Midnight Signals.flac",
+			mp:   MusicProbeResult{DurationMs: 150_000},
+			want: "The Example Band — Midnight Signals [2009 Mono Remaster]",
 		},
 		{
 			name: "year-prefixed root dir no artist",
-			path: "/music/1977 - The Eagles - Hotel California [SACD DSF][2011]/01 Hotel California.dsf",
-			mp:   musicProbeResult{DurationMs: 380_000},
-			want: "The Eagles — Hotel California [SACD DSF]",
+			path: "/music/1977 - The Night Birds - Open Highway [SACD DSF][2011]/01 Open Highway.dsf",
+			mp:   MusicProbeResult{DurationMs: 380_000},
+			want: "The Night Birds — Open Highway [SACD DSF]",
 		},
 		{
 			name: "single file full album path fallback",
-			path: "/music/Coldplay/2000 Parachutes/Coldplay - Parachutes.flac",
-			mp: musicProbeResult{
+			path: "/music/Example Artist/2000 First Light/Example Artist - First Light.flac",
+			mp: MusicProbeResult{
 				DurationMs:    38 * 60 * 1000,
 				HasCueSidecar: true,
 			},
-			want: "Coldplay — Parachutes [Full Album]",
+			want: "Example Artist — First Light [Full Album]",
 		},
 	}
 

@@ -210,6 +210,10 @@
   margin-bottom: 6px;
 }
 
+.encoder-table-wrap {
+  overflow-x: auto;
+}
+
 .encoder-table {
   width: 100%;
   border-collapse: collapse;
@@ -309,9 +313,7 @@
 }
 
 .encoder-actions-dropdown {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 4px);
+  position: fixed;
   z-index: 50;
   display: flex;
   flex-direction: column;
@@ -384,7 +386,7 @@
 .encoding-status-metric:hover,
 .encoding-status-metric.is-selected {
   border-color: var(--accent);
-  background: rgba(90, 169, 255, 0.08);
+  background: var(--accent-soft);
 }
 
 .encoding-status-metric span {
@@ -553,7 +555,15 @@
   white-space: nowrap;
 }
 
-.encoding-media-path,
+.encoding-media-path {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .encoding-media-error {
   font-family: var(--mono);
   font-size: 11px;

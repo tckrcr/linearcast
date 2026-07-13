@@ -1,0 +1,280 @@
+.inventory-panel {
+  width: 100%;
+  max-width: none;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+.inventory-toolbar {
+  display: grid;
+  grid-template-columns: 1.4fr repeat(4, minmax(120px, 0.55fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.inventory-toolbar label,
+.bulk-bar label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.inventory-toolbar label span,
+.bulk-bar label span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.inventory-summary {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.bulk-bar {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.bulk-input {
+  min-width: 260px;
+}
+
+.table-wrap {
+  margin-top: 12px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.inventory-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+}
+
+.inventory-table th,
+.inventory-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.inventory-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.inventory-table th input {
+  width: 100%;
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.show-filter {
+  position: relative;
+}
+
+.show-suggestions {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  z-index: 4;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
+}
+
+.show-suggestions button {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.show-suggestions button:last-child {
+  border-bottom: 0;
+}
+
+.show-suggestions button:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.sort-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-transform: lowercase;
+  cursor: pointer;
+}
+
+.select-col {
+  width: 34px;
+}
+
+.title-col {
+  width: 34%;
+}
+
+.episode-col {
+  width: 64px;
+}
+
+.collection-col {
+  width: 20%;
+}
+
+.duration-col {
+  width: 82px;
+}
+
+.resolution-col {
+  width: 84px;
+}
+
+.codec-col {
+  width: 48px;
+}
+
+.package-col {
+  width: 112px;
+}
+
+.actions-col {
+  width: 92px;
+}
+
+.title-cell,
+.collection-cell {
+  min-width: 0;
+}
+
+.main-title,
+.path-text,
+.collection-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-text {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.subline {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.edit-fields {
+  display: grid;
+  gap: 6px;
+}
+
+.edit-fields input {
+  width: 100%;
+}
+
+.ordering-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+}
+
+.ordering-fields input {
+  width: 100%;
+  min-width: 0;
+  padding-left: 5px;
+  padding-right: 5px;
+}
+
+.chip-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tiny-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.is-bad {
+  color: var(--danger);
+  border-color: rgba(255, 122, 138, 0.3);
+  background: var(--danger-bg);
+}
+
+.row-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.row-actions button {
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+.load-more {
+  display: flex;
+  justify-content: center;
+  margin-top: 12px;
+}
+
+@media (max-width: 1100px) {
+  .inventory-toolbar {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .inventory-table {
+    min-width: 1120px;
+  }
+}

@@ -8,6 +8,7 @@
 package plex
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +16,10 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tckrcr/linearcast/internal/mediasource"
 )
 
 // Client is a Plex HTTP client.
@@ -41,27 +43,6 @@ type Section struct {
 	Key   string // numeric, e.g. "1"
 	Title string // e.g. "TV Shows"
 	Type  string // "show", "movie"
-}
-
-// Item is one Plex media row (an episode for TV sections, a movie for movie
-// sections). Path is taken from the first Media.Part. Empty if Plex returned
-// no parts.
-type Item struct {
-	RatingKey        string // stable Plex ID
-	Title            string
-	Type             string // "episode", "movie"
-	GrandparentTitle string // show name, for episodes
-	ParentIndex      int    // season number, for episodes
-	Index            int    // episode number, for episodes
-	Year             int    // for movies
-	Resolution       string // "1080", "720", "4k", ...
-	Path             string // Plex-side path, before any path-map rewrite
-}
-
-// Status is the minimal authenticated server/account metadata used by admin UI.
-type Status struct {
-	ServerName string
-	Username   string
 }
 
 type rootResponse struct {
@@ -97,7 +78,15 @@ type rawMeta struct {
 	ParentIndex      int        `json:"parentIndex"`
 	Index            int        `json:"index"`
 	Year             int        `json:"year"`
+	Summary          string     `json:"summary"`
+	Thumb            string     `json:"thumb"`
+	ContentRating    string     `json:"contentRating"`
+	Genre            []rawTag   `json:"Genre"`
 	Media            []rawMedia `json:"Media"`
+}
+
+type rawTag struct {
+	Tag string `json:"tag"`
 }
 
 type rawMedia struct {
@@ -112,7 +101,7 @@ type rawPart struct {
 // Sections returns all library sections.
 func (c *Client) Sections() ([]Section, error) {
 	var resp sectionsResponse
-	if err := c.getJSON("/library/sections", nil, &resp); err != nil {
+	if err := c.getJSON(context.Background(), "/library/sections", nil, &resp); err != nil {
 		return nil, err
 	}
 	out := make([]Section, 0, len(resp.MediaContainer.Directory))
@@ -139,86 +128,17 @@ func (c *Client) FindSection(nameOrKey string) (*Section, error) {
 	return nil, nil
 }
 
-// ItemsOptions controls Items().
-type ItemsOptions struct {
-	// Resolution filter, e.g. "1080". Empty means no filter.
-	Resolution string
+// String renders a Section for human output.
+func (s Section) String() string {
+	return fmt.Sprintf("%s\t%s\t%s", s.Key, s.Type, s.Title)
 }
 
-// Items returns the items in a section. For "show" sections it returns
-// episodes (type=4). For "movie" sections it returns movies (type=1).
-// Items missing a file path or a non-matching resolution are dropped.
-func (c *Client) Items(section Section, opts ItemsOptions) ([]Item, error) {
-	q := url.Values{}
-	switch section.Type {
-	case "show":
-		q.Set("type", "4") // episode
-	case "movie":
-		q.Set("type", "1")
-	default:
-		return nil, fmt.Errorf("unsupported section type %q (only show/movie)", section.Type)
-	}
-	if opts.Resolution != "" {
-		q.Set("videoResolution", opts.Resolution)
-	}
-
-	var resp itemsResponse
-	if err := c.getJSON("/library/sections/"+section.Key+"/all", q, &resp); err != nil {
-		return nil, err
-	}
-
-	out := make([]Item, 0, len(resp.MediaContainer.Metadata))
-	for _, m := range resp.MediaContainer.Metadata {
-		path := ""
-		res := ""
-		if len(m.Media) > 0 {
-			res = strings.ToLower(m.Media[0].VideoResolution)
-			if len(m.Media[0].Part) > 0 {
-				path = m.Media[0].Part[0].File
-			}
-		}
-		if path == "" {
-			continue
-		}
-		if opts.Resolution != "" && res != strings.ToLower(opts.Resolution) {
-			continue
-		}
-		out = append(out, Item{
-			RatingKey:        m.RatingKey,
-			Title:            m.Title,
-			Type:             m.Type,
-			GrandparentTitle: m.GrandparentTitle,
-			ParentIndex:      m.ParentIndex,
-			Index:            m.Index,
-			Year:             m.Year,
-			Resolution:       res,
-			Path:             path,
-		})
-	}
-	return out, nil
+// Name returns the source kind identifier.
+func (c *Client) Name() string {
+	return "plex"
 }
 
-// Status verifies the token against the Plex server root endpoint and returns
-// the small amount of metadata Plex exposes there.
-func (c *Client) Status() (Status, error) {
-	var resp rootResponse
-	if err := c.getJSON("/", nil, &resp); err != nil {
-		return Status{}, err
-	}
-	status := Status{
-		ServerName: resp.MediaContainer.FriendlyName,
-		Username:   resp.MediaContainer.MyPlexUsername,
-	}
-	if status.ServerName == "" {
-		status.ServerName = resp.MediaContainer.ServerName
-	}
-	if status.Username == "" {
-		status.Username = resp.MediaContainer.Username
-	}
-	return status, nil
-}
-
-func (c *Client) getJSON(path string, q url.Values, out any) error {
+func (c *Client) getJSON(ctx context.Context, path string, q url.Values, out any) error {
 	if c.BaseURL == "" {
 		return fmt.Errorf("plex: BaseURL is empty (set PLEX_URL)")
 	}
@@ -231,7 +151,7 @@ func (c *Client) getJSON(path string, q url.Values, out any) error {
 	q.Set("X-Plex-Token", c.Token)
 
 	u := c.BaseURL + path + "?" + q.Encode()
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
@@ -320,23 +240,165 @@ func (m *PathMapper) Map(p string) string {
 	return p
 }
 
-// String renders a Section for human output.
-func (s Section) String() string {
-	return fmt.Sprintf("%s\t%s\t%s", s.Key, s.Type, s.Title)
+// Status checks connectivity and returns server info.
+func (c *Client) Status(ctx context.Context) (mediasource.Status, error) {
+	var resp rootResponse
+	if err := c.getJSON(ctx, "/", nil, &resp); err != nil {
+		return mediasource.Status{}, err
+	}
+	status := mediasource.Status{
+		Connected:  true,
+		ServerName: resp.MediaContainer.FriendlyName,
+		Username:   resp.MediaContainer.MyPlexUsername,
+		Version:    "",
+		ID:         "",
+		URL:        c.BaseURL,
+		PathMap:    "",
+	}
+	if status.ServerName == "" {
+		status.ServerName = resp.MediaContainer.ServerName
+	}
+	if status.Username == "" {
+		status.Username = resp.MediaContainer.Username
+	}
+	return status, nil
 }
 
-// EpisodeSlug returns "S01E02" style or empty if not an episode.
-func (i Item) EpisodeSlug() string {
-	if i.Type != "episode" || i.ParentIndex == 0 || i.Index == 0 {
-		return ""
+// Libraries returns all available libraries/sections.
+func (c *Client) Libraries(ctx context.Context) ([]mediasource.Library, error) {
+	var resp sectionsResponse
+	if err := c.getJSON(ctx, "/library/sections", nil, &resp); err != nil {
+		return nil, err
 	}
-	return "S" + pad2(i.ParentIndex) + "E" + pad2(i.Index)
+	out := make([]mediasource.Library, 0, len(resp.MediaContainer.Directory))
+	for _, d := range resp.MediaContainer.Directory {
+		libType := d.Type
+		if libType == "show" {
+			libType = "shows"
+		} else if libType == "movie" {
+			libType = "movies"
+		}
+		out = append(out, mediasource.Library{
+			ID:   d.Key,
+			Name: d.Title,
+			Type: libType,
+		})
+	}
+	return out, nil
 }
 
-func pad2(n int) string {
-	s := strconv.Itoa(n)
-	if len(s) < 2 {
-		return "0" + s
+// Items returns items in a library, filtered by options.
+func (c *Client) Items(ctx context.Context, libraryID string, opts mediasource.ScanOptions) ([]mediasource.Item, error) {
+	sections, err := c.Sections()
+	if err != nil {
+		return nil, err
 	}
-	return s
+	var section *Section
+	for i := range sections {
+		if sections[i].Key == libraryID {
+			section = &sections[i]
+			break
+		}
+	}
+	if section == nil {
+		return nil, fmt.Errorf("section not found: %s", libraryID)
+	}
+
+	q := url.Values{}
+	switch section.Type {
+	case "show":
+		q.Set("type", "4") // episode
+	case "movie":
+		q.Set("type", "1")
+	default:
+		return nil, fmt.Errorf("unsupported section type %q (only show/movie)", section.Type)
+	}
+
+	var resp itemsResponse
+	if err := c.getJSON(ctx, "/library/sections/"+section.Key+"/all", q, &resp); err != nil {
+		return nil, err
+	}
+
+	out := make([]mediasource.Item, 0, len(resp.MediaContainer.Metadata))
+	for _, m := range resp.MediaContainer.Metadata {
+		path := ""
+		res := ""
+		height := 0
+		if len(m.Media) > 0 {
+			res = strings.ToLower(m.Media[0].VideoResolution)
+			if len(m.Media[0].Part) > 0 {
+				path = m.Media[0].Part[0].File
+			}
+		}
+		if path == "" {
+			continue
+		}
+		if plexResolutionExceeds(res, opts.MaxResolution) {
+			continue
+		}
+		itemType := "movie"
+		if m.Type == "episode" {
+			itemType = "episode"
+		}
+		sourceRef := ""
+		if m.RatingKey != "" {
+			sourceRef = "plex://" + m.RatingKey
+		}
+		out = append(out, mediasource.Item{
+			ID:            m.RatingKey,
+			Title:         m.Title,
+			Type:          itemType,
+			SeriesName:    m.GrandparentTitle,
+			SeasonNumber:  m.ParentIndex,
+			EpisodeNumber: m.Index,
+			Year:          m.Year,
+			Description:   m.Summary,
+			ThumbnailPath: m.Thumb,
+			ContentRating: m.ContentRating,
+			Genres:        plexTags(m.Genre),
+			Path:          path,
+			Resolution:    res,
+			Height:        height,
+			SourceRef:     sourceRef,
+		})
+	}
+	return out, nil
 }
+
+func plexTags(tags []rawTag) []string {
+	out := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if s := strings.TrimSpace(tag.Tag); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func plexResolutionExceeds(itemRes, maxRes string) bool {
+	if maxRes == "" {
+		return false
+	}
+	return plexResolutionRank(itemRes) > plexResolutionRank(maxRes)
+}
+
+func plexResolutionRank(r string) int {
+	switch strings.ToLower(strings.TrimSpace(r)) {
+	case "4k", "2160":
+		return 4
+	case "1080":
+		return 3
+	case "720":
+		return 2
+	default:
+		return 1
+	}
+}
+
+// Close releases any resources held by the client.
+func (c *Client) Close() error {
+	return nil
+}
+
+// compile-time interface check
+var _ mediasource.MediaSourceClient = (*Client)(nil)

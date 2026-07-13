@@ -30,6 +30,10 @@ type ServiceOptions struct {
 	ResumeAfterMediaID string
 	ScheduleMode       string
 	SlotDurationMs     int64
+	// AllowLeadingPrimary permits a slot-grid build to place one primary
+	// before the first slot boundary when the channel has no existing
+	// schedule. See scheduler.Options for details.
+	AllowLeadingPrimary bool
 }
 
 type ExtendResult struct {
@@ -125,6 +129,7 @@ func ExtendChannel(ctx context.Context, conn db.Execer, channelID string, opts S
 		ResumeAfterMediaID:   opts.ResumeAfterMediaID,
 		ScheduleMode:         opts.ScheduleMode,
 		SlotDurationMs:       opts.SlotDurationMs,
+		AllowLeadingPrimary:  opts.AllowLeadingPrimary,
 	}
 	effective := OptionsForChannel(*ch, base)
 	result.RequireReadyPackages = effective.RequireReadyPackages
@@ -159,6 +164,17 @@ func ExtendChannel(ctx context.Context, conn db.Execer, channelID string, opts S
 	}
 	result.Inserted = inserted
 	result.LastEndMs = lastEnd
+
+	// Heal a leading gap left at channel creation when filler packages weren't
+	// yet ready. Runs on the extender's normal cadence; a no-op once the head
+	// covers now or no filler is ready.
+	if effective.ScheduleMode == "slot_grid" {
+		backfilled, berr := backfillSlotGridLeadingGap(ctx, conn, ch.ID, nowMs, effective)
+		if berr != nil {
+			return result, fmt.Errorf("backfill slot-grid leading gap: %w", berr)
+		}
+		result.Inserted += backfilled
+	}
 	return result, nil
 }
 

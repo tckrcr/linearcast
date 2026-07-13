@@ -8,28 +8,28 @@ import {
   type SlotGridComposition,
 } from "./scheduleFiller";
 import {
+  getAllScheduleBuilderCandidates,
   getScheduleBuilderAlbums,
   getScheduleBuilderCandidates,
   getScheduleBuilderFillerCandidates,
   getScheduleBuilderGroup,
+  getScheduleBuilderMovies,
   getScheduleBuilderProfileList,
-  getScheduleBuilderShows,
+  requestMediaPackages,
 } from "../api";
-import type { MediaShow, MusicArtist } from "../api/media";
+import type { MediaMovie, MusicArtist } from "../api/media";
 import { formatMs } from "../format";
 import { useScheduleEditor } from "../hooks/useScheduleEditor";
 import { useHasMediaSource } from "../hooks/useHasMediaSource";
 import type { ChannelNow, FillerAssetCandidateItem, MediaPackageCandidate, PackageProfile, ScheduleInsertItem } from "../types";
 import { MediaPickerRail } from "./MediaPickerRail";
 import { SchedulePickerMusicGrid } from "./SchedulePickerMusicGrid";
-import { SchedulePickerShowsGrid } from "./SchedulePickerShowsGrid";
 import { ScheduleTimeline } from "./ScheduleTimeline";
 import styles from "./ScheduleBuilderPanel.module.css";
 
-type PickerTab = "episodes" | "shows" | "music" | "filler";
+type PickerTab = "episodes" | "movies" | "music" | "filler";
 type ScheduleBatchDragPayload =
   | { kind: "group"; group: string }
-  | { kind: "show"; showName: string }
   | { kind: "album"; group: string }
   | { kind: "artist"; artistName?: string };
 
@@ -41,17 +41,102 @@ function packageStatusLabel(candidate: MediaPackageCandidate, profileDetails: Re
   return `${candidate.packageStatus} at ${profileChipLabel(profile, profileDetails)}`;
 }
 
+function forcedSubtitleWarningLabel(candidate: MediaPackageCandidate): string {
+  const warning = candidate.subtitleWarnings?.find((w) => w.code === "forced_pgs_dropped_by_copy_profile");
+  if (!warning) return "";
+  const lang = warning.language || "und";
+  const title = warning.title ? ` ${warning.title}` : "";
+  const stream = warning.streamIndex != null ? ` stream #${warning.streamIndex}` : "";
+  return `⚠ copy profile drops forced ${lang}${title} PGS${stream}`;
+}
+
+const BROWSER_HLS_COPY_BITRATE_CEILING_BPS = 40_000_000;
+
+function sourceBitrateLabel(candidate: MediaPackageCandidate): string {
+  if (!candidate.videoBitrateBps || candidate.videoBitrateBps <= 0) return "";
+  return `${(candidate.videoBitrateBps / 1_000_000).toFixed(1)} Mbps source`;
+}
+
+function browserHLSBitrateWarningLabel(candidate: MediaPackageCandidate, profile?: PackageProfile): string {
+  if (profile?.video.mode !== "copy") return "";
+  if (!candidate.videoBitrateBps || candidate.videoBitrateBps <= BROWSER_HLS_COPY_BITRATE_CEILING_BPS) return "";
+  return `over ${(BROWSER_HLS_COPY_BITRATE_CEILING_BPS / 1_000_000).toFixed(0)} Mbps browser HLS ceiling`;
+}
+
+function candidateDisabled(candidate: MediaPackageCandidate, profile?: PackageProfile): boolean {
+  return browserHLSBitrateWarningLabel(candidate, profile) !== "";
+}
+
 function candidateToInsertItem(r: MediaPackageCandidate, forceReady = false): ScheduleInsertItem {
   return {
     mediaId: r.mediaId,
     title: r.title,
     path: r.path,
-    schedulingGroup: r.schedulingGroup,
+    collectionName: r.collectionName,
     durationMs: r.packagedDurationMs ?? r.durationMs,
     packagedDurationMs: r.packagedDurationMs,
     packageReady: forceReady || r.packageStatus === "ready",
     channelMember: false,
   };
+}
+
+// An imported-list entry: an episode/movie name plus an optional show name —
+// the two fields needed to match against the library. Matches the scraper
+// shim's output; bare strings and a leading "N. " rank prefix are tolerated so
+// hand-written lists work too.
+type ImportListItem = { show?: string; episode: string };
+
+// Collapse case and punctuation so a dotted path ("The.Winds.of.Winter") and a
+// spaced title ("The Winds of Winter") compare equal.
+function normalizeForMatch(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// The IMDb scrape's metaItems is a typed-but-positional array like
+// ["S1.E9", "Game of Thrones", "2011–2019", "57m", "TV-MA", "TV Episode"].
+// The show is the one entry that isn't a season/episode code, year(-range),
+// runtime, certificate, or media-type label.
+function showFromMetaItems(meta: unknown): string | undefined {
+  if (!Array.isArray(meta)) return undefined;
+  for (const raw of meta) {
+    const m = String(raw).trim();
+    if (!m) continue;
+    if (/^S\d+\.E\d+$/i.test(m)) continue; // S1.E9
+    if (/^\d{4}(–|-|\s)?\d{0,4}$/.test(m)) continue; // 2011 or 2011–2019
+    if (/^(\d+\s*h)?\s*(\d+\s*m)?$/i.test(m) && /[hm]/i.test(m)) continue; // 57m / 1h 2m
+    if (/^(TV-\w+|G|PG|PG-13|R|NC-17|NR|Not Rated|Unrated)$/i.test(m)) continue; // cert
+    if (/\b(episode|series|movie|special|short|mini)\b/i.test(m)) continue; // type
+    return m;
+  }
+  return undefined;
+}
+
+function parseImportList(text: string): ImportListItem[] {
+  const data: unknown = JSON.parse(text);
+  const raw = Array.isArray(data) ? data : (data as { items?: unknown } | null)?.items;
+  if (!Array.isArray(raw)) throw new Error("expected a JSON array or { items: [...] }");
+  const out: ImportListItem[] = [];
+  for (const r of raw) {
+    if (typeof r === "string") {
+      const episode = r.replace(/^\s*\d+\.\s*/, "").trim();
+      if (episode) out.push({ episode });
+      continue;
+    }
+    if (!r || typeof r !== "object") continue;
+    const o = r as Record<string, unknown>;
+    // rawTitle ("6. Baelor") is the scrape's field; episode/title cover a
+    // pre-normalized list. Strip the leading "N. " rank prefix either way.
+    const episode = String(o.episode ?? o.title ?? o.rawTitle ?? "").replace(/^\s*\d+\.\s*/, "").trim();
+    if (!episode) continue;
+    const showRaw =
+      o.show ??
+      (o.series as { title?: unknown } | undefined)?.title ??
+      o.series ??
+      showFromMetaItems(o.metaItems);
+    const show = showRaw != null ? String(showRaw).trim() : "";
+    out.push({ episode, show: show || undefined });
+  }
+  return out;
 }
 
 const BUILDER_CANDIDATE_LIMIT = 10;
@@ -80,12 +165,10 @@ export function ScheduleBuilderPanel({
     existingChannel?.scheduleMode === "slot_grid" ? "slot_grid" : "back_to_back",
   );
   const [slotDurationMs, setSlotDurationMs] = useState(existingChannel?.slotDurationMs ?? DEFAULT_SLOT_DURATION_MS);
-  const [playbackMode, setPlaybackMode] = useState<"packaged" | "plex_relay">(
-    existingChannel?.playbackMode === "plex_relay" ? "plex_relay" : "packaged",
+  // Create-time only; an existing channel's prefill mode is shown read-only.
+  const [prefillMode, setPrefillMode] = useState<"eager" | "on_demand">(
+    existingChannel ? (existingChannel.prefillMode as "eager" | "on_demand") ?? "on_demand" : "on_demand",
   );
-  // On-demand defers packaging until a viewer tunes in. Create-time only; an
-  // existing channel's prefill mode is shown read-only via existingChannel.
-  const [onDemand, setOnDemand] = useState(existingChannel?.prefillMode === "on_demand");
   const [adaptiveBitrate, setAdaptiveBitrate] = useState("");
   const defaultProfileRef = useRef("");
   const [profiles, setProfiles] = useState<string[]>([]);
@@ -100,17 +183,18 @@ export function ScheduleBuilderPanel({
   const [searchBusy, setSearchBusy] = useState(false);
   const [searchStatus, setSearchStatus] = useState("");
   const [readyOnly, setReadyOnly] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Shows-tab state
-  const [shows, setShows] = useState<MediaShow[]>([]);
-  const [showsLoaded, setShowsLoaded] = useState(false);
-  const [showsLoading, setShowsLoading] = useState(false);
-  const [showsError, setShowsError] = useState("");
-  const [groupFilter, setGroupFilter] = useState("");
+  // Movies-tab state
   const [groupBusy, setGroupBusy] = useState<string | null>(null);
-  const [showBusy, setShowBusy] = useState<string | null>(null);
-  const [selectedShow, setSelectedShow] = useState<MediaShow | null>(null);
+  const [movies, setMovies] = useState<MediaMovie[]>([]);
+  const [moviesLoaded, setMoviesLoaded] = useState(false);
+  const [moviesLoading, setMoviesLoading] = useState(false);
+  const [moviesError, setMoviesError] = useState("");
+  const [movieFilter, setMovieFilter] = useState("");
+  const [movieBusy, setMovieBusy] = useState<string | null>(null);
 
   // Music-tab state
   const [artists, setArtists] = useState<MusicArtist[]>([]);
@@ -128,14 +212,14 @@ export function ScheduleBuilderPanel({
   const [fillerLoading, setFillerLoading] = useState(false);
   const [fillerError, setFillerError] = useState("");
   const [fillerQuery, setFillerQuery] = useState("");
+  const [fillerEncodeBusy, setFillerEncodeBusy] = useState<Set<string>>(new Set());
   // New-channel slot-grid only: which filler clip fills the gap after each
   // episode, keyed by the episode's draftId so the choice survives reorders.
   // The schedule must be gap-free (every gap assigned) before it can be saved.
   const [gapFillerByPrimaryId, setGapFillerByPrimaryId] = useState<Map<string, string>>(new Map());
 
   const channelMediaKind: "video" | "music" =
-    playbackMode === "plex_relay" ? "video" : profileDetails[packageProfile]?.mediaKind === "music" ? "music" : "video";
-  const isPlexRelay = !existingMode && playbackMode === "plex_relay";
+    profileDetails[packageProfile]?.mediaKind === "music" ? "music" : "video";
 
   // Entry management via the shared hook
   const {
@@ -166,11 +250,10 @@ export function ScheduleBuilderPanel({
       : {
           packageProfile,
           displayName,
-          playbackMode,
           scheduleMode,
           slotDurationMs,
-          prefillMode: playbackMode === "plex_relay" ? "eager" : onDemand ? "on_demand" : "eager",
-          adaptiveBitrate: (playbackMode === "packaged" && !onDemand && channelMediaKind === "video" && adaptiveBitrate) || undefined,
+          prefillMode,
+          adaptiveBitrate: (prefillMode === "eager" && channelMediaKind === "video" && adaptiveBitrate) || undefined,
           onImported: onChannelImported,
         },
   );
@@ -179,17 +262,17 @@ export function ScheduleBuilderPanel({
     if (!existingChannel) return;
     setDisplayName(existingChannel.displayName);
     setPackageProfile(existingChannel.packageProfile);
-    setPlaybackMode(existingChannel.playbackMode === "plex_relay" ? "plex_relay" : "packaged");
+    setPrefillMode((existingChannel.prefillMode as "eager" | "on_demand") ?? "on_demand");
     setScheduleMode(existingChannel.scheduleMode === "slot_grid" ? "slot_grid" : "back_to_back");
     setSlotDurationMs(existingChannel.slotDurationMs ?? DEFAULT_SLOT_DURATION_MS);
-  }, [existingChannel?.id, existingChannel?.displayName, existingChannel?.packageProfile, existingChannel?.playbackMode, existingChannel?.scheduleMode, existingChannel?.slotDurationMs]);
+  }, [existingChannel?.id, existingChannel?.displayName, existingChannel?.packageProfile, existingChannel?.scheduleMode, existingChannel?.slotDurationMs]);
 
   // Profiles
   useEffect(() => {
     getScheduleBuilderProfileList()
       .then((next) => {
         const details = Object.fromEntries(next.profileDetails.map((item) => [item.name, item]));
-        const selectable = next.profiles.filter((profile) => !isABRProfile(details[profile]));
+        const selectable = next.profiles;
         defaultProfileRef.current = next.defaultProfile;
         setProfiles(selectable);
         setProfileDetails(details);
@@ -212,16 +295,16 @@ export function ScheduleBuilderPanel({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [channelMediaKind]);
 
-  // Lazy-load shows
+  // Lazy-load movies
   useEffect(() => {
-    if (activeTab !== "shows" || showsLoaded || showsLoading) return;
-    setShowsLoading(true);
-    setShowsError("");
-    getScheduleBuilderShows()
-      .then((s) => { setShows(s); setShowsLoaded(true); })
-      .catch((err) => setShowsError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setShowsLoading(false));
-  }, [activeTab, showsLoaded, showsLoading]);
+    if (activeTab !== "movies" || moviesLoaded || moviesLoading) return;
+    setMoviesLoading(true);
+    setMoviesError("");
+    getScheduleBuilderMovies()
+      .then((m) => { setMovies(m); setMoviesLoaded(true); })
+      .catch((err) => setMoviesError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setMoviesLoading(false));
+  }, [activeTab, moviesLoaded, moviesLoading]);
 
   // Lazy-load music
   useEffect(() => {
@@ -253,14 +336,21 @@ export function ScheduleBuilderPanel({
     setFillerCandidates([]);
   }, [packageProfile]);
 
-  // Debounced episode search
+  // Debounced episode search — fires only when the user types, never on
+  // cold-select with an empty query (avoids flooding the backend for no result).
   useEffect(() => {
     if (activeTab !== "episodes") return;
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchResults([]);
+      setSearchStatus("");
+      return;
+    }
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     searchTimerRef.current = setTimeout(() => {
       setSearchBusy(true);
       setSearchStatus("");
-      getScheduleBuilderCandidates(packageProfile, searchQuery.trim(), readyOnly ? "ready" : "all")
+      getScheduleBuilderCandidates(packageProfile, q, readyOnly ? "ready" : "all")
         .then((r) => setSearchResults(r.media))
         .catch((err) => {
           setSearchResults([]);
@@ -272,11 +362,11 @@ export function ScheduleBuilderPanel({
   }, [activeTab, packageProfile, searchQuery, readyOnly]);
 
   async function queueGroup(group: string, index?: number) {
-    if (groupBusy || showBusy) return;
+    if (groupBusy) return;
     setGroupBusy(group);
     try {
       const media = await getScheduleBuilderGroup(group);
-      const added = appendDraftEntries(media.map((m) => candidateToInsertItemFromMedia(m, isPlexRelay)), index);
+      const added = appendDraftEntries(media.map((m) => candidateToInsertItemFromMedia(m)), index);
       if (!displayName.trim()) setDisplayName(group);
       if (added === 0) setSearchStatus(`all episodes from "${group}" already in queue`);
     } catch (err) {
@@ -286,19 +376,18 @@ export function ScheduleBuilderPanel({
     }
   }
 
-  async function queueShow(show: MediaShow, index?: number) {
-    if (showBusy || groupBusy) return;
-    setShowBusy(show.showName);
+  async function queueMovie(movie: MediaMovie, index?: number) {
+    if (movieBusy) return;
+    setMovieBusy(movie.group);
     try {
-      const groupNames = show.seasons.flatMap((season) => season.halves.map((h) => h.group));
-      const batches = await Promise.all(groupNames.map((g) => getScheduleBuilderGroup(g)));
-      const added = appendDraftEntries(batches.flat().map((m) => candidateToInsertItemFromMedia(m, isPlexRelay)), index);
-      if (!displayName.trim()) setDisplayName(show.showName);
-      if (added === 0) setSearchStatus(`all episodes from "${show.showName}" already in queue`);
+      const media = await getScheduleBuilderGroup(movie.group);
+      const added = appendDraftEntries(media.map((m) => candidateToInsertItemFromMedia(m)), index);
+      if (!displayName.trim()) setDisplayName(movie.title);
+      if (added === 0) setSearchStatus(`"${movie.title}" is already in the queue`);
     } catch (err) {
       setSearchStatus(err instanceof Error ? err.message : String(err));
     } finally {
-      setShowBusy(null);
+      setMovieBusy(null);
     }
   }
 
@@ -307,7 +396,7 @@ export function ScheduleBuilderPanel({
     setAlbumBusy(group);
     try {
       const media = await getScheduleBuilderGroup(group);
-      const added = appendDraftEntries(media.map((m) => candidateToInsertItemFromMedia(m, isPlexRelay)), index);
+      const added = appendDraftEntries(media.map((m) => candidateToInsertItemFromMedia(m)), index);
       if (!displayName.trim()) setDisplayName(group);
       if (added === 0) setSearchStatus(`all tracks from "${group}" already in queue`);
     } catch (err) {
@@ -323,7 +412,7 @@ export function ScheduleBuilderPanel({
     try {
       const batches = await Promise.all(artist.albums.map((al) => getScheduleBuilderGroup(al.group)));
       const artistDisplayName = artist.artistName || "Unknown Artist";
-      const added = appendDraftEntries(batches.flat().map((m) => candidateToInsertItemFromMedia(m, isPlexRelay)), index);
+      const added = appendDraftEntries(batches.flat().map((m) => candidateToInsertItemFromMedia(m)), index);
       if (!displayName.trim()) setDisplayName(artistDisplayName);
       if (added === 0) setSearchStatus(`all tracks from "${artistDisplayName}" already in queue`);
     } catch (err) {
@@ -333,13 +422,51 @@ export function ScheduleBuilderPanel({
     }
   }
 
+  // Import a scraped list: match each entry against the full candidate library
+  // for the selected profile (show + episode name), then queue the hits via the
+  // same appendDraftEntries path a drag-drop uses.
+  async function importShowList(items: ImportListItem[]) {
+    if (!packageProfile || importBusy) return;
+    if (items.length === 0) {
+      setSearchStatus("no entries found in imported list");
+      return;
+    }
+    setImportBusy(true);
+    setSearchStatus("");
+    try {
+      const all = await getAllScheduleBuilderCandidates(packageProfile);
+      const haystacks = all.map((c) => normalizeForMatch(`${c.title ?? ""} ${c.path}`));
+      const picked: MediaPackageCandidate[] = [];
+      const unmatched: string[] = [];
+      for (const it of items) {
+        const ep = normalizeForMatch(it.episode);
+        const show = it.show ? normalizeForMatch(it.show) : "";
+        const i = ep ? haystacks.findIndex((h) => h.includes(ep) && (!show || h.includes(show))) : -1;
+        if (i >= 0) picked.push(all[i]);
+        else unmatched.push(it.show ? `${it.show} — ${it.episode}` : it.episode);
+      }
+      const added = appendDraftEntries(picked.map((m) => candidateToInsertItemFromMedia(m)));
+      if (!displayName.trim() && items[0]?.show) setDisplayName(items[0].show);
+      const note = `imported ${added} of ${items.length}`;
+      setSearchStatus(
+        unmatched.length
+          ? `${note} · no match: ${unmatched.slice(0, 4).join(", ")}${unmatched.length > 4 ? ` +${unmatched.length - 4} more` : ""}`
+          : note,
+      );
+    } catch (err) {
+      setSearchStatus(err instanceof Error ? err.message : String(err));
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
   function toggleTab(tab: PickerTab) {
     setActiveTab((prev) => (prev === tab ? null : tab));
   }
 
   function insertMediaFromDrag(key: string, index: number) {
     const r = searchResults.find((x) => x.mediaId === key);
-    if (r) appendDraftEntry(candidateToInsertItem(r, isPlexRelay), index);
+    if (r && !candidateDisabled(r, profileDetails[packageProfile])) appendDraftEntry(candidateToInsertItem(r), index);
   }
 
   function insertBatchFromDrag(payloadText: string, index: number) {
@@ -352,12 +479,6 @@ export function ScheduleBuilderPanel({
     }
     if (payload.kind === "group") {
       void queueGroup(payload.group, index);
-      return;
-    }
-    if (payload.kind === "show") {
-      const show = shows.find((item) => item.showName === payload.showName);
-      if (show) void queueShow(show, index);
-      else setSearchStatus(`show not found: ${payload.showName}`);
       return;
     }
     if (payload.kind === "album") {
@@ -455,6 +576,45 @@ export function ScheduleBuilderPanel({
       return next;
     });
   }
+
+  async function queueFillerPackage(mediaId: string) {
+    const c = fillerCandidates.find((c) => c.mediaId === mediaId);
+    if (!c || c.packageReady || fillerEncodeBusy.has(mediaId) || !packageProfile) return;
+    setFillerEncodeBusy((prev) => new Set(prev).add(mediaId));
+    try {
+      await requestMediaPackages([mediaId], packageProfile);
+      setFillerLoaded(false);
+      setFillerCandidates([]);
+    } catch (err) {
+      setFillerError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFillerEncodeBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(mediaId);
+        return next;
+      });
+    }
+  }
+
+  async function queueAllMissingFiller() {
+    const missing = fillerCandidates.filter(
+      (c) => !c.packageReady && c.packageStatus === "missing" && !fillerEncodeBusy.has(c.mediaId),
+    );
+    if (missing.length === 0 || !packageProfile) return;
+    setFillerEncodeBusy((prev) => new Set([...prev, ...missing.map((c) => c.mediaId)]));
+    try {
+      await requestMediaPackages(
+        missing.map((c) => c.mediaId),
+        packageProfile,
+      );
+      setFillerLoaded(false);
+      setFillerCandidates([]);
+    } catch (err) {
+      setFillerError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFillerEncodeBusy(new Set());
+    }
+  }
   // Bulk convenience: assign the first long-enough ready clip to every gap that
   // is not already filled.
   function fillRemainingGaps() {
@@ -478,8 +638,6 @@ export function ScheduleBuilderPanel({
       : "Save schedule"
     : saveBusy
       ? "Importing..."
-      : isPlexRelay
-        ? "Create Plex relay channel"
       : allKnownReady
         ? "Create channel"
         : "Create channel and queue packages";
@@ -493,7 +651,7 @@ export function ScheduleBuilderPanel({
     return (
       <div className="admin-panel">
         <section className="admin-panel-section">
-          <h2>Schedule Builder</h2>
+          <h2>Schedule builder</h2>
           <p className="muted">checking media sources...</p>
         </section>
       </div>
@@ -504,14 +662,14 @@ export function ScheduleBuilderPanel({
     return (
       <div className="admin-panel">
         <section className="admin-panel-section">
-          <h2>Schedule Builder</h2>
-          <p className="muted">
+          <h2>Schedule builder</h2>
+          <p className="section-purpose">
             Connect at least one media source before building a schedule.
           </p>
           <div className={styles["sb-picker-actions"]}>
             {onOpenMediaSources && (
               <button type="button" className="primary" onClick={onOpenMediaSources}>
-                Open Media Sources
+                Open media sources
               </button>
             )}
             <button type="button" className="primary" onClick={sourceGate.refresh}>
@@ -534,12 +692,21 @@ export function ScheduleBuilderPanel({
   );
   const visibleSearchResults = unaddedResults.slice(0, BUILDER_CANDIDATE_LIMIT);
   const episodeItems = visibleSearchResults.map((r) => {
-    const meta = [r.schedulingGroup, isPlexRelay ? "" : packageStatusLabel(r, profileDetails)].filter(Boolean).join(" · ");
+    const disabledReason = browserHLSBitrateWarningLabel(r, profileDetails[packageProfile]);
+    const meta = [
+      r.collectionName,
+      sourceBitrateLabel(r),
+      packageStatusLabel(r, profileDetails),
+      forcedSubtitleWarningLabel(r),
+      disabledReason,
+    ].filter(Boolean).join(" · ");
     return {
       key: r.mediaId,
       title: r.title || r.path.split("/").pop() || r.path,
       meta: meta || undefined,
       durationMs: r.packagedDurationMs ?? r.durationMs,
+      disabled: disabledReason !== "",
+      actionLabel: disabledReason ? "Blocked" : undefined,
     };
   });
 
@@ -550,7 +717,7 @@ export function ScheduleBuilderPanel({
   return (
     <div className="admin-panel sb-panel">
       <section className="admin-panel-section">
-        <h2>{existingMode ? `Edit Schedule: ${displayName}` : "Schedule Builder"}</h2>
+        <h2>{existingMode ? `Edit schedule: ${displayName}` : "Schedule builder"}</h2>
         <div className={styles["sb-config"]}>
           <label className={styles["sb-name-label"]}>
             <span>display name</span>
@@ -605,49 +772,25 @@ export function ScheduleBuilderPanel({
               <div className={styles["sb-mode-btns"]}>
                 <button
                   type="button"
-                  className={`${styles["sb-mode-btn"]}${playbackMode === "packaged" && !onDemand ? ` ${styles["is-active"]}` : ""}`}
-                  onClick={() => {
-                    setPlaybackMode("packaged");
-                    setOnDemand(false);
-                  }}
-                >
-                  Pre-encode
-                </button>
-                <button
-                  type="button"
-                  className={`${styles["sb-mode-btn"]}${playbackMode === "packaged" && onDemand ? ` ${styles["is-active"]}` : ""}`}
-                  onClick={() => {
-                    setPlaybackMode("packaged");
-                    setOnDemand(true);
-                    setAdaptiveBitrate("");
-                  }}
+                  className={`${styles["sb-mode-btn"]}${prefillMode === "on_demand" ? ` ${styles["is-active"]}` : ""}`}
+                  onClick={() => { setPrefillMode("on_demand"); setAdaptiveBitrate(""); }}
                 >
                   On-demand
                 </button>
                 <button
                   type="button"
-                  className={`${styles["sb-mode-btn"]}${playbackMode === "plex_relay" ? ` ${styles["is-active"]}` : ""}`}
-                  disabled={!sourceGate.plexConfigured}
-                  title={sourceGate.plexConfigured ? undefined : "Connect Plex in Media Sources to enable relay playback."}
-                  onClick={() => {
-                    setPlaybackMode("plex_relay");
-                    setOnDemand(false);
-                    setAdaptiveBitrate("");
-                  }}
+                  className={`${styles["sb-mode-btn"]}${prefillMode === "eager" ? ` ${styles["is-active"]}` : ""}`}
+                  onClick={() => setPrefillMode("eager")}
                 >
-                  Plex relay
+                  Pre-encode
                 </button>
               </div>
               <p className="muted">
-                {playbackMode === "plex_relay"
-                  ? "Playback follows this schedule but asks Plex for a per-viewer transcode session instead of using linearcast packages."
-                  : !sourceGate.plexConfigured
-                  ? "Connect Plex in Media Sources to enable Plex relay. Pre-encode and On-demand use linearcast packages."
-                  : onDemand
+                {prefillMode === "on_demand"
                   ? "Nothing is encoded until someone tunes in. The first viewer waits while the current program encodes; later viewers join the live edge. Idle channels cost nothing."
                   : "Every program is packaged ahead of time so tune-in is instant."}
               </p>
-              {playbackMode === "packaged" && !onDemand && channelMediaKind === "video" && (
+              {prefillMode === "eager" && channelMediaKind === "video" && (
                 <label className={styles["sb-abr-select"]}>
                   <span>adaptive bitrate</span>
                   <select
@@ -673,14 +816,15 @@ export function ScheduleBuilderPanel({
           {!adaptiveBitrate && (
           <div className={styles["sb-profile-field"]}>
             <span className={styles["sb-field-label"]}>
-              {isPlexRelay ? "Select a video profile to browse Plex media" : "Select a package profile to get started"}
+              Select a package profile to get started
             </span>
             <div className={styles["sb-profile-btns"]}>
               {profiles.map((p) => (
                 <button
                   key={p}
                   type="button"
-                  className={`sb-profile-btn${packageProfile === p ? " is-active" : ""}`}
+                  className={`${styles["sb-profile-btn"]}${packageProfile === p ? ` ${styles["is-active"]}` : ""}`}
+                  aria-pressed={packageProfile === p}
                   title={p}
                   disabled={existingMode}
                   onClick={() => setPackageProfile(p === packageProfile ? "" : p)}
@@ -696,19 +840,49 @@ export function ScheduleBuilderPanel({
 
       {packageProfile && (
         <section className="admin-panel-section sb-list-section">
+          {channelMediaKind === "video" && (
+            <div className={styles["sb-content-btns"]}>
+              <button
+                type="button"
+                className={styles["sb-content-btn"]}
+                disabled={importBusy}
+                title="Import a scraped list (JSON) and queue matching episodes"
+                onClick={() => importInputRef.current?.click()}
+              >
+                {importBusy ? "Importing…" : "Import list"}
+              </button>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept="application/json,.json"
+                hidden
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!file) return;
+                  file
+                    .text()
+                    .then((text) => importShowList(parseImportList(text)))
+                    .catch((err) => setSearchStatus(err instanceof Error ? err.message : String(err)));
+                }}
+              />
+            </div>
+          )}
           <div className={styles["sb-content-btns"]}>
             {channelMediaKind === "video" ? (
               <>
                 <button
                   type="button"
-                  className={`sb-content-btn${activeTab === "shows" ? " is-active" : ""}`}
-                  onClick={() => toggleTab("shows")}
+                  className={`${styles["sb-content-btn"]}${activeTab === "movies" ? ` ${styles["is-active"]}` : ""}`}
+                  aria-pressed={activeTab === "movies"}
+                  onClick={() => toggleTab("movies")}
                 >
-                  Shows
+                  Movies
                 </button>
                 <button
                   type="button"
-                  className={`sb-content-btn${activeTab === "episodes" ? " is-active" : ""}`}
+                  className={`${styles["sb-content-btn"]}${activeTab === "episodes" ? ` ${styles["is-active"]}` : ""}`}
+                  aria-pressed={activeTab === "episodes"}
                   onClick={() => toggleTab("episodes")}
                 >
                   Episodes
@@ -717,16 +891,18 @@ export function ScheduleBuilderPanel({
             ) : (
               <button
                 type="button"
-                className={`sb-content-btn${activeTab === "music" ? " is-active" : ""}`}
+                className={`${styles["sb-content-btn"]}${activeTab === "music" ? ` ${styles["is-active"]}` : ""}`}
+                aria-pressed={activeTab === "music"}
                 onClick={() => toggleTab("music")}
               >
                 Music
               </button>
             )}
-            {existingMode && (
+            {(existingMode || scheduleMode === "slot_grid") && (
               <button
                 type="button"
-                className={`sb-content-btn${activeTab === "filler" ? " is-active" : ""}`}
+                className={`${styles["sb-content-btn"]}${activeTab === "filler" ? ` ${styles["is-active"]}` : ""}`}
+                aria-pressed={activeTab === "filler"}
                 onClick={() => toggleTab("filler")}
               >
                 Filler
@@ -747,19 +923,17 @@ export function ScheduleBuilderPanel({
                 draggableItems
                 onItemAction={(key) => {
                   const r = searchResults.find((x) => x.mediaId === key);
-                  if (r) appendDraftEntry(candidateToInsertItem(r, isPlexRelay));
+                  if (r && !candidateDisabled(r, profileDetails[packageProfile])) appendDraftEntry(candidateToInsertItem(r));
                 }}
                 toolsExtra={
-                  isPlexRelay ? undefined : (
-                    <label className={styles["sb-ready-filter"]}>
-                      <input
-                        type="checkbox"
-                        checked={readyOnly}
-                        onChange={(e) => setReadyOnly(e.target.checked)}
-                      />
-                      Ready only
-                    </label>
-                  )
+                  <label className={styles["sb-ready-filter"]}>
+                    <input
+                      type="checkbox"
+                      checked={readyOnly}
+                      onChange={(e) => setReadyOnly(e.target.checked)}
+                    />
+                    Ready only
+                  </label>
                 }
                 emptyMessage={
                   unaddedResults.length === 0
@@ -781,25 +955,33 @@ export function ScheduleBuilderPanel({
             </div>
           )}
 
-          {activeTab === "shows" && (
+          {activeTab === "movies" && (
             <div className={styles["sb-picker-expanded"]}>
-              <SchedulePickerShowsGrid
-                shows={shows}
-                loading={showsLoading}
-                error={showsError || undefined}
-                filter={groupFilter}
-                onFilterChange={setGroupFilter}
-                selectedShow={selectedShow}
-                onSelectShow={setSelectedShow}
-                queueGroup={queueGroup}
-                queueShow={queueShow}
-                groupBusy={groupBusy}
-                showBusy={showBusy}
+              <MediaPickerRail
+                query={movieFilter}
+                onQueryChange={setMovieFilter}
+                queryPlaceholder="Filter movies…"
+                loading={moviesLoading}
+                loadingMessage="loading…"
+                error={moviesError}
+                items={movies
+                  .filter((m) => !movieFilter.trim() || m.title.toLowerCase().includes(movieFilter.toLowerCase()))
+                  .map((m) => ({
+                    key: m.group,
+                    title: m.title,
+                    meta: m.itemCount > 1 ? `${m.itemCount} editions` : undefined,
+                    durationMs: m.durationMs,
+                    disabled: movieBusy === m.group,
+                  }))}
+                onItemAction={(key) => {
+                  const m = movies.find((x) => x.group === key);
+                  if (m) void queueMovie(m);
+                }}
                 emptyMessage={
-                  showsLoaded
-                    ? shows.length === 0
-                      ? "No media groups found. Run linearcast-ingest on a media directory first."
-                      : "no shows match"
+                  moviesLoaded
+                    ? movies.length === 0
+                      ? "No movies found. Add a media source in 'Library' and scan to create schedule"
+                      : "no movies match"
                     : undefined
                 }
               />
@@ -831,7 +1013,7 @@ export function ScheduleBuilderPanel({
             </div>
           )}
 
-          {activeTab === "filler" && existingMode && (
+          {activeTab === "filler" && (existingMode || scheduleMode === "slot_grid") && (
             <div className={styles["sb-picker-expanded"]}>
               <MediaPickerRail
                 query={fillerQuery}
@@ -851,9 +1033,19 @@ export function ScheduleBuilderPanel({
                     title: c.label,
                     durationMs: c.packagedDurationMs ?? c.durationMs,
                     meta: c.packageReady ? undefined : c.packageStatus === "missing" ? "needs package" : c.packageStatus,
-                    disabled: !c.packageReady,
+                    disabled: c.packageReady
+                      ? false
+                      : c.packageStatus === "pending" || c.packageStatus === "processing",
+                    actionLabel: c.packageReady
+                      ? undefined
+                      : c.packageStatus === "missing"
+                        ? "Encode"
+                        : c.packageStatus === "failed"
+                          ? "Retry"
+                          : undefined,
                   }))}
-                onItemAction={() => {}}
+                onItemAction={(mediaId) => void queueFillerPackage(mediaId)}
+                itemActionBusy={fillerEncodeBusy.size > 0}
                 emptyMessage={
                   fillerLoaded
                     ? fillerCandidates.length === 0
@@ -865,6 +1057,17 @@ export function ScheduleBuilderPanel({
                   fillerLoaded && fillerCandidates.length > 0
                     ? "Drag a ready filler asset onto a gap in the timeline below."
                     : undefined
+                }
+                toolsExtra={
+                  fillerLoaded && fillerCandidates.some((c) => !c.packageReady && c.packageStatus === "missing") ? (
+                    <button
+                      type="button"
+                      disabled={fillerEncodeBusy.size > 0}
+                      onClick={() => void queueAllMissingFiller()}
+                    >
+                      {fillerEncodeBusy.size > 0 ? "Queuing…" : "Queue all missing"}
+                    </button>
+                  ) : undefined
                 }
               />
             </div>
@@ -947,7 +1150,14 @@ export function ScheduleBuilderPanel({
                     return (
                       <Fragment key={e.draftId}>
                         <li className={styles["sb-entry"]}>
-                          <span className={styles["sb-entry-title"]}>{e.title || e.mediaId}</span>
+                          <div className={styles["sb-entry-main"]}>
+                            <span className={styles["sb-entry-title"]}>{e.title || e.mediaId}</span>
+                            {e.path && (
+                              <span className={`${styles["sb-entry-sub"]} muted`} title={e.path}>
+                                {sourceTail(e.path)}
+                              </span>
+                            )}
+                          </div>
                           <span className="sb-entry-duration muted">{formatMs(e.durationMs)}</span>
                           <div className={styles["sb-entry-move"]}>
                             <button type="button" disabled={preservesExistingWallClock || index === 0} onClick={() => moveDraftEntry(index, index - 1)} aria-label="Move up">↑</button>
@@ -1040,13 +1250,24 @@ export function ScheduleBuilderPanel({
   );
 }
 
-function isABRProfile(profile?: PackageProfile): boolean {
-  return (profile?.tags ?? []).includes("abr");
-}
-
 function profileChipLabel(name: string, details: Record<string, PackageProfile>) {
   if (!name) return "selected profile";
   return details[name]?.label || name;
+}
+
+// sourceTail returns the disambiguating part of a media filename for the list
+// preview subline: the source/quality/release tokens after the release year.
+// Two files of the same movie share a long "Title.YYYY" prefix that is already
+// shown on the title line and would otherwise eat the column with end-ellipsis,
+// so we drop it. Falls back to the bare filename when no year token is present.
+function sourceTail(path: string): string {
+  const base = path.split("/").pop() ?? path;
+  const yearRe = /(?:19|20)\d{2}/g;
+  let last: RegExpExecArray | null = null;
+  for (let m = yearRe.exec(base); m; m = yearRe.exec(base)) last = m;
+  if (!last) return base;
+  const tail = base.slice(last.index + last[0].length).replace(/^[.\s_-]+/, "");
+  return tail || base;
 }
 
 // Converts the media shape from getScheduleBuilderGroup into a ScheduleInsertItem.
@@ -1055,7 +1276,7 @@ function candidateToInsertItemFromMedia(m: {
   mediaId: string;
   title?: string;
   path: string;
-  schedulingGroup?: string;
+  collectionName?: string;
   durationMs: number;
   packagedDurationMs?: number;
 }, forceReady = false): ScheduleInsertItem {
@@ -1063,7 +1284,7 @@ function candidateToInsertItemFromMedia(m: {
     mediaId: m.mediaId,
     title: m.title,
     path: m.path,
-    schedulingGroup: m.schedulingGroup,
+    collectionName: m.collectionName,
     durationMs: m.packagedDurationMs ?? m.durationMs,
     packagedDurationMs: m.packagedDurationMs,
     packageReady: forceReady || m.packagedDurationMs != null,

@@ -7,220 +7,246 @@ import (
 	"strings"
 )
 
-func UpsertMediaTrack(ctx context.Context, conn *sql.DB, t MediaTrack) error {
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func valueOrEmpty(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func UpsertPackageTrack(ctx context.Context, conn *sql.DB, t PackageTrack) error {
 	if t.Source == "" {
 		t.Source = TrackSourceEmbedded
 	}
 	var err error
 	if t.Source == TrackSourceEmbedded || t.Source == TrackSourceEmbeddedBitmap {
-		// Conflict target: partial unique index on (media_id, kind, stream_index)
-		// where source IN ('embedded_text', 'embedded_bitmap'). Both embedded
-		// sources key on the source stream index, so a bitmap inventory row and a
-		// text sidecar for the same stream upsert in place rather than colliding.
+		// Conflict target: partial unique index on (package_id, kind, stream_index)
+		// where source IN ('embedded_text', 'embedded_bitmap').
 		_, err = conn.ExecContext(ctx, `
-			INSERT INTO media_tracks
-			  (media_id, kind, stream_index, language, codec, source, default_flag, forced, path)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(media_id, kind, stream_index)
+			INSERT INTO package_tracks
+			  (package_id, kind, stream_index, language, title, codec, source, default_flag, forced, hearing_impaired, path)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(package_id, kind, stream_index)
 			  WHERE source IN ('embedded_text', 'embedded_bitmap')
 			DO UPDATE SET
-			  language     = excluded.language,
-			  codec        = excluded.codec,
-			  source       = excluded.source,
-			  default_flag = excluded.default_flag,
-			  forced       = excluded.forced,
-			  path         = excluded.path`,
-			t.MediaID, t.Kind, t.StreamIndex, nullString(t.Language), nullString(t.Codec), string(t.Source),
-			boolToInt(t.DefaultFlag), boolToInt(t.Forced), nullableString(t.Path))
+			  language         = excluded.language,
+			  title            = excluded.title,
+			  codec            = excluded.codec,
+			  source           = excluded.source,
+			  default_flag     = excluded.default_flag,
+			  forced           = excluded.forced,
+			  hearing_impaired = excluded.hearing_impaired,
+			  path             = excluded.path`,
+			t.PackageID, t.Kind, t.StreamIndex, nullString(t.Language), nullString(t.Title), nullString(t.Codec), string(t.Source),
+			boolToInt(t.DefaultFlag), boolToInt(t.Forced), boolToInt(t.HearingImpaired), nullableString(t.Path))
 	} else {
-		// Conflict target: partial unique index on (media_id, language, source)
+		// Conflict target: partial unique index on (package_id, language, source)
 		// where source is external (not an embedded source) and kind = 'subtitle'.
 		_, err = conn.ExecContext(ctx, `
-			INSERT INTO media_tracks
-			  (media_id, kind, stream_index, language, codec, source, default_flag, forced, path)
-			VALUES (?, ?, -1, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(media_id, language, source)
+			INSERT INTO package_tracks
+			  (package_id, kind, stream_index, language, title, codec, source, default_flag, forced, hearing_impaired, path)
+			VALUES (?, ?, -1, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(package_id, language, source)
 			  WHERE source NOT IN ('embedded_text', 'embedded_bitmap') AND kind = 'subtitle'
 			DO UPDATE SET
-			  codec        = excluded.codec,
-			  default_flag = excluded.default_flag,
-			  forced       = excluded.forced,
-			  path         = excluded.path`,
-			t.MediaID, t.Kind, nullString(t.Language), nullString(t.Codec), string(t.Source),
-			boolToInt(t.DefaultFlag), boolToInt(t.Forced), nullableString(t.Path))
+			  title            = excluded.title,
+			  codec            = excluded.codec,
+			  default_flag     = excluded.default_flag,
+			  forced           = excluded.forced,
+			  hearing_impaired = excluded.hearing_impaired,
+			  path             = excluded.path`,
+			t.PackageID, t.Kind, nullString(t.Language), nullString(t.Title), nullString(t.Codec), string(t.Source),
+			boolToInt(t.DefaultFlag), boolToInt(t.Forced), boolToInt(t.HearingImpaired), nullableString(t.Path))
 	}
 	if err != nil {
-		return fmt.Errorf("upsert media track: %w", err)
+		return fmt.Errorf("upsert package track: %w", err)
 	}
 	return nil
 }
 
-func MediaTracksByMediaID(ctx context.Context, conn *sql.DB, mediaID string) ([]MediaTrack, error) {
-	tracks, err := queryRows(ctx, conn, scanMediaTrack, `
-		SELECT id, media_id, kind, stream_index, language, codec, source, default_flag, forced, path
-		FROM media_tracks
-		WHERE media_id = ?
-		ORDER BY kind, stream_index`,
-		mediaID)
+// DeletePackageTextSubtitleTracks removes embedded_text subtitle rows for a
+// package before re-finalizing it. Bitmap inventory rows (path=NULL) are left
+// untouched.
+func DeletePackageTextSubtitleTracks(ctx context.Context, conn *sql.DB, packageID string) error {
+	_, err := conn.ExecContext(ctx, `
+		DELETE FROM package_tracks
+		WHERE package_id = ? AND kind = 'subtitle' AND source = 'embedded_text'`,
+		packageID)
 	if err != nil {
-		return nil, fmt.Errorf("media tracks: %w", err)
+		return fmt.Errorf("delete package text subtitle tracks: %w", err)
+	}
+	return nil
+}
+
+func DeletePackageTracks(ctx context.Context, conn *sql.DB, packageID string) error {
+	_, err := conn.ExecContext(ctx, `DELETE FROM package_tracks WHERE package_id = ?`, packageID)
+	if err != nil {
+		return fmt.Errorf("delete package tracks: %w", err)
+	}
+	return nil
+}
+
+func PackageTracksByPackageID(ctx context.Context, conn *sql.DB, packageID string) ([]PackageTrack, error) {
+	tracks, err := queryRows(ctx, conn, scanPackageTrack, `
+		SELECT id, package_id, kind, stream_index, language, title, codec, source, default_flag, forced, hearing_impaired, path
+		FROM package_tracks
+		WHERE package_id = ?
+		ORDER BY kind, stream_index`,
+		packageID)
+	if err != nil {
+		return nil, fmt.Errorf("package tracks: %w", err)
 	}
 	return tracks, nil
 }
 
-// PreferredSubtitleTracksByMediaID returns the best available subtitle track
-// per language for a media item, applying source precedence:
-// embedded_text > opensubtitles > manual. Sentinel rows (path IS NULL) are
-// excluded — they exist only to suppress re-querying the API.
-func PreferredSubtitleTracksByMediaID(ctx context.Context, conn *sql.DB, mediaID string) ([]MediaTrack, error) {
-	all, err := queryRows(ctx, conn, scanMediaTrack, `
-		SELECT id, media_id, kind, stream_index, language, codec, source, default_flag, forced, path
-		FROM media_tracks
-		WHERE media_id = ?
-		  AND kind = 'subtitle'
-		  AND path IS NOT NULL
-		ORDER BY
-		  language,
-		  CASE source
-		    WHEN 'embedded_text'  THEN 0
-		    WHEN 'opensubtitles'  THEN 1
-		    WHEN 'manual'         THEN 2
-		    ELSE 3
-		  END`,
-		mediaID)
-	if err != nil {
-		return nil, fmt.Errorf("preferred subtitle tracks: %w", err)
-	}
-	// Keep first (highest-priority) row per language.
-	seen := make(map[string]bool)
-	out := all[:0]
-	for _, t := range all {
-		key := t.Language
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, t)
-		}
-	}
-	return out, nil
+// plainSubtitleCandidate reports whether t can serve as the plain per-language
+// text rendition. Forced narrative tracks never qualify: they are burned into
+// transcodes or advertised as their own FORCED rendition, and serving one as
+// "English" makes the CC track look empty.
+func plainSubtitleCandidate(t PackageTrack) bool {
+	return t.Kind == "subtitle" && !t.Forced && t.Path != nil
 }
 
-// SubtitleTracksForMediaIDs returns the preferred subtitle track per language
-// for each of the given media IDs in a single query.
-func SubtitleTracksForMediaIDs(ctx context.Context, conn *sql.DB, mediaIDs []string) ([]MediaTrack, error) {
-	if len(mediaIDs) == 0 {
+// forcedSubtitleCandidate reports whether t can serve as the forced-narrative
+// rendition for its language: a forced track with an extracted sidecar. Bitmap
+// forced tracks (NULL path) never qualify — they can only be burned.
+func forcedSubtitleCandidate(t PackageTrack) bool {
+	return t.Kind == "subtitle" && t.Forced && t.Path != nil
+}
+
+func subtitleSourceRank(s TrackSource) int {
+	switch s {
+	case TrackSourceEmbedded:
+		return 0
+	case TrackSourceManual:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// preferSubtitleTrack reports whether a beats b for the per-language pick: full
+// dialogue before SDH, then embedded_text before manual, then source stream
+// order.
+func preferSubtitleTrack(a, b PackageTrack) bool {
+	if a.HearingImpaired != b.HearingImpaired {
+		return !a.HearingImpaired
+	}
+	if ra, rb := subtitleSourceRank(a.Source), subtitleSourceRank(b.Source); ra != rb {
+		return ra < rb
+	}
+	return a.StreamIndex < b.StreamIndex
+}
+
+func bestSubtitleTrack(tracks []PackageTrack, language string, candidate func(PackageTrack) bool) *PackageTrack {
+	var best *PackageTrack
+	for i := range tracks {
+		t := tracks[i]
+		if !candidate(t) || t.Language != language {
+			continue
+		}
+		if best == nil || preferSubtitleTrack(t, *best) {
+			best = &tracks[i]
+		}
+	}
+	return best
+}
+
+// PreferredSubtitleTrack picks the track to serve as the plain rendition for
+// one language, or nil when the language has no qualifying (non-forced,
+// extracted) track.
+func PreferredSubtitleTrack(tracks []PackageTrack, language string) *PackageTrack {
+	return bestSubtitleTrack(tracks, language, plainSubtitleCandidate)
+}
+
+// ForcedSubtitleTrack picks the track to serve as the forced-narrative
+// rendition for one language, or nil when the language has no extracted forced
+// track.
+func ForcedSubtitleTrack(tracks []PackageTrack, language string) *PackageTrack {
+	return bestSubtitleTrack(tracks, language, forcedSubtitleCandidate)
+}
+
+// PackageSubtitleTracksForMediaIDs returns the advertisable plain subtitle track
+// per language across ready packages for the given media IDs and profile.
+func PackageSubtitleTracksForMediaIDs(ctx context.Context, conn *sql.DB, mediaIDs []string, profile string) ([]PackageTrack, error) {
+	return packageSubtitleRenditionsForMediaIDs(ctx, conn, mediaIDs, profile, plainSubtitleCandidate)
+}
+
+// ForcedPackageSubtitleTracksForMediaIDs returns the forced-narrative track per
+// language across ready packages for the given media IDs and profile. Callers
+// advertise these as FORCED renditions unless the profile burns the language in.
+func ForcedPackageSubtitleTracksForMediaIDs(ctx context.Context, conn *sql.DB, mediaIDs []string, profile string) ([]PackageTrack, error) {
+	return packageSubtitleRenditionsForMediaIDs(ctx, conn, mediaIDs, profile, forcedSubtitleCandidate)
+}
+
+func packageSubtitleRenditionsForMediaIDs(ctx context.Context, conn *sql.DB, mediaIDs []string, profile string, candidate func(PackageTrack) bool) ([]PackageTrack, error) {
+	if len(mediaIDs) == 0 || strings.TrimSpace(profile) == "" {
 		return nil, nil
 	}
 	placeholders := strings.Repeat("?,", len(mediaIDs))
 	placeholders = placeholders[:len(placeholders)-1]
-	args := make([]any, len(mediaIDs))
-	for i, id := range mediaIDs {
-		args[i] = id
+	args := make([]any, 0, len(mediaIDs)+2)
+	args = append(args, profile, string(PackageStatusReady))
+	for _, id := range mediaIDs {
+		args = append(args, id)
 	}
-	all, err := queryRows(ctx, conn, scanMediaTrack, `
-		SELECT id, media_id, kind, stream_index, language, codec, source, default_flag, forced, path
-		FROM media_tracks
-		WHERE media_id IN (`+placeholders+`)
-		  AND kind = 'subtitle'
-		  AND path IS NOT NULL
-		ORDER BY
-		  stream_index,
-		  CASE source
-		    WHEN 'embedded_text'  THEN 0
-		    WHEN 'opensubtitles'  THEN 1
-		    WHEN 'manual'         THEN 2
-		    ELSE 3
-		  END`,
+	all, err := queryRows(ctx, conn, scanPackageTrack, `
+		SELECT pt.id, pt.package_id, pt.kind, pt.stream_index, pt.language, pt.title, pt.codec,
+		       pt.source, pt.default_flag, pt.forced, pt.hearing_impaired, pt.path
+		FROM package_tracks pt
+		JOIN media_packages mp ON mp.id = pt.package_id
+		WHERE mp.rendition_profile = ?
+		  AND mp.status = ?
+		  AND mp.media_id IN (`+placeholders+`)
+		  AND pt.kind = 'subtitle'
+		  AND pt.path IS NOT NULL
+		ORDER BY mp.media_id, pt.stream_index`,
 		args...)
 	if err != nil {
-		return nil, fmt.Errorf("subtitle tracks: %w", err)
+		return nil, fmt.Errorf("package subtitle tracks: %w", err)
 	}
-	// Deduplicate by language, keeping first (highest-priority) occurrence.
-	seen := make(map[string]bool)
-	out := all[:0]
+	// One track per language, preferred across the whole window; output keeps
+	// first-seen language order so the manifest stays deterministic.
+	byLang := make(map[string]int)
+	var out []PackageTrack
 	for _, t := range all {
-		key := t.Language
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, t)
+		if !candidate(t) {
+			continue
 		}
+		if i, ok := byLang[t.Language]; ok {
+			if preferSubtitleTrack(t, out[i]) {
+				out[i] = t
+			}
+			continue
+		}
+		byLang[t.Language] = len(out)
+		out = append(out, t)
 	}
 	return out, nil
 }
 
-// BitmapSubtitleTracksForMedia returns embedded bitmap subtitle inventory rows
-// for one media item. These rows have no sidecar path; selecting one requires
-// burning it into a live transcode session.
-func BitmapSubtitleTracksForMedia(ctx context.Context, conn *sql.DB, mediaID string) ([]MediaTrack, error) {
-	tracks, err := queryRows(ctx, conn, scanMediaTrack, `
-		SELECT id, media_id, kind, stream_index, language, codec, source, default_flag, forced, path
-		FROM media_tracks
-		WHERE media_id = ?
-		  AND kind = 'subtitle'
-		  AND source = 'embedded_bitmap'
-		ORDER BY language, forced DESC, stream_index`,
-		mediaID)
-	if err != nil {
-		return nil, fmt.Errorf("bitmap subtitle tracks: %w", err)
+func scanPackageTrack(row scanner) (PackageTrack, error) {
+	var t PackageTrack
+	var defaultInt, forcedInt, hearingImpairedInt int
+	var language, title, codec, source, path *string
+	if err := row.Scan(&t.ID, &t.PackageID, &t.Kind, &t.StreamIndex, &language, &title, &codec, &source,
+		&defaultInt, &forcedInt, &hearingImpairedInt, &path); err != nil {
+		return PackageTrack{}, err
 	}
-	return tracks, nil
-}
-
-// HasSubtitleTrackForLang returns whether a non-sentinel subtitle track
-// (embedded_text or real opensubtitles) exists for a given (media_id, language).
-func HasSubtitleTrackForLang(ctx context.Context, conn *sql.DB, mediaID, language string) (bool, error) {
-	var n int
-	err := conn.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM media_tracks
-		WHERE media_id = ?
-		  AND kind = 'subtitle'
-		  AND language = ?
-		  AND path IS NOT NULL
-		  AND source IN ('embedded_text', 'opensubtitles', 'manual')`,
-		mediaID, language).Scan(&n)
-	if err != nil {
-		return false, fmt.Errorf("has subtitle track: %w", err)
-	}
-	return n > 0, nil
-}
-
-func scanMediaTrack(row scanner) (MediaTrack, error) {
-	var t MediaTrack
-	var defaultInt, forcedInt int
-	var source string
-	var language, codec, path sql.NullString
-	if err := row.Scan(&t.ID, &t.MediaID, &t.Kind, &t.StreamIndex,
-		&language, &codec, &source, &defaultInt, &forcedInt, &path); err != nil {
-		return MediaTrack{}, err
-	}
-	t.Language = language.String
-	t.Codec = codec.String
-	if path.Valid {
-		v := path.String
-		t.Path = &v
-	}
-	t.Source = TrackSource(source)
+	t.Language = valueOrEmpty(language)
+	t.Title = valueOrEmpty(title)
+	t.Codec = valueOrEmpty(codec)
+	t.Source = TrackSource(valueOrEmpty(source))
 	t.DefaultFlag = defaultInt == 1
 	t.Forced = forcedInt == 1
+	t.HearingImpaired = hearingImpairedInt == 1
+	t.Path = path
 	return t, nil
-}
-
-// DeleteMediaTrack removes a subtitle track row for a given media_id and language.
-// It deletes both real tracks and sentinel rows (path IS NULL).
-func DeleteMediaTrack(ctx context.Context, conn *sql.DB, mediaID, language string) error {
-	_, err := conn.ExecContext(ctx, `
-		DELETE FROM media_tracks
-		WHERE media_id = ? AND kind = 'subtitle' AND language = ?`,
-		mediaID, language)
-	if err != nil {
-		return fmt.Errorf("delete media track: %w", err)
-	}
-	return nil
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }

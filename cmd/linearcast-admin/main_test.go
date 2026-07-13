@@ -19,9 +19,6 @@ func TestLoadStartupConfigAllowsMissingPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success with no env password, got %v", err)
 	}
-	if cfg.adminPassword != "" {
-		t.Fatalf("expected empty adminPassword, got %q", cfg.adminPassword)
-	}
 	if cfg.allowNoAuth {
 		t.Fatal("expected allowNoAuth=false")
 	}
@@ -35,40 +32,33 @@ func TestLoadStartupConfigAllowsExplicitNoAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load startup config: %v", err)
 	}
-	if cfg.adminPassword != "" {
-		t.Fatalf("expected auth disabled, got password %q", cfg.adminPassword)
-	}
 	if !cfg.allowNoAuth {
 		t.Fatal("expected allowNoAuth=true")
 	}
 }
 
-func TestLoadStartupConfigAcceptsPresentPassword(t *testing.T) {
-	cfg, err := loadStartupConfig(testEnv(map[string]string{
-		"LINEARCAST_DB":             "/tmp/linearcast.db",
-		"LINEARCAST_ADMIN_PASSWORD": " secret ",
-	}))
-	if err != nil {
-		t.Fatalf("load startup config: %v", err)
-	}
-	if cfg.adminPassword != "secret" {
-		t.Fatalf("expected trimmed password, got %q", cfg.adminPassword)
-	}
-	if cfg.allowNoAuth {
-		t.Fatal("expected allowNoAuth=false")
+func TestLoadStartupConfigRejectsMalformedAdminAddr(t *testing.T) {
+	for _, addr := range []string{"localhost", ":", ":0", ":abc", "8890", ":99999"} {
+		_, err := loadStartupConfig(testEnv(map[string]string{
+			"LINEARCAST_DB":         "/tmp/linearcast.db",
+			"LINEARCAST_ADMIN_ADDR": addr,
+		}))
+		if err == nil || !strings.Contains(err.Error(), "LINEARCAST_ADMIN_ADDR") {
+			t.Fatalf("addr %q: expected LINEARCAST_ADMIN_ADDR error, got %v", addr, err)
+		}
 	}
 }
 
-func TestLoadStartupConfigWhitespacePasswordTreatedAsEmpty(t *testing.T) {
+func TestLoadStartupConfigAcceptsValidAdminAddr(t *testing.T) {
 	cfg, err := loadStartupConfig(testEnv(map[string]string{
-		"LINEARCAST_DB":             "/tmp/linearcast.db",
-		"LINEARCAST_ADMIN_PASSWORD": " \t\n ",
+		"LINEARCAST_DB":         "/tmp/linearcast.db",
+		"LINEARCAST_ADMIN_ADDR": "0.0.0.0:8890",
 	}))
 	if err != nil {
-		t.Fatalf("expected success, got %v", err)
+		t.Fatalf("unexpected error %v", err)
 	}
-	if cfg.adminPassword != "" {
-		t.Fatalf("expected empty adminPassword, got %q", cfg.adminPassword)
+	if cfg.addr != "0.0.0.0:8890" {
+		t.Fatalf("addr=%q", cfg.addr)
 	}
 }
 

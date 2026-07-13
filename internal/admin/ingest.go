@@ -261,7 +261,7 @@ func (a *App) handleIngestStatus(w http.ResponseWriter, r *http.Request) {
 			"total":            job.summary.Total,
 			"passed":           job.summary.Passed,
 			"failed":           job.summary.Failed,
-			"failuresByReason": groupFailuresByReason(job.summary.Failures),
+			"failuresByReason": job.summary.FailureReasons,
 		}
 	}
 	if job.errMsg != "" {
@@ -283,22 +283,6 @@ func (a *App) handleIngestCancel(w http.ResponseWriter, r *http.Request) {
 	}
 	job.cancel()
 	writeJSON(w, map[string]any{"ok": true})
-}
-
-// groupFailuresByReason takes per-file failure strings like
-// "Episode.mkv: video_codec=hevc; video_height=2160" and returns a
-// {reason → count} map keyed by the reason suffix. Failures with no
-// colon are bucketed under the whole string.
-func groupFailuresByReason(failures []string) map[string]int {
-	out := map[string]int{}
-	for _, f := range failures {
-		reason := f
-		if i := strings.Index(f, ": "); i >= 0 {
-			reason = f[i+2:]
-		}
-		out[reason]++
-	}
-	return out
 }
 
 // isUnderRoot reports whether path is root itself or directly under it.

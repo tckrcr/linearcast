@@ -63,7 +63,7 @@ func PreviewChannel(ctx context.Context, conn *sql.DB, channelID string, opts Pr
 	if fromMs == 0 {
 		fromMs = nowMs
 	}
-	alignedFrom := Align6s(fromMs)
+	alignedFrom := AlignToGrid(fromMs)
 	durationMs := opts.DurationMs
 	if durationMs <= 0 {
 		durationMs = int64(24 * time.Hour / time.Millisecond)

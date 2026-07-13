@@ -38,13 +38,13 @@ func UpsertPackageProfile(ctx context.Context, conn *sql.DB, p packageprofile.Pr
 func DeletePackageProfile(ctx context.Context, conn *sql.DB, name string) error {
 	res, err := conn.ExecContext(ctx, `
 		DELETE FROM package_profiles
-		WHERE name = ? AND is_builtin = 0 AND disabled = 0`, name)
+		WHERE name = ? AND is_builtin = 0`, name)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("profile %q not found, disabled, or built-in", name)
+		return fmt.Errorf("profile %q not found or built-in", name)
 	}
 	return nil
 }
@@ -65,8 +65,24 @@ func DisablePackageProfile(ctx context.Context, conn *sql.DB, name string) error
 	return nil
 }
 
+func EnablePackageProfile(ctx context.Context, conn *sql.DB, name string) error {
+	nowMs := time.Now().UTC().UnixMilli()
+	res, err := conn.ExecContext(ctx, `
+		UPDATE package_profiles
+		SET disabled = 0, updated_at_ms = ?
+		WHERE name = ? AND disabled = 1`, nowMs, name)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("profile %q not found or already enabled", name)
+	}
+	return nil
+}
+
 // GetPackageProfile returns a single profile by name, or (nil, nil) if not found.
-func GetPackageProfile(ctx context.Context, conn *sql.DB, name string) (*packageprofile.Profile, error) {
+func GetPackageProfile(ctx context.Context, conn Execer, name string) (*packageprofile.Profile, error) {
 	row := conn.QueryRowContext(ctx, `
 		SELECT profile_json FROM package_profiles
 		WHERE name = ? AND disabled = 0`, name)

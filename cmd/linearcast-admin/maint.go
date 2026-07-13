@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -23,6 +25,8 @@ func runMaint(args []string) {
 		maintDeleteEncode(args[1:])
 	case "audit-duration":
 		maintAuditDuration(args[1:])
+	case "backfill-package-bytes":
+		maintBackfillPackageBytes(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown maint subcommand: %s\n\n", args[0])
 		maintUsage()
@@ -44,6 +48,147 @@ func maintUsage() {
 	fmt.Fprintln(os.Stderr, "    List ready packages whose packaged duration is short of the source (truncated encode),")
 	fmt.Fprintln(os.Stderr, "    using the same tolerance as the finalize guard. Read-only by default.")
 	fmt.Fprintln(os.Stderr, "    --fix marks each offender pending in place so the worker re-encodes it immediately.")
+	fmt.Fprintln(os.Stderr, "  backfill-package-bytes [--dry-run]")
+	fmt.Fprintln(os.Stderr, "    Fill media_packages.package_bytes for ready packages from DB-tracked init/segment paths.")
+}
+
+func maintBackfillPackageBytes(args []string) {
+	fs := flag.NewFlagSet("backfill-package-bytes", flag.ExitOnError)
+	dryRun := fs.Bool("dry-run", false, "print package byte totals without updating media_packages")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: linearcast-admin maint backfill-package-bytes [--dry-run]")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	if fs.NArg() != 0 {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	dbPath := os.Getenv("LINEARCAST_DB")
+	if dbPath == "" {
+		log.Fatal("LINEARCAST_DB is required")
+	}
+
+	conn, err := db.OpenReadWrite(dbPath)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+
+	ctx := context.Background()
+	rows, err := conn.QueryContext(ctx, `
+		SELECT id, COALESCE(init_segment_path, '')
+		FROM media_packages
+		WHERE status = ? AND package_bytes IS NULL
+		ORDER BY updated_at_ms DESC, id`, string(db.PackageStatusReady))
+	if err != nil {
+		log.Fatalf("query packages: %v", err)
+	}
+	defer rows.Close()
+
+	type target struct {
+		id       string
+		initPath string
+	}
+	var targets []target
+	for rows.Next() {
+		var t target
+		if err := rows.Scan(&t.id, &t.initPath); err != nil {
+			log.Fatalf("scan package: %v", err)
+		}
+		targets = append(targets, t)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("scan packages: %v", err)
+	}
+
+	var updated, skipped int
+	var totalBytes int64
+	nowMs := time.Now().UTC().UnixMilli()
+	for _, t := range targets {
+		bytes, err := packageBytesFromTrackedFiles(ctx, conn, t.id, t.initPath)
+		if err != nil {
+			skipped++
+			fmt.Fprintf(os.Stderr, "skip %s: %v\n", t.id, err)
+			continue
+		}
+		if !*dryRun {
+			if _, err := conn.ExecContext(ctx,
+				`UPDATE media_packages SET package_bytes = ?, updated_at_ms = ? WHERE id = ? AND package_bytes IS NULL`,
+				bytes, nowMs, t.id); err != nil {
+				log.Fatalf("update %s: %v", t.id, err)
+			}
+		}
+		updated++
+		totalBytes += bytes
+		fmt.Printf("%s\t%d\n", t.id, bytes)
+	}
+	if *dryRun {
+		fmt.Printf("\nwould backfill %d package(s), skipped %d, total %d bytes\n", updated, skipped, totalBytes)
+		return
+	}
+	fmt.Printf("\nbackfilled %d package(s), skipped %d, total %d bytes\n", updated, skipped, totalBytes)
+}
+
+func packageBytesFromTrackedFiles(ctx context.Context, conn *sql.DB, packageID, initPath string) (int64, error) {
+	var total int64
+	if initPath != "" {
+		n, err := fileSize(initPath)
+		if err != nil {
+			return 0, fmt.Errorf("stat init %q: %w", initPath, err)
+		}
+		total += n
+	}
+
+	rows, err := conn.QueryContext(ctx, `
+		SELECT COALESCE(path, ''), byte_range_length
+		FROM packaged_segments
+		WHERE package_id = ?
+		ORDER BY segment_number`, packageID)
+	if err != nil {
+		return 0, fmt.Errorf("query segments: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var path string
+		var byteRangeLength sql.NullInt64
+		if err := rows.Scan(&path, &byteRangeLength); err != nil {
+			return 0, fmt.Errorf("scan segment: %w", err)
+		}
+		if byteRangeLength.Valid && byteRangeLength.Int64 > 0 {
+			total += byteRangeLength.Int64
+			continue
+		}
+		if path == "" {
+			return 0, errors.New("segment path is empty")
+		}
+		n, err := fileSize(path)
+		if err != nil {
+			return 0, fmt.Errorf("stat segment %q: %w", path, err)
+		}
+		total += n
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("scan segments: %w", err)
+	}
+	if total <= 0 {
+		return 0, errors.New("tracked files total zero bytes")
+	}
+	return total, nil
+}
+
+func fileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.IsDir() {
+		return 0, fmt.Errorf("is a directory")
+	}
+	return info.Size(), nil
 }
 
 func maintAuditDuration(args []string) {

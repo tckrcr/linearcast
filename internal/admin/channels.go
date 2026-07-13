@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/packageprofile"
 	"github.com/tckrcr/linearcast/internal/scheduler"
 )
 
@@ -59,7 +60,10 @@ type channelPolicyUpdateRequest struct {
 	RequiredPackageProfile *string `json:"requiredPackageProfile"`
 	PackagePrefillMs       *int64  `json:"packagePrefillMs"`
 	MediaKind              *string `json:"mediaKind"`
-	Force                  bool    `json:"force"`
+}
+
+type channelOnDemandProfileUpdateRequest struct {
+	Profile string `json:"profile"`
 }
 
 type channelExtendRequest struct {
@@ -76,18 +80,18 @@ type channelCloneResponse struct {
 
 type createChannelRequest struct {
 	DisplayName    string   `json:"displayName"`
-	PlaybackMode   string   `json:"playbackMode,omitempty"` // "packaged" (default) or "plex_relay"
+	PlaybackMode   string   `json:"playbackMode,omitempty"` // "packaged" (default)
 	PackageProfile string   `json:"packageProfile"`
 	MediaIDs       []string `json:"mediaIds"`
 	Ordering       string   `json:"ordering,omitempty"`
 	ScheduleMode   string   `json:"scheduleMode,omitempty"`
 	SlotDurationMs *int64   `json:"slotDurationMs,omitempty"`
 	UpstreamHLSURL string   `json:"upstreamHlsUrl,omitempty"`
-	// PrefillMode is "eager" (default) or "on_demand". On-demand channels defer
-	// packaging until a viewer tunes in; the schedule still builds ahead.
+	// PrefillMode is "eager" (default) or "on_demand". On-demand defers durable
+	// package work; the schedule still builds ahead.
 	PrefillMode string `json:"prefillMode,omitempty"`
 	// AdaptiveBitrate selects a prepackaged video ladder at channel creation
-	// time: "" (off), "cpu" (libx264), or "nvenc" (h264_nvenc).
+	// time: "" (off), "cpu" (libx264), or "hdr" (HEVC HDR).
 	// It is intentionally not a mutable channel policy.
 	AdaptiveBitrate string `json:"adaptiveBitrate,omitempty"`
 	// Entries, when present, is an explicit wall-clock-ordered schedule the
@@ -110,11 +114,16 @@ type scheduleEntryInput struct {
 }
 
 type createChannelResponse struct {
-	ChannelID       string `json:"channelID"`
-	DisplayName     string `json:"displayName"`
-	Created         bool   `json:"created"`
-	SyncedMedia     int    `json:"syncedMedia"`
-	ScheduleEntries int    `json:"scheduleEntries"`
+	ChannelID       string                        `json:"channelID"`
+	DisplayName     string                        `json:"displayName"`
+	Created         bool                          `json:"created"`
+	SyncedMedia     int                           `json:"syncedMedia"`
+	ScheduleEntries int                           `json:"scheduleEntries"`
+	PackageProfile  string                        `json:"profile,omitempty"`
+	Queued          []string                      `json:"queued,omitempty"`
+	AlreadyPending  []string                      `json:"alreadyPending,omitempty"`
+	AlreadyReady    []string                      `json:"alreadyReady,omitempty"`
+	Failed          []mediaPackageFailureResponse `json:"failed,omitempty"`
 }
 
 type adminHTTPError struct {
@@ -130,13 +139,125 @@ func (a *App) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	resp, herr := a.createChannel(r.Context(), req)
+	resp, herr := a.createChannelWithPackageRequests(r.Context(), req)
 	if herr != nil {
 		writeError(w, herr.Status, herr.Code, herr.Message)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	writeJSONStatus(w, http.StatusCreated, resp)
+}
+
+func (a *App) createChannelWithPackageRequests(ctx context.Context, req createChannelRequest) (createChannelResponse, *adminHTTPError) {
+	channelResp, herr := a.createChannel(ctx, req)
+	if herr != nil {
+		return createChannelResponse{}, herr
+	}
+
+	// Live-encoded channels use ephemeral encodings for unpackaged playback, so
+	// creation must NOT eagerly queue the whole channel — that is the point.
+	packageResult := db.MediaPackageRequestResult{
+		Profile:        strings.TrimSpace(req.PackageProfile),
+		Queued:         []string{},
+		AlreadyPending: []string{},
+		AlreadyReady:   []string{},
+	}
+	mode := strings.TrimSpace(req.PrefillMode)
+	if mode != "on_demand" {
+		var err error
+		packageResult, err = db.RequestMediaPackages(ctx, a.dbConn, req.MediaIDs, strings.TrimSpace(req.PackageProfile))
+		if err != nil {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: err.Error()}
+		}
+	}
+
+	channelResp.PackageProfile = packageResult.Profile
+	channelResp.Queued = packageResult.Queued
+	channelResp.AlreadyPending = packageResult.AlreadyPending
+	channelResp.AlreadyReady = packageResult.AlreadyReady
+	channelResp.Failed = make([]mediaPackageFailureResponse, 0, len(packageResult.Failed))
+	for _, failure := range packageResult.Failed {
+		channelResp.Failed = append(channelResp.Failed, mediaPackageFailureResponse{
+			MediaID: failure.MediaID,
+			Code:    failure.Code,
+			Message: failure.Message,
+		})
+	}
+	return channelResp, nil
+}
+
+func (a *App) rejectCopyProfileForcedBitmapSubtitles(ctx context.Context, mediaIDs []string) *adminHTTPError {
+	mediaMap, err := db.MediaByIDs(ctx, a.dbConn, mediaIDs)
+	if err != nil {
+		return &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: err.Error()}
+	}
+	var offenders []string
+	seen := make(map[string]bool)
+	for _, id := range mediaIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		m, ok := mediaMap[id]
+		if !ok {
+			continue
+		}
+		warnings := a.copyProfileSubtitleWarnings(ctx, m.ID, m.Path)
+		if len(warnings) == 0 {
+			continue
+		}
+		label := strings.TrimSpace(m.Title)
+		if label == "" {
+			label = m.ID
+		}
+		offenders = append(offenders, label)
+	}
+	if len(offenders) == 0 {
+		return nil
+	}
+	if len(offenders) > 3 {
+		offenders = append(offenders[:3], fmt.Sprintf("and %d more", len(offenders)-3))
+	}
+	return &adminHTTPError{
+		Status:  http.StatusConflict,
+		Code:    "copy_profile_drops_forced_subtitles",
+		Message: fmt.Sprintf("You've selected a copy profile. %s contain forced PGS subtitles that cannot be burned with copy-mode video; choose a transcode profile to preserve forced dialogue.", strings.Join(offenders, ", ")),
+	}
+}
+
+func (a *App) rejectCopyProfileOverBrowserHLSBitrateCeiling(ctx context.Context, mediaIDs []string) *adminHTTPError {
+	mediaMap, err := db.MediaByIDs(ctx, a.dbConn, mediaIDs)
+	if err != nil {
+		return &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: err.Error()}
+	}
+	var offenders []string
+	seen := make(map[string]bool)
+	for _, id := range mediaIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		m, ok := mediaMap[id]
+		if !ok || m.VideoBitrateBps <= packageprofile.BrowserHLSCopyVideoBitrateCeilingBps {
+			continue
+		}
+		label := strings.TrimSpace(m.Title)
+		if label == "" {
+			label = m.ID
+		}
+		offenders = append(offenders, fmt.Sprintf("%s (%.1f Mbps)", label, float64(m.VideoBitrateBps)/1_000_000))
+	}
+	if len(offenders) == 0 {
+		return nil
+	}
+	if len(offenders) > 3 {
+		offenders = append(offenders[:3], fmt.Sprintf("and %d more", len(offenders)-3))
+	}
+	return &adminHTTPError{
+		Status:  http.StatusConflict,
+		Code:    "copy_profile_browser_hls_bitrate_ceiling",
+		Message: fmt.Sprintf("You've selected a copy profile. %s exceed the %.0f Mbps browser HLS source-video ceiling; choose a capped transcode profile for Linearcast playback.", strings.Join(offenders, ", "), float64(packageprofile.BrowserHLSCopyVideoBitrateCeilingBps)/1_000_000),
+	}
 }
 
 func (a *App) createChannel(ctx context.Context, req createChannelRequest) (createChannelResponse, *adminHTTPError) {
@@ -159,7 +280,7 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 	if req.ScheduleMode != "back_to_back" && req.ScheduleMode != "slot_grid" {
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_schedule_mode", Message: "scheduleMode must be back_to_back or slot_grid"}
 	}
-	if req.SlotDurationMs != nil && (*req.SlotDurationMs <= 0 || *req.SlotDurationMs%scheduler.TargetSegmentMs != 0) {
+	if req.SlotDurationMs != nil && (*req.SlotDurationMs <= 0 || *req.SlotDurationMs%db.ScheduleGridMs != 0) {
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_slot_duration", Message: "slotDurationMs must be a positive 6000ms-aligned value"}
 	}
 	if req.PrefillMode == "" {
@@ -205,79 +326,6 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 		return createChannelResponse{ChannelID: channelID, DisplayName: req.DisplayName, Created: true}, nil
 	}
 
-	if req.PlaybackMode == string(db.PlaybackModePlexRelay) {
-		if len(req.MediaIDs) == 0 {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "empty_media", Message: "at least one mediaId is required for schedule"}
-		}
-		nowMs := a.now().UTC().UnixMilli()
-		mediaMap, err := db.MediaByIDs(ctx, a.dbConn, req.MediaIDs)
-		if err != nil {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: err.Error()}
-		}
-		members := make([]db.ChannelMediaRow, 0, len(req.MediaIDs))
-		seen := make(map[string]bool)
-		for _, id := range req.MediaIDs {
-			m, ok := mediaMap[id]
-			if !ok || seen[m.ID] {
-				continue
-			}
-			if !strings.HasPrefix(strings.TrimSpace(m.SourceRef), "plex://") {
-				return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "non_plex_media", Message: "plex_relay channels can only use media imported from Plex"}
-			}
-			if !m.CodecCheckPassed {
-				continue
-			}
-			seen[m.ID] = true
-			members = append(members, db.ChannelMediaRow{
-				ChannelID: channelID,
-				MediaID:   m.ID,
-				AddedAtMs: nowMs,
-			})
-		}
-		if len(members) == 0 {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusUnprocessableEntity, Code: "no_eligible_media", Message: "none of the supplied mediaIds are eligible Plex media"}
-		}
-		if err := db.InsertChannel(ctx, a.dbConn, db.ChannelWrite{
-			ID:           channelID,
-			DisplayName:  req.DisplayName,
-			PlaybackMode: db.PlaybackModePlexRelay,
-			Ordering:     req.Ordering,
-			MediaKind:    db.MediaKindVideo,
-			ScheduleMode: req.ScheduleMode,
-		}); err != nil {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("create channel: %v", err)}
-		}
-		if err := db.WithTx(ctx, a.dbConn, func(tx db.Execer) error {
-			return db.ReplaceChannelMedia(ctx, tx, channelID, members)
-		}); err != nil {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("write channel_media: %v", err)}
-		}
-		scheduleEntries := 0
-		if len(req.Entries) > 0 {
-			explicitEntries, fillerAssetIDs, herr := a.validateExplicitSchedule(ctx, channelID, req, nowMs)
-			if herr != nil {
-				return createChannelResponse{}, herr
-			}
-			n, herr := a.writeExplicitSchedule(ctx, channelID, explicitEntries, fillerAssetIDs)
-			if herr != nil {
-				return createChannelResponse{}, herr
-			}
-			scheduleEntries = n
-		}
-		if len(req.Entries) == 0 {
-			if sched, err := scheduler.ExtendChannel(ctx, a.dbConn, channelID, scheduler.ServiceOptions{HorizonHours: 24}); err == nil {
-				scheduleEntries = sched.Inserted
-			}
-		}
-		return createChannelResponse{
-			ChannelID:       channelID,
-			DisplayName:     req.DisplayName,
-			Created:         true,
-			SyncedMedia:     len(members),
-			ScheduleEntries: scheduleEntries,
-		}, nil
-	}
-
 	if req.PackageProfile == "" {
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "missing_profile", Message: "packageProfile is required"}
 	}
@@ -293,24 +341,30 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 	if profileRecord == nil || profileRecord.Disabled {
 		return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_profile", Message: fmt.Sprintf("package profile %q is not available", req.PackageProfile)}
 	}
+	if profileRecord.Profile.Video.Mode == packageprofile.VideoModeCopy {
+		if herr := a.rejectCopyProfileOverBrowserHLSBitrateCeiling(ctx, req.MediaIDs); herr != nil {
+			return createChannelResponse{}, herr
+		}
+		if herr := a.rejectCopyProfileForcedBitmapSubtitles(ctx, req.MediaIDs); herr != nil {
+			return createChannelResponse{}, herr
+		}
+	}
 	mediaKind := db.NormalizeMediaKind(db.MediaKind(profileRecord.Profile.MediaKind))
 	var abrLadder []string
 	if req.AdaptiveBitrate != "" {
 		if mediaKind != db.MediaKindVideo {
 			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_media_kind", Message: "adaptive bitrate is only available for video channels"}
 		}
-		if req.PrefillMode == "on_demand" {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_prefill", Message: "adaptive bitrate is only available for pre-encoded channels"}
+		if req.PrefillMode != "eager" {
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_prefill", Message: "adaptive bitrate is only available for pre-encoded (eager) channels"}
 		}
 		switch req.AdaptiveBitrate {
 		case "cpu":
 			abrLadder = db.StandardVideoABRLadder
-		case "nvenc":
-			abrLadder = db.StandardVideoNVENCABRLadder
 		case "hdr":
 			abrLadder = db.StandardVideoHDRABRLadder
 		default:
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_mode", Message: "adaptiveBitrate must be \"cpu\", \"nvenc\", or \"hdr\""}
+			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_abr_mode", Message: "adaptiveBitrate must be \"cpu\" or \"hdr\""}
 		}
 		if req.PackageProfile != db.DefaultPackageProfile {
 			abrLadder = append([]string{req.PackageProfile}, abrLadder...)
@@ -390,7 +444,12 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 		scheduleEntries = n
 	} else {
 		// Best-effort schedule extension — no ready packages yet is fine.
-		if sched, err := scheduler.ExtendChannel(ctx, a.dbConn, channelID, scheduler.ServiceOptions{HorizonHours: 24}); err == nil {
+		// For slot-grid channels, allow one best-fit primary before the first
+		// slot boundary so tune-in is not dead air / filler-only.
+		if sched, err := scheduler.ExtendChannel(ctx, a.dbConn, channelID, scheduler.ServiceOptions{
+			HorizonHours:        24,
+			AllowLeadingPrimary: req.ScheduleMode == "slot_grid",
+		}); err == nil {
 			scheduleEntries = sched.Inserted
 		}
 	}
@@ -436,10 +495,10 @@ func (a *App) validateExplicitSchedule(ctx context.Context, channelID string, re
 	}
 
 	// schedule_entries.start_ms is wall-clock epoch ms. The client composes a
-	// 0-based layout, so rebase onto the current 6s grid; for slot-grid snap that
+	// 0-based layout, so rebase onto the current 6s grid. For slot-grid snap that
 	// base forward to the next real slot boundary so primaries land on :00/:30
 	// wall-clock, matching BuildEntriesSlotGrid.
-	base := scheduler.Align6s(nowMs)
+	base := scheduler.AlignToGrid(nowMs)
 	if slotMs > 0 {
 		base = scheduler.AlignToSlot(base, slotMs)
 	}
@@ -454,11 +513,11 @@ func (a *App) validateExplicitSchedule(ctx context.Context, channelID string, re
 		if _, ok := mediaMap[mediaID]; !ok {
 			return nil, nil, &adminHTTPError{Status: http.StatusUnprocessableEntity, Code: "invalid_entry", Message: fmt.Sprintf("entry %d references unknown media %q", i, mediaID)}
 		}
-		if in.DurationMs <= 0 || in.DurationMs%scheduler.TargetSegmentMs != 0 {
-			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_entry", Message: fmt.Sprintf("entry %d duration_ms=%d must be a positive %dms-aligned value", i, in.DurationMs, scheduler.TargetSegmentMs)}
+		if in.DurationMs <= 0 || in.DurationMs%db.ScheduleGridMs != 0 {
+			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_entry", Message: fmt.Sprintf("entry %d duration_ms=%d must be a positive %dms-aligned value", i, in.DurationMs, db.ScheduleGridMs)}
 		}
-		if in.OffsetMs < 0 || in.OffsetMs%scheduler.TargetSegmentMs != 0 {
-			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_entry", Message: fmt.Sprintf("entry %d offset_ms=%d must be a non-negative %dms-aligned value", i, in.OffsetMs, scheduler.TargetSegmentMs)}
+		if in.OffsetMs < 0 || in.OffsetMs%db.ScheduleGridMs != 0 {
+			return nil, nil, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_entry", Message: fmt.Sprintf("entry %d offset_ms=%d must be a non-negative %dms-aligned value", i, in.OffsetMs, db.ScheduleGridMs)}
 		}
 		// Slot-grid integrity: a primary entry must begin on a slot boundary. If
 		// it does not, a preceding gap was left unfilled.
@@ -556,7 +615,13 @@ func (a *App) handleChannelList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"channels": out})
 }
 
-func (a *App) setChannelEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+type channelPatchRequest struct {
+	Enabled         *bool `json:"enabled"`
+	HiddenFromGuide *bool `json:"hiddenFromGuide"`
+}
+
+func (a *App) handleChannelPatch(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 	channelID := r.PathValue("channelID")
 	existing, err := db.ChannelByID(r.Context(), a.dbConn, channelID)
 	if err != nil {
@@ -567,62 +632,47 @@ func (a *App) setChannelEnabled(w http.ResponseWriter, r *http.Request, enabled 
 		writeError(w, http.StatusNotFound, "not_found", "channel not found")
 		return
 	}
-	// This is intentionally the admin sidecar's narrow write path. It does not
-	// clear schedule rows; linearcast observes the enabled flag on its periodic
-	// channel refresh.
-	if _, err := db.SetChannelEnabled(r.Context(), a.dbConn, channelID, enabled); err != nil {
-		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+	var req channelPatchRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	note := "linearcast refreshes its channel list every ~60s; the in-memory runtime drops then. No restart required."
-	if enabled {
-		note = "linearcast refreshes its channel list every ~60s; the channel will start serving then. No restart required."
+	if req.Enabled == nil && req.HiddenFromGuide == nil {
+		writeError(w, http.StatusBadRequest, "empty_patch", "at least one of enabled or hiddenFromGuide is required")
+		return
 	}
-	writeJSON(w, map[string]any{
-		"channelID":  channelID,
-		"enabled":    enabled,
-		"wasEnabled": existing.Enabled,
-		"note":       note,
-	})
-}
-
-func (a *App) handleChannelEnable(w http.ResponseWriter, r *http.Request) {
-	a.setChannelEnabled(w, r, true)
-}
-
-func (a *App) handleChannelDisable(w http.ResponseWriter, r *http.Request) {
-	a.setChannelEnabled(w, r, false)
-}
-
-func (a *App) setChannelHiddenFromGuide(w http.ResponseWriter, r *http.Request, hidden bool) {
-	channelID := r.PathValue("channelID")
-	existing, err := db.ChannelByID(r.Context(), a.dbConn, channelID)
+	if req.Enabled != nil {
+		if _, err := db.SetChannelEnabled(r.Context(), a.dbConn, channelID, *req.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			return
+		}
+	}
+	if req.HiddenFromGuide != nil {
+		if _, err := db.SetChannelHiddenFromGuide(r.Context(), a.dbConn, channelID, *req.HiddenFromGuide); err != nil {
+			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			return
+		}
+	}
+	ch, err := db.ChannelByID(r.Context(), a.dbConn, channelID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
 	}
-	if existing == nil {
+	if ch == nil {
 		writeError(w, http.StatusNotFound, "not_found", "channel not found")
 		return
 	}
-	if _, err := db.SetChannelHiddenFromGuide(r.Context(), a.dbConn, channelID, hidden); err != nil {
-		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
-		return
-	}
-	writeJSON(w, map[string]any{
-		"channelID":          channelID,
-		"hiddenFromGuide":    hidden,
-		"wasHiddenFromGuide": existing.HiddenFromGuide,
-		"note":               "public guide/lineup listings update immediately; direct stream URLs keep working.",
+	writeJSON(w, channelListRow{
+		ID:              ch.ID,
+		DisplayName:     ch.DisplayName,
+		Enabled:         ch.Enabled,
+		Ordering:        ch.Ordering,
+		ScheduleMode:    ch.ScheduleMode,
+		SlotDurationMs:  ch.SlotDurationMs,
+		HiddenFromGuide: ch.HiddenFromGuide,
+		ArtworkURL:      ch.ArtworkURL,
+		MediaKind:       string(db.NormalizeMediaKind(ch.MediaKind)),
 	})
-}
-
-func (a *App) handleChannelHideFromGuide(w http.ResponseWriter, r *http.Request) {
-	a.setChannelHiddenFromGuide(w, r, true)
-}
-
-func (a *App) handleChannelShowInGuide(w http.ResponseWriter, r *http.Request) {
-	a.setChannelHiddenFromGuide(w, r, false)
 }
 
 func (a *App) handleChannelDelete(w http.ResponseWriter, r *http.Request) {
@@ -816,6 +866,10 @@ func (a *App) handleChannelPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, channelPolicyWire(*ch))
+}
+
+func channelPolicyWire(ch db.Channel) channelPolicyResponse {
 	profile := ch.RequiredPackageProfile
 	if profile == "" {
 		profile = db.DefaultPackageProfileForMediaKind(ch.MediaKind)
@@ -828,14 +882,101 @@ func (a *App) handleChannelPolicy(w http.ResponseWriter, r *http.Request) {
 		playbackMode = "packaged"
 	}
 
-	writeJSON(w, channelPolicyResponse{
+	return channelPolicyResponse{
 		ChannelID:              ch.ID,
 		PlaybackMode:           playbackMode,
 		RequiredPackageProfile: profile,
 		AdaptiveBitrate:        db.ABRLadderEnabled(profile, ch.ABRLadder),
 		PackagePrefillMs:       prefillMs,
 		MediaKind:              string(db.NormalizeMediaKind(ch.MediaKind)),
-	})
+	}
+}
+
+func (a *App) handleChannelOnDemandProfileUpdate(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	channelID := r.PathValue("channelID")
+
+	existing, err := db.ChannelByID(r.Context(), a.dbConn, channelID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	if existing == nil {
+		writeError(w, http.StatusNotFound, "not_found", "channel not found")
+		return
+	}
+	if existing.PlaybackMode != db.PlaybackModePackaged || existing.PrefillMode != "on_demand" || existing.UpstreamHLSURL != nil {
+		writeError(w, http.StatusConflict, "unsupported_channel_type", "package profile changes are only supported for on-demand packaged channels")
+		return
+	}
+
+	var req channelOnDemandProfileUpdateRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	profileName := strings.TrimSpace(req.Profile)
+	if profileName == "" {
+		writeError(w, http.StatusBadRequest, "missing_profile", "profile is required")
+		return
+	}
+	record, err := db.PackageProfileByName(r.Context(), a.dbConn, profileName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	if record == nil || record.Disabled {
+		writeError(w, http.StatusBadRequest, "invalid_profile", "profile is not available")
+		return
+	}
+	mediaKind := db.NormalizeMediaKind(existing.MediaKind)
+	if string(record.Profile.MediaKind) != string(mediaKind) {
+		writeError(w, http.StatusBadRequest, "profile_kind_mismatch",
+			fmt.Sprintf("profile %s is for %s media, but channel %s is %s", profileName, record.Profile.MediaKind, channelID, mediaKind))
+		return
+	}
+	if record.Profile.Video.Mode == packageprofile.VideoModeCopy {
+		mediaIDs, err := db.ChannelMediaOrdered(r.Context(), a.dbConn, channelID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			return
+		}
+		if herr := a.rejectCopyProfileOverBrowserHLSBitrateCeiling(r.Context(), mediaIDs); herr != nil {
+			writeError(w, herr.Status, herr.Code, herr.Message)
+			return
+		}
+		if herr := a.rejectCopyProfileForcedBitmapSubtitles(r.Context(), mediaIDs); herr != nil {
+			writeError(w, herr.Status, herr.Code, herr.Message)
+			return
+		}
+	}
+
+	currentProfile := strings.TrimSpace(existing.RequiredPackageProfile)
+	if currentProfile == "" {
+		currentProfile = db.DefaultPackageProfileForMediaKind(existing.MediaKind)
+	}
+	if profileName != currentProfile {
+		updated, err := db.UpdateOnDemandChannelPackageProfile(r.Context(), a.dbConn, channelID, profileName)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+			return
+		}
+		if !updated {
+			writeError(w, http.StatusConflict, "unsupported_channel_type", "package profile changes are only supported for on-demand packaged channels")
+			return
+		}
+	}
+
+	ch, err := db.ChannelByID(r.Context(), a.dbConn, channelID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	if ch == nil {
+		writeError(w, http.StatusNotFound, "not_found", "channel not found")
+		return
+	}
+	writeJSON(w, channelPolicyWire(*ch))
 }
 
 func (a *App) handleChannelPolicyUpdate(w http.ResponseWriter, r *http.Request) {
@@ -903,41 +1044,15 @@ func (a *App) handleChannelPolicyUpdate(w http.ResponseWriter, r *http.Request) 
 		prefillMs = req.PackagePrefillMs
 	}
 
-	// Guard: if switching profiles, check the next 48 h of schedule. A non-zero
-	// unready count means playback will break immediately after the switch.
-	// Force=true skips the guard for operators who know what they're doing.
 	currentProfile := existing.RequiredPackageProfile
 	if currentProfile == "" {
 		currentProfile = db.DefaultPackageProfileForMediaKind(existing.MediaKind)
 	}
 	newProfile := profile
-	kindChanged := db.NormalizeMediaKind(existing.MediaKind) != mediaKind
-	if !req.Force && !kindChanged && newProfile != currentProfile {
-		const horizonMs = 48 * 3600 * 1000
-		nowMs := a.now().UTC().UnixMilli()
-		unready, err := db.ScheduleUnreadyCount(r.Context(), a.dbConn, channelID, newProfile, nowMs, horizonMs)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
-			return
-		}
-		if unready > 0 {
-			readiness, _ := db.ChannelProfileReadiness(r.Context(), a.dbConn, channelID, newProfile)
-			w.Header().Set("Content-Type", "application/json")
-			writeJSONStatus(w, http.StatusConflict, map[string]any{
-				"code":    "profile_not_ready",
-				"message": fmt.Sprintf("%d schedule entries in the next 48h lack a ready package at %s — queue packaging first or pass force:true", unready, newProfile),
-				"readiness": map[string]any{
-					"profile":    readiness.Profile,
-					"total":      readiness.Total,
-					"ready":      readiness.Ready,
-					"pending":    readiness.Pending,
-					"processing": readiness.Processing,
-					"failed":     readiness.Failed,
-					"missing":    readiness.Missing,
-				},
-			})
-			return
-		}
+	profileChanged := newProfile != currentProfile
+	if profileChanged {
+		writeError(w, http.StatusConflict, "unsupported_policy_update", "use the on-demand profile endpoint to change an on-demand channel profile")
+		return
 	}
 
 	updated, err := db.UpdateChannelPlaybackPolicy(r.Context(), a.dbConn, channelID, db.PlaybackModePackaged, profile, existing.ABRLadder, prefillMs, mediaKind)

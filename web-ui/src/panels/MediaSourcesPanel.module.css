@@ -1,8 +1,19 @@
-/* 2-row media-server connection card (Plex, Jellyfin) */
+.source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* 2-row media-server connection card (Plex, Jellyfin, Local) */
 .media-server-section {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev-1);
 }
 
 .media-server-help-link {
@@ -63,20 +74,14 @@
 }
 
 .jellyfin-logo {
-  background: #00a4dc;
-  color: #fff;
+  background: #4b4b4b;
+  color: var(--text);
 }
 
-.plex-connected-pill {
-  display: inline-flex;
-  align-items: center;
-  min-height: 24px;
-  border-radius: 999px;
-  padding: 2px 10px;
-  background: #1f9d55;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 700;
+.local-logo {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
 }
 
 .plex-account {
@@ -93,51 +98,17 @@
 }
 
 
-.ingest-root-dirs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.ingest-dir-chip {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  align-items: flex-start;
-  max-width: 100%;
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 6px 8px;
+.local-kind-pill {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 1px 8px;
+  background: var(--bg-elev-2);
   border: 1px solid var(--border);
-  border-radius: 4px;
-  background: transparent;
   color: var(--text-muted);
-  cursor: pointer;
-  text-align: left;
-}
-
-.ingest-dir-chip:hover {
-  color: var(--text);
-  border-color: var(--text-muted);
-}
-
-.ingest-dir-chip-name {
-  color: var(--text);
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.ingest-dir-chip-path,
-.ingest-dir-chip-count {
-  overflow: hidden;
-  max-width: 260px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ingest-dir-chip-count {
-  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .ingest-path-row {
@@ -207,7 +178,10 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  min-width: 320px;
+  /* Fixed width so every media-source dialog (Plex, Jellyfin, Local) is the
+     same size; long helper text wraps instead of stretching the dialog. */
+  width: 360px;
+  max-width: 100%;
 }
 .dialog-form label {
   display: flex;
@@ -229,12 +203,28 @@
 .dialog-form select {
   font-family: var(--mono);
   font-size: 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+/* Normalize the native select so it matches the text inputs (same height,
+   custom caret) instead of the chunky OS control. */
+.dialog-form select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238a8a8a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
 }
 .dialog-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 4px;
+}
+/* Back sits on the left of the action row; Cancel/submit stay right. */
+.dialog-back {
+  margin-right: auto;
 }
 
 
@@ -267,6 +257,33 @@
   cursor: not-allowed;
 }
 
+.advanced-disclosure {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.advanced-summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  color: var(--text-muted);
+  user-select: none;
+}
+.advanced-summary::-webkit-details-marker {
+  display: none;
+}
+.advanced-summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 10px;
+}
+.advanced-disclosure[open] > .advanced-summary::before {
+  content: "▾";
+}
+.advanced-body {
+  margin-top: 10px;
+}
+
 .path-replacement-editor {
   display: flex;
   flex-direction: column;
@@ -285,16 +302,6 @@
 }
 .path-replacement-add {
   align-self: flex-start;
-}
-
-.filesystem-suggestions {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.filesystem-suggestions p {
-  margin: 0;
-  font-size: 12px;
 }
 
 .local-source-path-list {

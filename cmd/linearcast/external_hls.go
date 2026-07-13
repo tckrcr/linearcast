@@ -1,36 +1,32 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/liveproxy"
 )
 
+// External HLS is a thin adapter over the proxy engine, internal/liveproxy: it
+// builds a liveproxy.Proxy and calls Serve with a liveproxy.Request, so
+// cooldown/backoff, the failure map, the SSRF-guarded dialer, manifest body
+// limits, and response streaming are shared code.
+// tokens, the redirect, timeline/keepalive) — does not exist for external HLS,
+// which is a stateless GET-and-rewrite. What remains per adapter (upstream-URL
+// derivation, header injection, manifest-rewrite rules, failure-key shape) is
+// protocol-specific glue; folding it into one function would just reconstruct
+// liveproxy.Request behind if-branches. liveproxy is the shared seam.
 const (
 	externalHLSTimeout       = 5 * time.Second
 	externalHLSCooldown      = 5 * time.Second
 	externalHLSLogSampleEach = 60 * time.Second
 )
-
-type externalHLSProxyState struct {
-	mu       sync.Mutex
-	failures map[string]*externalHLSFailure
-}
-
-type externalHLSFailure struct {
-	nextAttempt    time.Time
-	lastLog        time.Time
-	lastError      string
-	suppressedLogs int
-}
 
 func (a *app) handleExternalHLSManifest(w http.ResponseWriter, r *http.Request) {
 	channelID := r.PathValue("channelID")
@@ -38,13 +34,13 @@ func (a *app) handleExternalHLSManifest(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	a.proxyExternalHLS(w, r, channelID, upstream, "application/vnd.apple.mpegurl")
+	a.proxyExternalHLS(w, r, channelID, upstream, "", "application/vnd.apple.mpegurl")
 }
 
-func (a *app) handleExternalHLSSegment(w http.ResponseWriter, r *http.Request) {
+func (a *app) handleExternalHLSProxy(w http.ResponseWriter, r *http.Request) {
 	channelID := r.PathValue("channelID")
-	name := r.PathValue("name")
-	if !validExternalHLSSegmentName(name) {
+	restPath := strings.TrimPrefix(r.PathValue("path"), "/")
+	if !liveproxy.SafeRelativePath(restPath) {
 		http.NotFound(w, r)
 		return
 	}
@@ -52,8 +48,16 @@ func (a *app) handleExternalHLSSegment(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	segmentURL := upstream.ResolveReference(&url.URL{Path: name})
-	a.proxyExternalHLS(w, r, channelID, segmentURL, "video/mp2t")
+	proxiedPath := restPath
+	if r.URL.RawQuery != "" {
+		proxiedPath += "?" + r.URL.RawQuery
+	}
+	proxiedURL, err := externalHLSUpstreamURL(upstream, proxiedPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	a.proxyExternalHLS(w, r, channelID, proxiedURL, restPath, "")
 }
 
 func (a *app) externalHLSURL(w http.ResponseWriter, r *http.Request, channelID string) (*url.URL, bool) {
@@ -74,52 +78,47 @@ func (a *app) externalHLSURL(w http.ResponseWriter, r *http.Request, channelID s
 	return u, true
 }
 
-func (a *app) proxyExternalHLS(w http.ResponseWriter, r *http.Request, channelID string, upstream *url.URL, contentType string) {
-	state := a.externalHLSState()
-	key := externalHLSFailureKey(channelID, upstream)
-	if retryAt, ok := state.coolingDown(key, time.Now()); ok {
-		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", time.Until(retryAt).Seconds()))
-		http.Error(w, "external hls upstream temporarily unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	client := a.httpClient
+func (a *app) proxyExternalHLS(w http.ResponseWriter, r *http.Request, channelID string, upstream *url.URL, sourcePath, contentType string) {
+	client := a.externalHLSClient
 	if client == nil {
-		client = http.DefaultClient
+		client = a.httpClient
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), externalHLSTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.String(), nil)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+	proxy := liveproxy.Proxy{
+		Client:        client,
+		Timeout:       externalHLSTimeout,
+		Cooldown:      externalHLSCooldown,
+		LogSampleEach: externalHLSLogSampleEach,
+		State:         a.externalHLSState(),
+		LogPrefix:     "external hls",
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		state.recordFailure(key, upstream.String(), err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 500 {
-		state.recordFailure(key, upstream.String(), fmt.Errorf("status %d", resp.StatusCode))
-	} else {
-		state.recordSuccess(key)
-	}
-
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		state.recordFailure(key, upstream.String(), err)
-	}
+	proxy.Serve(w, r, liveproxy.Request{
+		Key:          externalHLSFailureKey(channelID, upstream),
+		Upstream:     upstream.String(),
+		LogUpstream:  upstream.Scheme + "://" + upstream.Host,
+		LogFields:    "channel_id=" + channelID,
+		ContentType:  contentType,
+		CacheControl: "no-store",
+		Body: func(resp *http.Response) (io.Reader, error) {
+			if contentType != "application/vnd.apple.mpegurl" && !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "mpegurl") && !strings.HasSuffix(sourcePath, ".m3u8") {
+				return resp.Body, nil
+			}
+			body, err := liveproxy.ReadManifestBody(resp.Body)
+			if err != nil {
+				return nil, err
+			}
+			rewritten := liveproxy.RewriteManifest(body, sourcePath, func(raw, sourcePath string) (string, bool) {
+				return externalHLSProxyURI(upstream, raw, sourcePath)
+			})
+			return strings.NewReader(string(rewritten)), nil
+		},
+	})
 }
 
-func (a *app) externalHLSState() *externalHLSProxyState {
+func (a *app) externalHLSState() *liveproxy.State {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.externalHLS == nil {
-		a.externalHLS = &externalHLSProxyState{failures: map[string]*externalHLSFailure{}}
+		a.externalHLS = liveproxy.NewState()
 	}
 	return a.externalHLS
 }
@@ -128,57 +127,52 @@ func externalHLSFailureKey(channelID string, upstream *url.URL) string {
 	return channelID + "|" + upstream.Scheme + "://" + upstream.Host
 }
 
-func (s *externalHLSProxyState) coolingDown(key string, now time.Time) (time.Time, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	f := s.failures[key]
-	if f == nil || now.After(f.nextAttempt) {
-		return time.Time{}, false
+func externalHLSUpstreamURL(base *url.URL, proxiedPath string) (*url.URL, error) {
+	u, err := url.Parse(proxiedPath)
+	if err != nil || u.Scheme != "" || u.Host != "" || !liveproxy.SafeRelativePath(u.Path) {
+		return nil, fmt.Errorf("invalid external hls path")
 	}
-	return f.nextAttempt, true
+	return base.ResolveReference(u), nil
 }
 
-func (s *externalHLSProxyState) recordSuccess(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.failures, key)
-}
+func externalHLSProxyURI(base *url.URL, raw, sourcePath string) (string, bool) {
+	if rel, ok := liveproxy.RelativePath(raw, sourcePath); ok {
+		return externalProxyChildURI(sourcePath, rel), true
+	}
 
-func (s *externalHLSProxyState) recordFailure(key, upstream string, err error) {
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.failures == nil {
-		s.failures = map[string]*externalHLSFailure{}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Path == "" {
+		return "", false
 	}
-	f := s.failures[key]
-	if f == nil {
-		f = &externalHLSFailure{}
-		s.failures[key] = f
+	target := base.ResolveReference(u)
+	if target.Scheme != base.Scheme || target.Host != base.Host {
+		return "", false
 	}
-	f.nextAttempt = now.Add(externalHLSCooldown)
-	f.lastError = err.Error()
-	if f.lastLog.IsZero() || now.Sub(f.lastLog) >= externalHLSLogSampleEach {
-		if f.suppressedLogs > 0 {
-			log.Printf("external hls upstream failure upstream=%q err=%q next_retry=%s suppressed=%d",
-				upstream, f.lastError, f.nextAttempt.Format(time.RFC3339), f.suppressedLogs)
-		} else {
-			log.Printf("external hls upstream failure upstream=%q err=%q next_retry=%s",
-				upstream, f.lastError, f.nextAttempt.Format(time.RFC3339))
+	baseDir := strings.TrimPrefix(path.Dir(base.Path), "/")
+	targetPath := strings.TrimPrefix(target.Path, "/")
+	if baseDir != "." && baseDir != "" {
+		prefix := strings.TrimSuffix(baseDir, "/") + "/"
+		if !strings.HasPrefix(targetPath, prefix) {
+			return "", false
 		}
-		f.lastLog = now
-		f.suppressedLogs = 0
-		return
+		targetPath = strings.TrimPrefix(targetPath, prefix)
 	}
-	f.suppressedLogs++
+	if !liveproxy.SafeRelativePath(targetPath) {
+		return "", false
+	}
+	return externalProxyChildURI(sourcePath, liveproxy.AppendQuery(targetPath, target.RawQuery)), true
 }
 
-func validExternalHLSSegmentName(name string) bool {
-	if name == "" || name == "." || name == ".." {
-		return false
+// externalProxyChildURI converts rel — a resource path rooted at the channel's
+// /external/<id>/proxy/ mount — into a reference relative to the manifest being
+// rewritten, so any reverse-proxy mount prefix (e.g. /hls) on the manifest URL
+// is preserved. sourcePath is "" for the top manifest (served at
+// /external/<id>/stream.m3u8, i.e. one level above the proxy mount) and the
+// proxied path otherwise (served at /external/<id>/proxy/<sourcePath>).
+func externalProxyChildURI(sourcePath, rel string) string {
+	baseDir := ""
+	if sourcePath != "" {
+		baseDir = "proxy/" + path.Dir(strings.TrimPrefix(sourcePath, "/"))
 	}
-	if strings.ContainsAny(name, `/\`) {
-		return false
-	}
-	return strings.HasSuffix(name, ".ts")
+	return liveproxy.RelativeReference(baseDir, "proxy/"+rel)
 }

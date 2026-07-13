@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import type Hls from "hls.js";
-import type { ErrorData, Fragment, LevelLoadedData } from "hls.js";
+import type { ErrorData, Fragment, HlsConfig, LevelLoadedData } from "hls.js";
 import type { PlaybackStats } from "../types";
 
 const NETWORK_RETRY_INITIAL_MS = 5_000;
@@ -13,7 +13,7 @@ const fragRetry = {
   backoff: "exponential" as const,
 };
 
-// Playlist 503s are expected while an on-demand live session warms up (ffmpeg
+// Playlist 503s are expected while an on-demand live encoding warms up (ffmpeg
 // spawn to first segment can take ~15s after an idle teardown), so the retry
 // window has to outlast that: 0.5+1+2+4+4+4 ≈ 15.5s.
 const playlistRetry = {
@@ -26,7 +26,9 @@ const playlistRetry = {
 const HLS_CONFIG = {
   lowLatencyMode: false,
   enableWorker: true,
-  startFragPrefetch: false,
+  startFragPrefetch: true,
+  enableWebVTT: true,
+  renderTextTracksNatively: true,
   backBufferLength: 0,
   liveBackBufferLength: 0,
   // Buffer budget is sized for copy-source profiles: -c:v copy preserves the
@@ -43,7 +45,14 @@ const HLS_CONFIG = {
   maxBufferLength: 60,
   maxMaxBufferLength: 120,
   maxBufferSize: 96 * 1000 * 1000,
-  liveSyncDurationCount: 6,
+  // Live-sync distance must match the packaged manifest's lookahead, not sit at
+  // half of it. The manifest leads wall clock by manifestAheadMs (~12 target
+  // durations); parking 6 back left playback ~6 segments ahead of the schedule,
+  // so program boundaries fired early and the guide appeared to "switch late".
+  // Park ~1 segment in from the front — schedule-now — keeping the whole window
+  // as forward runway. That last segment is the HLS floor; shrink it via segment
+  // duration, not by trimming the window.
+  liveSyncDurationCount: 11,
   liveMaxLatencyDurationCount: 12,
   maxBufferHole: 1,
   nudgeOffset: 0.1,
@@ -72,7 +81,7 @@ const HLS_CONFIG = {
       errorRetry: playlistRetry,
     },
   },
-};
+} satisfies Partial<HlsConfig>;
 
 // Module-level promise cache — fires once on first call, then the browser
 // module cache makes every subsequent call free. Kicked off immediately on
@@ -211,7 +220,30 @@ export function useHlsPlayer({
             lastEvent: data.details.live ? "live level loaded" : "vod level loaded",
           }));
         });
+        // Debounce state for buffer-stalled errors. hls.js auto-recovers by
+        // nudging the playhead, so suppress UI noise on the first few
+        // occurrences. Escalate if they persist — genuine encoder failure.
+        let stallCount = 0;
+        let stallWindowStart = 0;
+        const STALL_WINDOW_MS = 30_000;
+        const STALL_THRESHOLD = 3;
+
         hls.on(Events.ERROR, (_event, data: ErrorData) => {
+          if (data.details === ErrorDetails.BUFFER_STALLED_ERROR) {
+            const now = Date.now();
+            if (now - stallWindowStart > STALL_WINDOW_MS) {
+              stallCount = 0;
+              stallWindowStart = now;
+            }
+            stallCount++;
+            console.warn(`[hls] buffer stalled (${stallCount}/${STALL_THRESHOLD})${"frag" in data && data.frag ? ` frag=${fragLabel(data.frag)}` : ""}${data.error ? ` ${data.error.message}` : ""}`);
+            if (stallCount < STALL_THRESHOLD) {
+              setStats((prev) => ({ ...prev, lastEvent: "buffer stalled" }));
+              return;
+            }
+            // Escalated — fall through to normal error reporting.
+          }
+
           const frag = "frag" in data && data.frag ? ` frag=${fragLabel(data.frag)}` : "";
           const reason = data.error ? ` ${data.error.message}` : "";
           const msg = `${data.type}: ${data.details}${frag}${reason}${data.fatal ? " fatal" : ""}`;
@@ -225,12 +257,25 @@ export function useHlsPlayer({
             hls.startLoad(video.currentTime);
             return;
           }
+          if (isUnsupportedCodecError(data)) {
+            // The device/browser can't decode the stream's codec (e.g. an
+            // HEVC-only channel on a machine without HEVC support). This is
+            // terminal — recoverMediaError() loops forever — so stop and show a
+            // real error instead of leaving a black player.
+            setStats((prev) => ({
+              ...prev,
+              lastEvent: "unsupported codec",
+              fatalError: unsupportedCodecMessage(data),
+            }));
+            hls.stopLoad();
+            return;
+          }
           if (isMissingMediaArtifact(data)) {
             // Non-fatal means the frag load policy is still retrying the URL;
             // let it run before declaring the stream unavailable.
             if (!data.fatal) return;
-            // A 404 here is usually transient: on-demand session segments
-            // vanish when the server recycles a session (the replacement has
+            // A 404 here is usually transient: on-demand encoding segments
+            // vanish when the server recycles a encoding (the replacement has
             // new URLs the next playlist refresh picks up), and missing
             // packaged artifacts are auto-requeued for re-encode server-side.
             // Either way the right move is to back off and reload, not stop.
@@ -275,7 +320,7 @@ export function useHlsPlayer({
       hlsRef.current?.destroy();
       hlsRef.current = null;
     };
-  }, [source, enabled, autoPlay, muted, videoRef, hlsRef, initialStats, setStats]);
+  }, [source, enabled, autoPlay, videoRef, hlsRef, initialStats, setStats]);
 
   useEffect(() => {
     const hls = hlsRef.current;
@@ -292,10 +337,39 @@ export function useHlsPlayer({
 function streamUnavailableReason(data: ErrorData): string {
   if (!isMissingMediaArtifact(data)) return "";
   const url = "frag" in data ? data.frag?.url ?? "" : "";
-  if (url.includes("/session/")) {
-    return "Live packaging session restarted; reconnecting automatically.";
+  if (url.includes("/encoding/")) {
+    return "Live packaging encoding restarted; reconnecting automatically.";
   }
   return "Packaged segments are missing; the server queues a rebuild on 404 and playback will retry automatically.";
+}
+
+// hls.js error details raised when no variant's codec can be decoded by this
+// device — manifest-time (no compatible level) and SourceBuffer-time (codec
+// rejected on append). These are not retryable; the user needs a different
+// device or a channel with a supported rendition.
+const UNSUPPORTED_CODEC_DETAILS = new Set([
+  "manifestIncompatibleCodecsError",
+  "bufferIncompatibleCodecsError",
+  "bufferAddCodecError",
+]);
+
+function isUnsupportedCodecError(data: ErrorData): boolean {
+  return UNSUPPORTED_CODEC_DETAILS.has(data.details);
+}
+
+function unsupportedCodecMessage(data: ErrorData): string {
+  const codec = unsupportedCodecLabel(data.error?.message ?? "");
+  const what = codec ? `video format (${codec})` : "video format";
+  return `This device can’t play this channel — its ${what} isn’t supported by this browser.`;
+}
+
+// Best-effort friendly codec name pulled from hls.js's message, which lists the
+// offending CODECS string (e.g. "hvc1.1.6.L153.B0,mp4a.40.2"). "" when unknown.
+function unsupportedCodecLabel(message: string): string {
+  if (/hvc1|hev1|hevc/i.test(message)) return "HEVC";
+  if (/av01/i.test(message)) return "AV1";
+  if (/vp0?9/i.test(message)) return "VP9";
+  return "";
 }
 
 function isMissingMediaArtifact(data: ErrorData): boolean {

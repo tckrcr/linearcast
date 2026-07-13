@@ -1,4 +1,4 @@
-// Package clock implements the startup skew check from CONTRACT.md §1.
+// Package clock implements the startup clock-skew check.
 package clock
 
 import (

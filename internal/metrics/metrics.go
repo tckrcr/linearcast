@@ -31,6 +31,10 @@ var (
 		Name: "linearcast_package_unknown_duration",
 		Help: "Ready packages whose packaged/source duration is unknown, so the truncation audit could not run, as of the last integrity sweep.",
 	})
+	PackageCacheBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "linearcast_package_cache_bytes",
+		Help: "On-disk size of the package cache root (CACHE_DIR/packages), sampled periodically by the playback process. Reclamation is manual (admin orphan/unreferenced cleanup); this gauge exists to alert on cache growth.",
+	})
 	PackagedArtifactNotFoundTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "linearcast_packaged_artifact_not_found_total",
 		Help: "Packaged artifact 404 responses by bounded artifact type.",
@@ -92,34 +96,34 @@ var (
 		Help: "1 if now falls inside a schedule gap for the channel, 0 otherwise.",
 	}, []string{"channel_id"})
 
-	OnDemandSessionSpawnsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "linearcast_on_demand_session_spawns_total",
-		Help: "Total on-demand live session spawns (first segment delivered).",
+	OnDemandEncodingSpawnsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_encoding_spawns_total",
+		Help: "Total on-demand live encoding spawns (first segment delivered).",
 	})
-	OnDemandSessionRestartsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "linearcast_on_demand_session_restarts_total",
-		Help: "Total on-demand session entry restarts after failure.",
+	OnDemandEncodingRestartsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_encoding_restarts_total",
+		Help: "Total on-demand encoding entry restarts after failure.",
 	})
-	OnDemandSessionEvictionsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "linearcast_on_demand_session_evictions_total",
-		Help: "Total on-demand sessions evicted to make room for other channels.",
+	OnDemandEncodingEvictionsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "linearcast_on_demand_encoding_evictions_total",
+		Help: "Total on-demand encodings evicted to make room for other channels.",
 	})
 	OnDemandWarming503Total = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "linearcast_on_demand_warming_503_total",
-		Help: "On-demand session warming (no segments yet) 503 responses.",
+		Help: "On-demand encoding warming (no segments yet) 503 responses.",
 	})
 	OnDemandAtCapacity503Total = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "linearcast_on_demand_at_capacity_503_total",
-		Help: "On-demand session at-capacity 503 responses.",
+		Help: "On-demand encoding at-capacity 503 responses.",
 	})
-	OnDemandSessionSpawnLatency = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "linearcast_on_demand_session_spawn_latency_seconds",
+	OnDemandEncodingSpawnLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "linearcast_on_demand_encoding_spawn_latency_seconds",
 		Help:    "Seconds from ffmpeg start to first segment available.",
 		Buckets: []float64{0.5, 1, 2, 3, 5, 8, 12, 20, 30, 60},
 	})
-	OnDemandSessions = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "linearcast_on_demand_sessions",
-		Help: "Current on-demand live sessions by state (starting/serving/failed).",
+	OnDemandEncodings = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "linearcast_on_demand_encodings",
+		Help: "Current on-demand live encodings by state (starting/serving/failed).",
 	}, []string{"state"})
 )
 

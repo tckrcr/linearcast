@@ -22,7 +22,7 @@ func TestAdminJellyfinStatusDisconnectedIncludesURL(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var body jellyfinStatusResponse
+	var body mediaServerStatusResponse
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestAdminJellyfinConfigSetSuccessDoesNotReturnAPIKey(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "good") {
 		t.Fatalf("response leaked api key: %s", rec.Body.String())
 	}
-	var body jellyfinStatusResponse
+	var body mediaServerStatusResponse
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}

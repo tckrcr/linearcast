@@ -21,7 +21,7 @@ func TestAdminPlexStatusDisconnected(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var body plexStatusResponse
+	var body mediaServerStatusResponse
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestAdminPlexConfigSetSuccessDoesNotReturnToken(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "good") {
 		t.Fatalf("response leaked token: %s", rec.Body.String())
 	}
-	var body plexStatusResponse
+	var body mediaServerStatusResponse
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -145,13 +145,16 @@ func TestAdminPlexConfigClearPreservesLogout(t *testing.T) {
 	}
 }
 
-func TestAdminPlexStatusConnectionErrorIsFriendly(t *testing.T) {
+// Status reports configured state from stored config without a live probe, so
+// it returns 200 (connected) even when the Plex server is unreachable and never
+// blocks on a network round-trip. Reachability is checked at connect/scan time.
+func TestAdminPlexStatusDoesNotProbe(t *testing.T) {
 	app, conn := testAdminApp(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	if err := db.SetPlexURL(context.Background(), conn, srv.URL); err != nil {
 		t.Fatalf("set url: %v", err)
 	}
-	srv.Close()
+	srv.Close() // unreachable: a live probe would fail here
 	if err := db.SetPlexToken(context.Background(), conn, "secret-token"); err != nil {
 		t.Fatalf("set token: %v", err)
 	}
@@ -160,14 +163,78 @@ func TestAdminPlexStatusConnectionErrorIsFriendly(t *testing.T) {
 
 	app.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
+	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body mediaServerStatusResponse
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.Connected {
+		t.Fatalf("connected=%v, want true (token configured)", body.Connected)
 	}
 	if strings.Contains(rec.Body.String(), "secret-token") || strings.Contains(rec.Body.String(), "X-Plex-Token") {
 		t.Fatalf("response leaked token: %s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Could not connect to Plex") {
-		t.Fatalf("response did not include friendly connectivity error: %s", rec.Body.String())
+}
+
+func TestPlexPinFlowReturnsDiscoveredServers(t *testing.T) {
+	app, _ := testAdminApp(t)
+	var fake *httptest.Server
+	fake = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v2/pins":
+			if r.Method != http.MethodPost {
+				t.Fatalf("pin method=%s", r.Method)
+			}
+			_, _ = w.Write([]byte(`{"id":123,"code":"ABCD"}`))
+		case "/api/v2/pins/123":
+			_, _ = w.Write([]byte(`{"authToken":"account-token"}`))
+		case "/api/v2/resources":
+			if got := r.URL.Query().Get("X-Plex-Token"); got != "account-token" {
+				t.Fatalf("resources token=%q", got)
+			}
+			_, _ = w.Write([]byte(`[{"name":"Home Plex","provides":"server","accessToken":"server-token","connections":[{"uri":"` + fake.URL + `","local":true}]}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	oldBase := plexTVBaseURL
+	plexTVBaseURL = fake.URL
+	t.Cleanup(func() { plexTVBaseURL = oldBase })
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/plex/pin", nil)
+	app.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("start status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var start plexPinStartResponse
+	if err := json.NewDecoder(rec.Body).Decode(&start); err != nil {
+		t.Fatalf("decode start: %v", err)
+	}
+	if start.ID != 123 || start.Code != "ABCD" || start.AuthURL == "" {
+		t.Fatalf("start=%+v", start)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/admin/plex/pin/123?code=ABCD", nil)
+	app.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("poll status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var poll plexPinPollResponse
+	if err := json.NewDecoder(rec.Body).Decode(&poll); err != nil {
+		t.Fatalf("decode poll: %v", err)
+	}
+	if !poll.Authorized || len(poll.Servers) != 1 {
+		t.Fatalf("poll=%+v", poll)
+	}
+	server := poll.Servers[0]
+	if server.URL != fake.URL || server.Token != "server-token" || !server.Local {
+		t.Fatalf("server=%+v", server)
 	}
 }
 

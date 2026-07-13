@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -53,29 +52,26 @@ func IngestMusic(ctx context.Context, conn *sql.DB, musicDir string, logger Logg
 	if logger == nil {
 		logger = nopLogger{}
 	}
-	files, err := walkMusicFiles(musicDir)
+	var paths []string
+	err := walkMusicFiles(musicDir, func(p string) error {
+		paths = append(paths, p)
+		return nil
+	})
 	if err != nil {
 		return Result{}, fmt.Errorf("walk: %w", err)
 	}
-	if len(files) == 0 {
+	if len(paths) == 0 {
 		return Result{}, fmt.Errorf("no music files under %s", musicDir)
 	}
-
-	var res Result
-	res.Total = len(files)
-	pr, _ := logger.(ProgressReporter)
-	for _, p := range files {
-		ingestMusicOne(ctx, conn, p, logger, &res)
-		if pr != nil {
-			pr.OnProgress()
-		}
-	}
-	return res, nil
+	res := ScanPool(ctx, paths, logger, func(p string, r *Result) {
+		r.Total++
+		ingestMusicOne(ctx, conn, p, logger, r)
+	})
+	return res, ctx.Err()
 }
 
-func walkMusicFiles(dir string) ([]string, error) {
-	var paths []string
-	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+func walkMusicFiles(dir string, fn func(string) error) error {
+	return filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -83,15 +79,10 @@ func walkMusicFiles(dir string) ([]string, error) {
 			return nil
 		}
 		if musicExts[strings.ToLower(filepath.Ext(p))] {
-			paths = append(paths, p)
+			return fn(p)
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(paths)
-	return paths, nil
 }
 
 func CountMusicFiles(dir string) (int, error) {
@@ -120,13 +111,7 @@ type musicTags struct {
 	Date        string
 }
 
-type musicProbeResult struct {
-	FormatName    string
-	DurationMs    int64
-	AudioCodec    string
-	Tags          musicTags
-	HasCueSidecar bool
-}
+// MusicProbeResult is defined in probe.go
 
 type musicFFProbeOutput struct {
 	Format struct {
@@ -140,7 +125,7 @@ type musicFFProbeOutput struct {
 	} `json:"streams"`
 }
 
-func ffprobeMusicFile(ctx context.Context, path string) (musicProbeResult, error) {
+func ffprobeMusicFile(ctx context.Context, path string) (MusicProbeResult, error) {
 	cmd, err := ffmpegexec.CommandContext(ctx, "ffprobe",
 		"-v", "error",
 		"-print_format", "json",
@@ -149,19 +134,19 @@ func ffprobeMusicFile(ctx context.Context, path string) (musicProbeResult, error
 		path,
 	)
 	if err != nil {
-		return musicProbeResult{}, fmt.Errorf("ffprobe: %w", err)
+		return MusicProbeResult{}, fmt.Errorf("ffprobe: %w", err)
 	}
 	out, err := cmd.Output()
 	if err != nil {
-		return musicProbeResult{}, fmt.Errorf("ffprobe: %w", err)
+		return MusicProbeResult{}, fmt.Errorf("ffprobe: %w", err)
 	}
 	var raw musicFFProbeOutput
 	if err := json.Unmarshal(out, &raw); err != nil {
-		return musicProbeResult{}, fmt.Errorf("parse ffprobe: %w", err)
+		return MusicProbeResult{}, fmt.Errorf("parse ffprobe: %w", err)
 	}
 	durSecs, err := strconv.ParseFloat(strings.TrimSpace(raw.Format.Duration), 64)
 	if err != nil || durSecs <= 0 {
-		return musicProbeResult{}, fmt.Errorf("invalid duration %q", raw.Format.Duration)
+		return MusicProbeResult{}, fmt.Errorf("invalid duration %q", raw.Format.Duration)
 	}
 
 	var audioCodec string
@@ -172,13 +157,13 @@ func ffprobeMusicFile(ctx context.Context, path string) (musicProbeResult, error
 		}
 	}
 	if audioCodec == "" {
-		return musicProbeResult{}, fmt.Errorf("no audio stream")
+		return MusicProbeResult{}, fmt.Errorf("no audio stream")
 	}
 
 	stem := strings.TrimSuffix(path, filepath.Ext(path))
 	_, cueErr := os.Stat(stem + ".cue")
 
-	return musicProbeResult{
+	return MusicProbeResult{
 		FormatName:    containerFromFormat(raw.Format.FormatName, path),
 		DurationMs:    int64(durSecs * 1000),
 		AudioCodec:    audioCodec,
@@ -214,7 +199,7 @@ func parseMusicTags(raw map[string]string) musicTags {
 	}
 }
 
-func isSingleFileAlbum(mp musicProbeResult) bool {
+func isSingleFileAlbum(mp MusicProbeResult) bool {
 	return mp.HasCueSidecar || mp.DurationMs >= fullAlbumMinDurationMs
 }
 
@@ -222,7 +207,7 @@ func isSingleFileAlbum(mp musicProbeResult) bool {
 //
 // For full-album single-file rips: "[Full Album] <Album Name>"
 // For normal tracks: "<NN>. <Track Title>" from tags, or cleaned filename stem.
-func DeriveMusicTitle(path string, mp musicProbeResult) string {
+func DeriveMusicTitle(path string, mp MusicProbeResult) string {
 	if isSingleFileAlbum(mp) {
 		album := mp.Tags.Album
 		if album == "" {
@@ -259,7 +244,7 @@ func DeriveMusicTitle(path string, mp musicProbeResult) string {
 // The [2009 Stereo Remaster] / [2009 Mono Remaster] suffixes in directory names
 // are preserved, so stereo and mono remasters of the same album land in separate
 // scheduling groups.
-func DeriveMusicSchedulingGroup(path string, mp musicProbeResult) string {
+func DeriveMusicSchedulingGroup(path string, mp MusicProbeResult) string {
 	artist := firstNonEmpty(mp.Tags.AlbumArtist, mp.Tags.Artist)
 	album := mp.Tags.Album
 	full := isSingleFileAlbum(mp)
@@ -302,13 +287,13 @@ func splitArtistAlbum(dir, filePath string) (artist, album string) {
 		right := strings.TrimSpace(dir[idx+3:])
 
 		if pureYearRe.MatchString(left) {
-			// "1977 - The Eagles - Hotel California" — the left is just a year.
+			// "1977 - Example Artist - Example Album" — the left is just a year.
 			// Try splitting the right portion again.
 			if idx2 := strings.Index(right, " - "); idx2 > 0 {
 				left = strings.TrimSpace(right[:idx2])
 				right = strings.TrimSpace(right[idx2+3:])
 			} else {
-				// "2016 - The Life Of Pablo" — no second split available.
+				// "2016 - Example Album" — no second split available.
 				left = ""
 			}
 		}
@@ -325,7 +310,7 @@ func splitArtistAlbum(dir, filePath string) (artist, album string) {
 		return "", album
 	}
 
-	// Case: "2008 Viva La Vida..." — leading year, album follows.
+	// Case: "2008 Example Album" — leading year, album follows.
 	stripped := strings.TrimSpace(yearPrefixRe.ReplaceAllString(dir, ""))
 	if stripped != dir && stripped != "" {
 		album = cleanAlbumName(stripped)
@@ -401,8 +386,8 @@ func trackNum(s string) int {
 // musicMediaIDFor derives a stable, unique ID for a music file.
 //
 // Unlike the video mediaIDFor (filename stem only), music libraries contain
-// many files with identical names across album directories — "01 - So Far Away.flac"
-// appears in both the stereo and SACD editions of Brothers in Arms, and generic
+// many files with identical names across album directories — "01 - Opening Track.flac"
+// can appear in both the stereo and SACD editions of one album, and generic
 // names like "CD Track 01" appear across many albums.
 // Including the parent directory name and the full filename (with extension)
 // makes IDs unique across editions and across FLAC/MP3 duplicates of the same track.
@@ -433,8 +418,7 @@ func ingestMusicOne(ctx context.Context, conn *sql.DB, p string, logger Logger, 
 	mp, err := ffprobeMusicFile(ctx, p)
 	if err != nil {
 		logger.Printf("probe failed path=%q err=%v", p, err)
-		res.Failed++
-		res.Failures = append(res.Failures, fmt.Sprintf("%s: probe error: %v", filepath.Base(p), err))
+		res.recordFailure(fmt.Sprintf("probe error: %v", err))
 		return
 	}
 
@@ -456,14 +440,13 @@ func ingestMusicOne(ctx context.Context, conn *sql.DB, p string, logger Logger, 
 
 	if err := upsertMedia(conn, row); err != nil {
 		logger.Printf("upsert failed path=%q err=%v", p, err)
-		res.Failed++
-		res.Failures = append(res.Failures, fmt.Sprintf("%s: db error: %v", filepath.Base(p), err))
+		res.recordFailure(fmt.Sprintf("db error: %v", err))
 		return
 	}
 
 	if group != "" {
-		if err := setSchedulingGroupIfNull(conn, row.ID, group); err != nil {
-			logger.Printf("set scheduling_group path=%q err=%v", p, err)
+		if err := setCollectionIfNull(conn, row.ID, group, "album"); err != nil {
+			logger.Printf("set collection path=%q err=%v", p, err)
 		}
 	}
 

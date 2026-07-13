@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/packager"
 	"github.com/tckrcr/linearcast/internal/sysinfo"
 )
@@ -22,6 +23,7 @@ import (
 
 type localConfig struct {
 	dbPath     string
+	cache      layout.Cache
 	outputRoot string
 	workDir    string
 }
@@ -30,20 +32,15 @@ func loadLocalConfig(getenv func(string) string) (localConfig, error) {
 	cfg := localConfig{
 		dbPath: strings.TrimSpace(getenv("LINEARCAST_DB")),
 	}
-	cfg.outputRoot = strings.TrimSpace(getenv("LINEARCAST_PACKAGE_ROOT"))
-	if cfg.outputRoot == "" {
-		if cacheRoot := strings.TrimSpace(getenv("CACHE_DIR")); cacheRoot != "" {
-			cfg.outputRoot = cacheRoot + "/packages"
-		}
+	cacheRoot := strings.TrimSpace(getenv("CACHE_DIR"))
+	if cacheRoot == "" {
+		return cfg, fmt.Errorf("CACHE_DIR is required in local mode")
 	}
-	if cfg.outputRoot == "" {
-		return cfg, fmt.Errorf("LINEARCAST_PACKAGE_ROOT or CACHE_DIR is required in local mode")
-	}
+	cfg.cache = layout.NewCache(cacheRoot)
+	cfg.outputRoot = cfg.cache.PackagesDir()
 	cfg.workDir = strings.TrimSpace(getenv("LINEARCAST_WORK_DIR"))
 	if cfg.workDir == "" {
-		if cacheRoot := strings.TrimSpace(getenv("CACHE_DIR")); cacheRoot != "" {
-			cfg.workDir = cacheRoot + "/encoder-work"
-		}
+		cfg.workDir = cacheRoot + "/encoder-work"
 	}
 	return cfg, nil
 }

@@ -332,6 +332,7 @@ func (s *scheduleService) UpsertEntry(ctx context.Context, channelID string, req
 	if ch == nil {
 		return upsertEntryResult{}, errChannelNotFound
 	}
+	nowMs := s.now().UTC().UnixMilli()
 
 	entries, err := db.ScheduleWindow(ctx, s.db, channelID, req.StartMs, req.StartMs+1)
 	if err != nil {
@@ -359,7 +360,7 @@ func (s *scheduleService) UpsertEntry(ctx context.Context, channelID string, req
 	if pkg == nil || pkg.PackagedDurationMs == nil {
 		return upsertEntryResult{}, errPackageNotReady
 	}
-	durationMs := scheduler.ClipTo6s(*pkg.PackagedDurationMs)
+	durationMs := scheduler.ClipToGrid(*pkg.PackagedDurationMs)
 	if durationMs <= 0 {
 		return upsertEntryResult{}, errPackageNotReady
 	}
@@ -385,7 +386,7 @@ func (s *scheduleService) UpsertEntry(ctx context.Context, channelID string, req
 			MediaID:     req.MediaID,
 			OffsetMs:    0,
 			DurationMs:  durationMs,
-			CreatedAtMs: s.now().UTC().UnixMilli(),
+			CreatedAtMs: nowMs,
 		}
 		if prevEntry != nil {
 			entry.AnchorScheduleEntryID = &prevEntry.ID
@@ -422,7 +423,8 @@ func (s *scheduleService) FillGap(ctx context.Context, channelID string, req sch
 	if ch == nil {
 		return fillGapResult{}, errChannelNotFound
 	}
-	if req.StartMs%segmentMs != 0 || req.OffsetMs%segmentMs != 0 {
+	nowMs := s.now().UTC().UnixMilli()
+	if req.StartMs%db.ScheduleGridMs != 0 || req.OffsetMs%db.ScheduleGridMs != 0 {
 		return fillGapResult{}, errNoScheduleGap
 	}
 	if req.OffsetMs < 0 {
@@ -474,7 +476,7 @@ func (s *scheduleService) FillGap(ctx context.Context, channelID string, req sch
 	}
 
 	durationMs := nextEntry.StartMs - req.StartMs
-	if durationMs <= 0 || durationMs%segmentMs != 0 {
+	if durationMs <= 0 || durationMs%db.ScheduleGridMs != 0 {
 		return fillGapResult{}, errNoScheduleGap
 	}
 	if prevEntry != nil && req.StartMs < prevEntry.StartMs+prevEntry.DurationMs {
@@ -489,7 +491,7 @@ func (s *scheduleService) FillGap(ctx context.Context, channelID string, req sch
 	if pkg == nil || pkg.PackagedDurationMs == nil {
 		return fillGapResult{}, errPackageNotReady
 	}
-	packagedDurationMs := scheduler.ClipTo6s(*pkg.PackagedDurationMs)
+	packagedDurationMs := scheduler.ClipToGrid(*pkg.PackagedDurationMs)
 	offsetMs, err := s.resolveFillerOffset(ctx, channelID, req, durationMs, packagedDurationMs)
 	if err != nil {
 		return fillGapResult{}, err
@@ -506,7 +508,7 @@ func (s *scheduleService) FillGap(ctx context.Context, channelID string, req sch
 		MediaID:     req.MediaID,
 		OffsetMs:    offsetMs,
 		DurationMs:  durationMs,
-		CreatedAtMs: s.now().UTC().UnixMilli(),
+		CreatedAtMs: nowMs,
 		Kind:        "filler",
 	}
 	if prevEntry != nil {
@@ -584,6 +586,7 @@ func (s *scheduleService) saveWindowByMediaIDs(ctx context.Context, channelID st
 	if ch == nil {
 		return saveWindowResult{}, errChannelNotFound
 	}
+	nowMs := s.now().UTC().UnixMilli()
 
 	if entries, err := db.ScheduleWindow(ctx, s.db, channelID, fromMs, fromMs+1); err != nil {
 		return saveWindowResult{}, err
@@ -624,14 +627,13 @@ func (s *scheduleService) saveWindowByMediaIDs(ctx context.Context, channelID st
 		if pkg == nil || pkg.PackagedDurationMs == nil {
 			return saveWindowResult{}, errPackageNotReady
 		}
-		durationMs := scheduler.ClipTo6s(*pkg.PackagedDurationMs)
+		durationMs := scheduler.ClipToGrid(*pkg.PackagedDurationMs)
 		if durationMs <= 0 {
 			return saveWindowResult{}, errPackageNotReady
 		}
 		readyByMedia[mediaID] = readyScheduleMedia{mediaID: mediaID, durationMs: durationMs}
 	}
 
-	nowMs := s.now().UTC().UnixMilli()
 	prevEntry, err := db.LastScheduleEntryBefore(ctx, s.db, channelID, fromMs)
 	if err != nil {
 		return saveWindowResult{}, err
@@ -780,7 +782,7 @@ func (s *scheduleService) RecomposeSlotGridFuture(ctx context.Context, channelID
 	if err != nil {
 		return recomposeResult{}, err
 	}
-	fromMs := scheduler.Align6s(nowMs)
+	fromMs := scheduler.AlignToGrid(nowMs)
 	if prev != nil {
 		fromMs = prev.StartMs + prev.DurationMs
 	}
@@ -852,7 +854,7 @@ func (s *scheduleService) insertEntryRelative(ctx context.Context, channelID, ta
 	if pkg == nil || pkg.PackagedDurationMs == nil {
 		return insertRelativeResult{}, errPackageNotReady
 	}
-	durationMs := scheduler.ClipTo6s(*pkg.PackagedDurationMs)
+	durationMs := scheduler.ClipToGrid(*pkg.PackagedDurationMs)
 	if durationMs <= 0 {
 		return insertRelativeResult{}, errPackageNotReady
 	}

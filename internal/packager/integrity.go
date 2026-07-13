@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
 )
 
 // IntegrityResult tallies what a ready-package sweep requeued, split by failure
@@ -203,7 +204,7 @@ func readyPackageManifestSegments(pkg db.MediaPackage) (string, []HLSSegment, er
 		return "", nil, fmt.Errorf("missing package_root")
 	}
 	root := *pkg.PackageRoot
-	playlist := filepath.Join(root, "stream.m3u8")
+	playlist := layout.PlaylistPath(root)
 	if err := requireRegularFile(playlist); err != nil {
 		return "", nil, fmt.Errorf("manifest %s: %w", playlist, err)
 	}

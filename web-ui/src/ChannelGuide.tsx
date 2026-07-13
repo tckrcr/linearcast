@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
-import { useGuide } from "./api";
+import { getPublicServerURL, useGuide } from "./api";
 import { formatDateTime, formatMs } from "./format";
 import type { GuideChannel, GuideEntry } from "./types";
 
@@ -44,6 +44,21 @@ export function ChannelGuide({ activeChannelID, onSelect }: Props) {
     const now = Date.now();
     return now - (now % HOUR_MS);
   });
+  const [publicServerURL, setPublicServerURL] = useState("");
+  const [copiedURL, setCopiedURL] = useState<"m3u" | "xmltv" | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getPublicServerURL()
+      .then((resp) => {
+        if (!cancelled) setPublicServerURL(resp.publicServerUrl ?? "");
+      })
+      .catch(() => {
+        if (!cancelled) setPublicServerURL("");
+      });
+    return () => { cancelled = true; };
+  }, []);
+
   const windowEndMs = windowStartMs + windowHours * HOUR_MS;
 
   const { data, error, loading } = useGuide(windowStartMs, windowHours, REFRESH_MS);
@@ -64,6 +79,16 @@ export function ChannelGuide({ activeChannelID, onSelect }: Props) {
   function jumpToNow() {
     const now = Date.now();
     setWindowStartMs(now - (now % HOUR_MS));
+  }
+  async function copyURL(kind: "m3u" | "xmltv") {
+    const url = iptvURL(publicServerURL, kind);
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      window.prompt("Copy URL", url);
+    }
+    setCopiedURL(kind);
+    window.setTimeout(() => setCopiedURL(null), 1600);
   }
 
   function msToPct(ms: number) {
@@ -109,6 +134,17 @@ export function ChannelGuide({ activeChannelID, onSelect }: Props) {
         <span className="muted schedule-window-label">
           {formatDateTime(windowStartMs)} – {formatDateTime(windowEndMs)}
         </span>
+        <details className="guide-url-menu">
+          <summary>IPTV URLs</summary>
+          <div className="guide-url-dropdown" role="menu">
+            <button type="button" role="menuitem" onClick={() => void copyURL("m3u")}>
+              {copiedURL === "m3u" ? "Copied M3U" : "Copy M3U URL"}
+            </button>
+            <button type="button" role="menuitem" onClick={() => void copyURL("xmltv")}>
+              {copiedURL === "xmltv" ? "Copied XMLTV" : "Copy XMLTV URL"}
+            </button>
+          </div>
+        </details>
       </div>
 
       {channels.length === 0 ? (
@@ -184,6 +220,12 @@ export function ChannelGuide({ activeChannelID, onSelect }: Props) {
   );
 }
 
+function iptvURL(publicServerURL: string, kind: "m3u" | "xmltv") {
+  const fallback = typeof window !== "undefined" ? window.location.origin : "";
+  const base = (publicServerURL.trim() || fallback).replace(/\/+$/, "");
+  return `${base}/api/${kind}`;
+}
+
 function renderChannelBlocks(
   channel: GuideChannel,
   windowStartMs: number,
@@ -193,14 +235,17 @@ function renderChannelBlocks(
   onSelect: (id: string) => void,
 ) {
   if (channel.isExternal) {
+    const down = channel.status === "down";
     const np = channel.nowPlaying;
-    const label = np?.title
-      ? np.artist ? `${np.title} — ${np.artist}` : np.title
-      : "live";
+    const label = down
+      ? "offline"
+      : np?.title
+        ? np.artist ? `${np.title} — ${np.artist}` : np.title
+        : "live";
     return (
       <button
         type="button"
-        className="schedule-timeline-entry is-live"
+        className={`schedule-timeline-entry ${down ? "is-down" : "is-live"}`}
         style={{ left: "0%", width: "100%" }}
         onClick={() => onSelect(channel.id)}
         title={label}
@@ -232,14 +277,20 @@ function renderChannelBlocks(
       const leftPct = msToPct(cursor);
       const widthPct = msToPct(startMs) - leftPct;
       const isNow = cursor <= nowMs && nowMs < startMs;
+      const isLeadingSlotGap =
+        i === 0 &&
+        channel.scheduleMode === "slot_grid" &&
+        channel.slotDurationMs != null &&
+        startMs % channel.slotDurationMs === 0;
+      const label = isLeadingSlotGap ? "tune-in" : "gap";
       out.push(
         <div
           key={`gap-${cursor}-${i}`}
           className={`schedule-timeline-gap${isNow ? " is-now" : ""}`}
           style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
-          title={`gap at ${formatDateTime(cursor)} · ${formatMs(startMs - cursor)}`}
+          title={`${label} at ${formatDateTime(cursor)} · ${formatMs(startMs - cursor)}`}
         >
-          <span className="schedule-timeline-gap-label">gap</span>
+          <span className="schedule-timeline-gap-label">{label}</span>
         </div>,
       );
     }

@@ -4,12 +4,14 @@ package packager
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,13 +20,19 @@ import (
 
 	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/ffmpegexec"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/lcingest"
-	"github.com/tckrcr/linearcast/internal/packageid"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
-	"github.com/tckrcr/linearcast/internal/scheduler"
+	"github.com/tckrcr/linearcast/internal/subtitlepolicy"
 )
 
-const DefaultProfile = packageprofile.DefaultName
+const (
+	DefaultProfile = packageprofile.DefaultName
+	// PackagedSegmentMs is the durable package segment/GOP target. Live
+	// on-demand encodes pass scheduler.TargetSegmentMs explicitly for faster
+	// startup; offline packages favor encoder efficiency and smaller playlists.
+	PackagedSegmentMs int64 = 6000
+)
 
 type Options struct {
 	MediaPath  string
@@ -43,6 +51,10 @@ type Options struct {
 	NowMs           int64
 	FailKind        string
 	MaxAttempts     int
+	// ProgressFunc, when non-nil, is called with a 0–99 percentage as ffmpeg
+	// advances through the source. The caller drives this from a heartbeat
+	// goroutine so progress reaches the DB/SSE stream without blocking the encode.
+	ProgressFunc func(int)
 }
 
 type FinalizeOptions struct {
@@ -69,18 +81,26 @@ type Result struct {
 }
 
 type probeStream struct {
-	Index        int    `json:"index"`
-	CodecType    string `json:"codec_type"`
-	CodecName    string `json:"codec_name"`
-	Profile      string `json:"profile"`
-	Width        int64  `json:"width"`
-	Height       int64  `json:"height"`
-	AvgFrameRate string `json:"avg_frame_rate"`
-	TimeBase     string `json:"time_base"`
-	Disposition  struct {
-		Default     int `json:"default"`
-		Forced      int `json:"forced"`
-		AttachedPic int `json:"attached_pic"`
+	Index          int    `json:"index"`
+	CodecType      string `json:"codec_type"`
+	CodecName      string `json:"codec_name"`
+	CodecTagString string `json:"codec_tag_string"`
+	Profile        string `json:"profile"`
+	Width          int64  `json:"width"`
+	Height         int64  `json:"height"`
+	// ColorTransfer / ColorPrimaries are ffprobe's color_transfer /
+	// color_primaries fields, used to detect HDR (PQ/HLG) sources so the
+	// transcode path can preserve HDR instead of flattening it to SDR.
+	ColorTransfer  string          `json:"color_transfer"`
+	ColorPrimaries string          `json:"color_primaries"`
+	SideDataList   []probeSideData `json:"side_data_list"`
+	AvgFrameRate   string          `json:"avg_frame_rate"`
+	TimeBase       string          `json:"time_base"`
+	Disposition    struct {
+		Default         int `json:"default"`
+		Forced          int `json:"forced"`
+		AttachedPic     int `json:"attached_pic"`
+		HearingImpaired int `json:"hearing_impaired"`
 	} `json:"disposition"`
 	Tags struct {
 		Language    string `json:"language"`
@@ -116,7 +136,7 @@ func PackageOne(ctx context.Context, conn *sql.DB, opts Options) (Result, error)
 		opts.Profile = DefaultProfile
 	}
 	if opts.TargetSegmentMs <= 0 {
-		opts.TargetSegmentMs = scheduler.TargetSegmentMs
+		opts.TargetSegmentMs = PackagedSegmentMs
 	}
 	if opts.Preset == "" {
 		opts.Preset = "veryfast"
@@ -156,9 +176,9 @@ func PackageOne(ctx context.Context, conn *sql.DB, opts Options) (Result, error)
 
 	packageID := opts.PackageID
 	if packageID == "" {
-		packageID = packageid.For(media.ID, opts.Profile)
+		packageID = layout.ID(media.ID, opts.Profile)
 	}
-	packageRoot := filepath.Join(opts.OutputRoot, media.ID, opts.Profile)
+	packageRoot := layout.PackageRoot(opts.OutputRoot, media.ID, opts.Profile)
 	// encodeTarget is where ffmpeg writes. With WorkDir set it is a scratch dir
 	// that gets renamed to packageRoot on success; otherwise it is packageRoot.
 	encodeTarget := packageRoot
@@ -176,7 +196,7 @@ func PackageOne(ctx context.Context, conn *sql.DB, opts Options) (Result, error)
 		UpdatedAtMs:      opts.NowMs,
 	}
 	pr := packageRoot
-	ip := filepath.Join(packageRoot, "init.mp4")
+	ip := layout.InitPath(packageRoot)
 	pkg.PackageRoot = &pr
 	pkg.InitSegmentPath = &ip
 	if err := db.MarkPackageProcessing(ctx, conn, pkg); err != nil {
@@ -231,13 +251,21 @@ func PackageOne(ctx context.Context, conn *sql.DB, opts Options) (Result, error)
 		if err := validateSourceForProfile(probe, *profile); err != nil {
 			return err
 		}
-		return runFFmpeg(jobCtx, mediaPath, encodeTarget, opts.TargetSegmentMs, opts.Preset, probe, *profile)
+		return runFFmpeg(jobCtx, mediaPath, encodeTarget, opts.TargetSegmentMs, opts.Preset, probe, *profile, opts.ProgressFunc)
 	}()
 	if encodeErr != nil {
 		if encodeTarget != packageRoot {
 			os.RemoveAll(encodeTarget)
 		}
-		recordFailureIfStillProcessing(ctx, conn, pkg, opts.NowMs, encodeErr, opts.FailKind, opts.MaxAttempts)
+		// Unsupported-source errors (e.g. Dolby Vision Profile 5) are terminal:
+		// retrying re-probes the same file and fails identically, so don't burn
+		// attempts. The existing codec-failed gating then excludes it from
+		// scheduling.
+		failKind := opts.FailKind
+		if errors.Is(encodeErr, ErrUnsupportedDolbyVision) {
+			failKind = "terminal"
+		}
+		recordFailureIfStillProcessing(ctx, conn, pkg, opts.NowMs, encodeErr, failKind, opts.MaxAttempts)
 		return Result{}, encodeErr
 	}
 
@@ -298,7 +326,7 @@ func PackageOne(ctx context.Context, conn *sql.DB, opts Options) (Result, error)
 // files into packageRoot. It does not touch the DB.
 func EncodePackageOutput(ctx context.Context, mediaPath, packageRoot string, targetSegmentMs int64, preset string, profile packageprofile.Profile) error {
 	if targetSegmentMs <= 0 {
-		targetSegmentMs = scheduler.TargetSegmentMs
+		targetSegmentMs = PackagedSegmentMs
 	}
 	if preset == "" {
 		preset = "veryfast"
@@ -319,7 +347,7 @@ func EncodePackageOutput(ctx context.Context, mediaPath, packageRoot string, tar
 	if err := os.MkdirAll(packageRoot, 0o755); err != nil {
 		return fmt.Errorf("create package root: %w", err)
 	}
-	return runFFmpeg(ctx, mediaPath, packageRoot, targetSegmentMs, preset, probe, profile)
+	return runFFmpeg(ctx, mediaPath, packageRoot, targetSegmentMs, preset, probe, profile, nil)
 }
 
 const (
@@ -367,8 +395,9 @@ func durationShortfallTolerance(sourceMs int64) int64 {
 // FinalizePackage validates encoded HLS output — including a guard that the
 // packaged duration covers the source duration, so a truncated or killed encode
 // is rejected rather than silently finalized as ready — writes
-// packaged_segments, extracts best-effort subtitle sidecars from the source
-// media, and returns the metadata needed to mark the media package ready.
+// packaged_segments, extracts best-effort package-owned subtitle sidecars from
+// the source media, and returns the metadata needed to mark the media package
+// ready.
 func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (Result, db.FinalizedPackage, error) {
 	if opts.Profile == "" {
 		opts.Profile = DefaultProfile
@@ -380,13 +409,13 @@ func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (R
 		return Result{}, db.FinalizedPackage{}, errors.New("media id is required")
 	}
 	if opts.PackageID == "" {
-		opts.PackageID = packageid.For(opts.MediaID, opts.Profile)
+		opts.PackageID = layout.ID(opts.MediaID, opts.Profile)
 	}
 	if opts.NowMs == 0 {
 		opts.NowMs = time.Now().UTC().UnixMilli()
 	}
-	packageRoot := filepath.Join(opts.OutputRoot, opts.MediaID, opts.Profile)
-	playlist := filepath.Join(packageRoot, "stream.m3u8")
+	packageRoot := layout.PackageRoot(opts.OutputRoot, opts.MediaID, opts.Profile)
+	playlist := layout.PlaylistPath(packageRoot)
 	segments, err := ParseHLSManifest(playlist)
 	if err != nil {
 		return Result{}, db.FinalizedPackage{}, err
@@ -401,8 +430,12 @@ func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (R
 
 	var rows []db.PackagedSegment
 	var curMs int64
+	var packageBytes int64
 	for i, seg := range segments {
 		segPath := filepath.Join(packageRoot, filepath.FromSlash(seg.URI))
+		if info, statErr := os.Stat(segPath); statErr == nil {
+			packageBytes += info.Size()
+		}
 		rows = append(rows, db.PackagedSegment{
 			PackageID:     opts.PackageID,
 			SegmentNumber: int64(i),
@@ -411,6 +444,12 @@ func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (R
 			Path:          &segPath,
 		})
 		curMs += seg.DurationMs
+	}
+	// The init segment carries the moov/codec config and is part of the package's
+	// footprint. Best-effort: a stat failure just under-counts rather than failing
+	// the finalize (size is informational, never a finalize gate).
+	if info, statErr := os.Stat(layout.InitPath(packageRoot)); statErr == nil {
+		packageBytes += info.Size()
 	}
 	if shortfall, truncated := PackagedDurationShortfall(curMs, opts.SourceDurationMs); truncated {
 		return Result{}, db.FinalizedPackage{}, fmt.Errorf(
@@ -422,15 +461,15 @@ func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (R
 	}
 
 	if opts.MediaPath != "" {
-		if probe, err := probeSource(ctx, opts.MediaPath); err == nil {
-			prefs, _ := db.GetSubtitleLanguagePreference(ctx, conn)
-			extractSubtitleTracks(ctx, conn, opts.MediaPath, opts.OutputRoot, opts.MediaID, probe, prefs)
+		ExtractSubtitles(ctx, conn, opts.MediaPath, packageRoot, opts.PackageID)
+		if n, err := packageSubtitleBytes(layout.PackageSubtitleDir(packageRoot)); err == nil {
+			packageBytes += n
 		}
 	}
 
 	finalized := db.FinalizedPackage{
 		PackageRoot:        nullString(packageRoot),
-		InitSegmentPath:    nullString(filepath.Join(packageRoot, "init.mp4")),
+		InitSegmentPath:    nullString(layout.InitPath(packageRoot)),
 		SegmentBasePath:    nullString(packageRoot),
 		Container:          nullString("fmp4"),
 		VideoCodec:         nullString(meta.VideoCodec),
@@ -440,13 +479,14 @@ func FinalizePackage(ctx context.Context, conn *sql.DB, opts FinalizeOptions) (R
 		AudioCodec:         nullString(meta.AudioCodec),
 		Timescale:          nullInt64(meta.Timescale),
 		PackagedDurationMs: &curMs,
+		PackageBytes:       nullInt64(packageBytes),
 	}
 	return Result{
 		PackageID:        opts.PackageID,
 		MediaID:          opts.MediaID,
 		RenditionProfile: opts.Profile,
 		PackageRoot:      packageRoot,
-		InitSegmentPath:  filepath.Join(packageRoot, "init.mp4"),
+		InitSegmentPath:  layout.InitPath(packageRoot),
 		SegmentCount:     len(rows),
 		DurationMs:       curMs,
 	}, finalized, nil
@@ -477,26 +517,7 @@ func applyFinalizedPackage(pkg *db.MediaPackage, finalized db.FinalizedPackage) 
 	}
 	pkg.Timescale = finalized.Timescale
 	pkg.PackagedDurationMs = finalized.PackagedDurationMs
-}
-
-// BackfillSubtitleTracks probes mediaPath for subtitle streams and extracts
-// them to VTT sidecars without re-encoding video. Safe to call on any media
-// that already has a ready package. prefs is the ordered preference list
-// (ISO 639-2 codes); pass nil to read from the DB.
-func BackfillSubtitleTracks(ctx context.Context, conn *sql.DB, mediaID, mediaPath, outputRoot string, prefs []string) error {
-	if prefs == nil {
-		var err error
-		prefs, err = db.GetSubtitleLanguagePreference(ctx, conn)
-		if err != nil {
-			return fmt.Errorf("read subtitle preferences: %w", err)
-		}
-	}
-	probe, err := probeSource(ctx, mediaPath)
-	if err != nil {
-		return fmt.Errorf("ffprobe %s: %w", mediaPath, err)
-	}
-	extractSubtitleTracks(ctx, conn, mediaPath, outputRoot, mediaID, probe, prefs)
-	return nil
+	pkg.PackageBytes = finalized.PackageBytes
 }
 
 func recordFailure(ctx context.Context, conn *sql.DB, pkg db.MediaPackage, nowMs int64, cause error, kind string, maxAttempts int) {
@@ -580,13 +601,52 @@ func validateSourceForProfile(probe sourceProbe, profile packageprofile.Profile)
 		return fmt.Errorf("source has no audio stream for profile %s", profile.Name)
 	}
 	s := *selected.Video
+	if isDolbyVisionProfile5Stream(s) {
+		return fmt.Errorf("%w: source codec tag %q", ErrUnsupportedDolbyVision, s.CodecTagString)
+	}
 	if profile.Video.CodecRequired != "" && strings.ToLower(s.CodecName) != profile.Video.CodecRequired {
 		return fmt.Errorf("source video codec %q is not valid for profile %s; requires %s", s.CodecName, profile.Name, profile.Video.CodecRequired)
 	}
 	return nil
 }
 
-func runFFmpeg(ctx context.Context, input, packageRoot string, targetSegmentMs int64, preset string, probe sourceProbe, profile packageprofile.Profile) error {
+func resolveSubtitleDecision(profile packageprofile.Profile, probe sourceProbe) subtitlepolicy.Decision {
+	return subtitlepolicy.Resolve(subtitlepolicy.Request{
+		Mode:     subtitlepolicy.Mode(profile.Subtitles.Mode),
+		Language: profile.Subtitles.Language,
+	}, profile, subtitleTracksFromProbe(probe))
+}
+
+func subtitleTracksFromProbe(probe sourceProbe) []db.PackageTrack {
+	tracks := make([]db.PackageTrack, 0)
+	for _, s := range probe.Streams {
+		if s.CodecType != "subtitle" {
+			continue
+		}
+		lang := strings.ToLower(strings.TrimSpace(s.Tags.Language))
+		if lang == "" {
+			lang = "und"
+		}
+		source := db.TrackSourceEmbedded
+		if isBitmapSubtitle(s.CodecName) {
+			source = db.TrackSourceEmbeddedBitmap
+		}
+		tracks = append(tracks, db.PackageTrack{
+			Kind:            "subtitle",
+			StreamIndex:     s.Index,
+			Language:        lang,
+			Title:           s.Tags.Title,
+			Codec:           strings.ToLower(s.CodecName),
+			Source:          source,
+			DefaultFlag:     s.Disposition.Default == 1,
+			Forced:          s.Disposition.Forced == 1,
+			HearingImpaired: s.Disposition.HearingImpaired == 1,
+		})
+	}
+	return tracks
+}
+
+func runFFmpeg(ctx context.Context, input, packageRoot string, targetSegmentMs int64, preset string, probe sourceProbe, profile packageprofile.Profile, progressFn func(int)) error {
 	// cmd.Dir = packageRoot below, so resolve both paths against the caller's
 	// cwd before ffmpeg's cwd changes underneath it. Otherwise relative
 	// packageRoot args (init.mp4 / seg*.m4s / stream.m3u8) get re-resolved
@@ -599,32 +659,93 @@ func runFFmpeg(ctx context.Context, input, packageRoot string, targetSegmentMs i
 	if err != nil {
 		return fmt.Errorf("resolve package root: %w", err)
 	}
-	args, err := ffmpegArgs(absInput, absPackageRoot, targetSegmentMs, preset, probe, profile, nil, -1)
+	// MKV exposes HDR10 mastering/CLL only as frame side data, not in
+	// -show_streams, so backfill it from the first frame before building args so
+	// an HDR-preserving encode can carry it. Best-effort; skipped for SDR.
+	enrichHDRSideData(ctx, &probe, absInput)
+	subtitleDecision := resolveSubtitleDecision(profile, probe)
+	if profile.Subtitles.Mode != "" {
+		log.Printf("INFO package subtitle decision profile=%s action=%s reason=%s stream_index=%d language=%s",
+			profile.Name, subtitleDecision.Action, subtitleDecision.Reason, subtitleDecision.StreamIndex, subtitleDecision.Language)
+	}
+	args, err := ffmpegArgs(absInput, absPackageRoot, targetSegmentMs, preset, probe, profile, nil, subtitleDecision, nil)
 	if err != nil {
 		return err
+	}
+	if progressFn != nil {
+		// -progress pipe:1 writes key=value progress lines to stdout each time
+		// ffmpeg completes a frame batch; stderr continues to carry errors.
+		args = append([]string{"-progress", "pipe:1"}, args...)
 	}
 	cmd, err := ffmpegexec.CommandContext(ctx, "ffmpeg", args...)
 	if err != nil {
 		return err
 	}
 	cmd.Dir = absPackageRoot
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ffmpeg: %w: %s", err, strings.TrimSpace(string(out)))
+
+	if progressFn == nil {
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("ffmpeg: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("ffmpeg stdout pipe: %w", err)
+	}
+	totalUs := probeDurationUs(probe)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("ffmpeg start: %w", err)
+	}
+	sc := bufio.NewScanner(stdout)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "out_time_us=") {
+			continue
+		}
+		us, err := strconv.ParseInt(strings.TrimPrefix(line, "out_time_us="), 10, 64)
+		if err != nil || totalUs <= 0 || us < 0 {
+			continue
+		}
+		pct := int(us * 100 / totalUs)
+		if pct > 99 {
+			pct = 99
+		}
+		progressFn(pct)
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("ffmpeg: %w: %s", err, strings.TrimSpace(errBuf.String()))
 	}
 	return nil
 }
 
+// probeDurationUs returns the source duration in microseconds from the probe
+// format block. Returns 0 when the duration is absent or unparseable.
+func probeDurationUs(probe sourceProbe) int64 {
+	f, err := strconv.ParseFloat(strings.TrimSpace(probe.Format.Duration), 64)
+	if err != nil || f <= 0 {
+		return 0
+	}
+	return int64(f * 1_000_000)
+}
+
 // ffmpegArgs builds the package-encode command line. inputArgs, when non-nil,
 // is spliced in directly before -i (input options such as -ss seeking or
-// -readrate pacing for live sessions); package encodes pass nil.
-func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string, probe sourceProbe, profile packageprofile.Profile, inputArgs []string, burnSubtitleStreamIndex int) ([]string, error) {
-	segmentPattern := filepath.Join(packageRoot, "seg%06d.m4s")
+// -readrate pacing for live encodings); package encodes pass nil. Subtitle
+// stream indexes are optional HLS side outputs for live encodings.
+func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string, probe sourceProbe, profile packageprofile.Profile, inputArgs []string, burn subtitlepolicy.Decision, subtitleStreamIndexes []int) ([]string, error) {
+	segmentPattern := filepath.Join(packageRoot, layout.SegmentPattern)
 	targetSeconds := formatSeconds(targetSegmentMs)
 	selected := selectSourceStreams(probe)
 	if selected.Video == nil {
+		slog.Warn("ffmpeg args: source has no usable video stream", "profile", profile.Name, "input", input)
 		return nil, fmt.Errorf("source has no video stream for profile %s", profile.Name)
 	}
 	if selected.Audio == nil {
+		slog.Warn("ffmpeg args: source has no usable audio stream", "profile", profile.Name, "input", input)
 		return nil, fmt.Errorf("source has no audio stream for profile %s", profile.Name)
 	}
 	gopFrames := gopFramesForStream(*selected.Video, targetSegmentMs)
@@ -633,12 +754,13 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 		"-hide_banner", "-loglevel", "error", "-nostdin", "-y",
 	}
 	if profile.Video.Mode == packageprofile.VideoModeCopy {
-		args = append(args, "-fflags", "+genpts")
+		args = append(args, "-fflags", "+genpts", "-copytb", "1")
 	}
 	args = append(args, inputArgs...)
 	args = append(args, "-i", input)
-	if burnSubtitleStreamIndex >= 0 {
-		args = append(args, "-filter_complex", subtitleBurnFilter(selected.Video.Index, burnSubtitleStreamIndex, profile), "-map", "[v]")
+	burning := burn.Action == subtitlepolicy.ActionBurn
+	if burning {
+		args = append(args, "-filter_complex", burnFilter(input, selected.Video, burn, probe, profile), "-map", "[v]")
 	} else {
 		args = append(args, "-map", fmt.Sprintf("0:%d", selected.Video.Index))
 	}
@@ -683,13 +805,46 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 		if profile.Video.Level != "" {
 			args = append(args, "-level:v", profile.Video.Level)
 		}
-		if burnSubtitleStreamIndex < 0 {
-			args = append(args, "-pix_fmt", "yuv420p")
+		// HDR-preserving transcode: an HDR (PQ/HLG) source encoded by an HEVC
+		// profile keeps its 10-bit BT.2020 signal instead of being flattened to
+		// SDR. Subtitle burn-in composites in yuv420p (SDR), so it is excluded.
+		preserveHDR := !burning && sourceIsHDR(selected.Video) && isHEVCEncoder(profile.Video.Codec)
+		// An SDR transcode (e.g. libx264) of an HDR source must tone-map, not just
+		// flatten the pixel format: copying PQ/HLG luma into yuv420p without a
+		// linear-light conversion yields a dark, desaturated picture. preserveHDR
+		// (HEVC HDR profiles) keeps HDR instead, so the two are mutually exclusive.
+		tonemapSDR := !burning && sourceIsHDR(selected.Video) && !preserveHDR
+		if !burning {
+			pixFmt := profile.Video.PixelFormat
+			if pixFmt == "" {
+				pixFmt = "yuv420p"
+			}
+			args = append(args, "-pix_fmt", pixFmt)
 		}
-		if profile.Video.ScaleHeight > 0 && burnSubtitleStreamIndex < 0 {
-			// Scale down sources taller than ScaleHeight; leave shorter sources unchanged.
-			// -2 keeps width as a multiple of 2 after the height is pinned.
-			args = append(args, "-vf", fmt.Sprintf("scale=-2:'min(ih,%d)'", profile.Video.ScaleHeight))
+		if !burning {
+			var filters []string
+			if tonemapSDR {
+				filters = append(filters, tonemapSDRFilter())
+			}
+			if shouldScaleVideo(selected.Video, profile.Video.ScaleHeight) {
+				// Scale down sources taller than ScaleHeight; leave unknown-height
+				// sources conservative. -2 keeps width as a multiple of 2 after
+				// the height is pinned.
+				filters = append(filters, fmt.Sprintf("scale=-2:'min(ih,%d)'", profile.Video.ScaleHeight))
+			}
+			if len(filters) > 0 {
+				args = append(args, "-vf", strings.Join(filters, ","))
+			}
+		}
+		if preserveHDR {
+			args = append(args, hdrColorArgs(selected.Video.ColorTransfer)...)
+			if strings.Contains(strings.ToLower(profile.Video.Codec), "x265") {
+				args = append(args, "-x265-params", hevcHDRx265Params(gopFrames, selected.Video))
+			}
+		}
+		// Apple clients only accept HEVC fMP4 tagged hvc1 (not hev1).
+		if isHEVCEncoder(profile.Video.Codec) {
+			args = append(args, "-tag:v", "hvc1")
 		}
 		// HLS requires segment boundaries to land on keyframes — always emit.
 		args = append(args,
@@ -703,6 +858,7 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 		if selected.Video != nil && selected.Video.CodecName == "hevc" {
 			args = append(args, "-tag:v", "hvc1")
 		}
+		args = append(args, "-muxdelay", "0", "-muxpreload", "0")
 	default:
 		return nil, fmt.Errorf("unsupported video mode %q for profile %s", profile.Video.Mode, profile.Name)
 	}
@@ -730,11 +886,45 @@ func ffmpegArgs(input, packageRoot string, targetSegmentMs int64, preset string,
 		"-hls_time", targetSeconds,
 		"-hls_list_size", "0",
 		"-hls_segment_type", "fmp4",
-		"-hls_fmp4_init_filename", "init.mp4",
+		"-hls_fmp4_init_filename", layout.InitName,
 		"-hls_segment_filename", segmentPattern,
-		filepath.Join(packageRoot, "stream.m3u8"),
+		layout.PlaylistPath(packageRoot),
 	)
+
+	for _, streamIndex := range subtitleStreamIndexes {
+		subdir := filepath.Join(packageRoot, "subs", subtitleSlug(streamIndex))
+		args = append(args,
+			"-map", fmt.Sprintf("0:%d", streamIndex),
+			"-c:s", "webvtt",
+			"-f", "segment",
+			"-segment_time", targetSeconds,
+			"-segment_format", "webvtt",
+			"-segment_list", filepath.Join(subdir, "playlist.m3u8"),
+			"-segment_list_type", "m3u8",
+			filepath.Join(subdir, "seg_%06d.vtt"),
+		)
+	}
+
 	return args, nil
+}
+
+func subtitleSlug(streamIndex int) string { return "s" + strconv.Itoa(streamIndex) }
+
+func shouldScaleVideo(video *probeStream, scaleHeight int64) bool {
+	if scaleHeight <= 0 {
+		return false
+	}
+	return video == nil || video.Height <= 0 || video.Height > scaleHeight
+}
+
+// burnFilter picks the composite chain for a resolved burn decision: text
+// tracks render via the subtitles filter, anything else overlays as video
+// (the pre-Source default, so decisions without a Source stay bitmap).
+func burnFilter(input string, video *probeStream, burn subtitlepolicy.Decision, probe sourceProbe, profile packageprofile.Profile) string {
+	if burn.Source == db.TrackSourceEmbedded {
+		return textSubtitleBurnFilter(input, video, subtitleRelativeIndex(probe, burn.StreamIndex), profile)
+	}
+	return subtitleBurnFilter(video.Index, burn.StreamIndex, profile)
 }
 
 func subtitleBurnFilter(videoStreamIndex, subtitleStreamIndex int, profile packageprofile.Profile) string {
@@ -743,6 +933,64 @@ func subtitleBurnFilter(videoStreamIndex, subtitleStreamIndex int, profile packa
 		scale = fmt.Sprintf("scale=-2:'min(ih,%d)'", profile.Video.ScaleHeight)
 	}
 	return fmt.Sprintf("[0:%d][0:%d]overlay=eof_action=pass,%s,format=yuv420p[v]", videoStreamIndex, subtitleStreamIndex, scale)
+}
+
+// textSubtitleBurnFilter renders a text subtitle stream onto the video via the
+// subtitles filter (libass), reading the track straight from the source file
+// so the encode carries no sidecar dependency. Unlike the bitmap overlay chain
+// it tone-maps HDR sources to SDR first — text burn targets HDR Web-DLs, and
+// compositing over untouched PQ/HLG frames ships crushed, desaturated video.
+// Text renders after the downscale so glyphs rasterize at output resolution.
+func textSubtitleBurnFilter(input string, video *probeStream, subtitleRelIndex int, profile packageprofile.Profile) string {
+	var filters []string
+	if sourceIsHDR(video) {
+		filters = append(filters, tonemapSDRFilter())
+	}
+	if shouldScaleVideo(video, profile.Video.ScaleHeight) {
+		filters = append(filters, fmt.Sprintf("scale=-2:'min(ih,%d)'", profile.Video.ScaleHeight))
+	}
+	filters = append(filters,
+		fmt.Sprintf("subtitles=filename=%s:si=%d", subtitlesFilterPath(input), subtitleRelIndex),
+		"format=yuv420p",
+	)
+	return fmt.Sprintf("[0:%d]%s[v]", video.Index, strings.Join(filters, ","))
+}
+
+// subtitleRelativeIndex converts an absolute stream index into the stream's
+// position among the source's subtitle streams, which is what the subtitles
+// filter's si option expects.
+func subtitleRelativeIndex(probe sourceProbe, streamIndex int) int {
+	rel := 0
+	for _, s := range probe.Streams {
+		if s.CodecType != "subtitle" {
+			continue
+		}
+		if s.Index == streamIndex {
+			return rel
+		}
+		rel++
+	}
+	return -1
+}
+
+// subtitlesFilterPath escapes a path for the subtitles filter's filename
+// option. ffmpeg unescapes filter option values twice — the filtergraph
+// parser handles \ ' [ ] , ; and then the option parser handles \ ' : — so
+// the path is escaped for the option level first and the graph level second.
+func subtitlesFilterPath(path string) string {
+	return escapeFilterChars(escapeFilterChars(path, `\':`), `\'[],;`)
+}
+
+func escapeFilterChars(s, special string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if strings.ContainsRune(special, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 type packageMeta struct {
@@ -1011,28 +1259,51 @@ func timescaleFromTimeBase(v string) int64 {
 	return n
 }
 
-// extractSubtitleTracks converts text-based subtitle streams to WebVTT sidecars
-// and records them in media_tracks. Only streams whose language is in prefs are
-// extracted. Bitmap formats are skipped. Already-extracted streams (DB row +
-// file on disk) are skipped — making the function idempotent on re-runs.
-// Each stream has a 2-minute timeout so a hung ffmpeg can't block the worker.
-func extractSubtitleTracks(ctx context.Context, conn *sql.DB, mediaPath, outputRoot, mediaID string, probe sourceProbe, prefs []string) {
+// ExtractSubtitles converts text-based subtitle streams to package-owned WebVTT
+// sidecars and records them in package_tracks. Only streams whose language is in
+// prefs are extracted. Forced text tracks are always extracted. Bitmap formats
+// are recorded as package inventory rows with no path. Each text stream has a
+// 2-minute timeout so a hung ffmpeg can't block the worker.
+func ExtractSubtitles(ctx context.Context, conn *sql.DB, mediaPath, packageRoot, packageID string) {
+	probe, err := probeSource(ctx, mediaPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "packager: probe for subtitle extraction package=%s: %v\n", packageID, err)
+		return
+	}
+	prefs, _ := db.GetSubtitleLanguagePreference(ctx, conn)
+	extractSubtitleTracks(ctx, conn, mediaPath, packageRoot, packageID, probe, prefs)
+}
+
+func extractSubtitleTracks(ctx context.Context, conn *sql.DB, mediaPath, packageRoot, packageID string, probe sourceProbe, prefs []string) {
 	prefSet := make(map[string]bool, len(prefs))
 	for _, p := range prefs {
 		prefSet[strings.ToLower(p)] = true
 	}
 
-	// Build index of already-extracted streams: stream_index -> vttPath.
-	existing := make(map[int]string)
-	if tracks, err := db.MediaTracksByMediaID(ctx, conn, mediaID); err == nil {
-		for _, t := range tracks {
-			if t.Kind == "subtitle" && t.Source == db.TrackSourceEmbedded && t.Path != nil {
-				existing[t.StreamIndex] = *t.Path
-			}
-		}
+	subtitleDir := layout.PackageSubtitleDir(packageRoot)
+	if err := os.MkdirAll(subtitleDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "packager: mkdir subtitle output dir %s: %v\n", subtitleDir, err)
+		return
+	}
+	if err := db.DeletePackageTracks(ctx, conn, packageID); err != nil {
+		fmt.Fprintf(os.Stderr, "packager: clear package tracks package=%s: %v\n", packageID, err)
+		return
 	}
 
-	mediaDir := filepath.Join(outputRoot, mediaID)
+	// Per-run log file so the operator can see what happened without digging
+	// through container stderr. Truncated on each new extraction attempt.
+	logFile, logErr := os.OpenFile(filepath.Join(subtitleDir, "extract.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	logf := func(format string, args ...any) {
+		line := fmt.Sprintf(time.Now().UTC().Format("2006-01-02T15:04:05Z")+" "+format+"\n", args...)
+		fmt.Fprint(os.Stderr, "packager: "+line)
+		if logErr == nil {
+			fmt.Fprint(logFile, line)
+		}
+	}
+	if logErr == nil {
+		defer logFile.Close()
+	}
+	logf("start package=%s path=%s", packageID, mediaPath)
 	var subtitleRelIdx int
 	for _, s := range probe.Streams {
 		if s.CodecType != "subtitle" {
@@ -1043,49 +1314,51 @@ func extractSubtitleTracks(ctx context.Context, conn *sql.DB, mediaPath, outputR
 			lang = "und"
 		}
 		if isBitmapSubtitle(s.CodecName) {
-			// Bitmap subs (PGS/VOBSUB) cannot be converted to a VTT sidecar.
-			// Record an inventory row (path stays NULL) so the track is visible —
-			// admin UI, and the future forced-burn-in / external-fetch slices —
-			// instead of silently dropping it. Recorded regardless of language
-			// preference: the point of the inventory is to surface everything we
-			// cannot currently serve. Idempotent via the embedded upsert.
-			track := db.MediaTrack{
-				MediaID:     mediaID,
+			track := db.PackageTrack{
+				PackageID:   packageID,
 				Kind:        "subtitle",
 				StreamIndex: s.Index,
 				Language:    lang,
+				Title:       s.Tags.Title,
 				Codec:       strings.ToLower(s.CodecName),
 				Source:      db.TrackSourceEmbeddedBitmap,
 				DefaultFlag: s.Disposition.Default == 1,
 				Forced:      s.Disposition.Forced == 1,
 				Path:        nil,
 			}
-			if err := db.UpsertMediaTrack(ctx, conn, track); err != nil {
-				fmt.Fprintf(os.Stderr, "packager: record bitmap subtitle stream %d (%s) media=%s: %v\n",
-					s.Index, lang, mediaID, err)
+			if err := db.UpsertPackageTrack(ctx, conn, track); err != nil {
+				logf("stream %d (%s) bitmap inventory error: %v", s.Index, lang, err)
 			} else {
-				fmt.Fprintf(os.Stderr, "packager: bitmap subtitle stream %d (%s, %s) not extractable to text; recorded as inventory (forced=%v) media=%s\n",
-					s.Index, lang, strings.ToLower(s.CodecName), s.Disposition.Forced == 1, mediaID)
+				logf("stream %d (%s) bitmap — inventoried (not extractable)", s.Index, lang)
 			}
 			subtitleRelIdx++
 			continue
 		}
 
-		// Skip languages not in the preference list (empty prefs = extract all).
-		if len(prefSet) > 0 && !prefSet[strings.ToLower(lang)] {
+		// Forced tracks carry foreign-dialogue translations that are meaningful
+		// regardless of the user's language preference — always extract them.
+		isForced := s.Disposition.Forced == 1
+		if len(prefSet) > 0 && !prefSet[strings.ToLower(lang)] && !isForced {
+			logf("stream %d (%s) skipped (not in language preference)", s.Index, lang)
 			subtitleRelIdx++
 			continue
 		}
 
-		// Skip if already extracted and file still exists.
-		if existingPath, done := existing[s.Index]; done {
-			if _, err := os.Stat(existingPath); err == nil {
-				subtitleRelIdx++
-				continue
+		vttPath := filepath.Join(subtitleDir, layout.SubtitleFileName(s.Index))
+
+		// The canonical sidecar path is package-local. If the file is already
+		// there, record that path even if an older DB row pointed elsewhere.
+		if _, err := os.Stat(vttPath); err == nil {
+			if err := upsertExtractedTextSubtitleTrack(ctx, conn, packageID, s, lang, vttPath); err != nil {
+				logf("stream %d (%s) db error for existing subtitle: %v", s.Index, lang, err)
+			} else {
+				logf("stream %d (%s) skipped (already extracted: %s)", s.Index, lang, vttPath)
 			}
+			subtitleRelIdx++
+			continue
 		}
 
-		vttPath := filepath.Join(mediaDir, fmt.Sprintf("sub_%d_%s.vtt", s.Index, lang))
+		logf("stream %d (%s) extracting -> %s", s.Index, lang, vttPath)
 		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		cmd, err := ffmpegexec.CommandContext(sctx, "ffmpeg",
 			"-hide_banner", "-loglevel", "error", "-nostdin", "-y",
@@ -1095,8 +1368,7 @@ func extractSubtitleTracks(ctx context.Context, conn *sql.DB, mediaPath, outputR
 			vttPath,
 		)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "packager: subtitle stream %d (%s) media=%s: %v\n",
-				s.Index, lang, mediaID, err)
+			logf("stream %d (%s) ffmpeg setup error: %v", s.Index, lang, err)
 			cancel()
 			subtitleRelIdx++
 			continue
@@ -1104,27 +1376,34 @@ func extractSubtitleTracks(ctx context.Context, conn *sql.DB, mediaPath, outputR
 		out, err := cmd.CombinedOutput()
 		cancel()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "packager: subtitle stream %d (%s) media=%s: %v: %s\n",
-				s.Index, lang, mediaID, err, strings.TrimSpace(string(out)))
+			logf("stream %d (%s) ffmpeg error: %v: %s", s.Index, lang, err, strings.TrimSpace(string(out)))
 			subtitleRelIdx++
 			continue
 		}
-		track := db.MediaTrack{
-			MediaID:     mediaID,
-			Kind:        "subtitle",
-			StreamIndex: s.Index,
-			Language:    lang,
-			Codec:       "webvtt",
-			Source:      db.TrackSourceEmbedded,
-			DefaultFlag: s.Disposition.Default == 1,
-			Path:        &vttPath,
-		}
-		if err := db.UpsertMediaTrack(ctx, conn, track); err != nil {
-			fmt.Fprintf(os.Stderr, "packager: upsert subtitle track stream=%d media=%s: %v\n",
-				s.Index, mediaID, err)
+		if err := upsertExtractedTextSubtitleTrack(ctx, conn, packageID, s, lang, vttPath); err != nil {
+			logf("stream %d (%s) db error: %v", s.Index, lang, err)
+		} else {
+			logf("stream %d (%s) done -> %s", s.Index, lang, vttPath)
 		}
 		subtitleRelIdx++
 	}
+	logf("done")
+}
+
+func upsertExtractedTextSubtitleTrack(ctx context.Context, conn *sql.DB, packageID string, s probeStream, lang, vttPath string) error {
+	return db.UpsertPackageTrack(ctx, conn, db.PackageTrack{
+		PackageID:       packageID,
+		Kind:            "subtitle",
+		StreamIndex:     s.Index,
+		Language:        lang,
+		Title:           s.Tags.Title,
+		Codec:           "webvtt",
+		Source:          db.TrackSourceEmbedded,
+		DefaultFlag:     s.Disposition.Default == 1,
+		Forced:          s.Disposition.Forced == 1,
+		HearingImpaired: s.Disposition.HearingImpaired == 1,
+		Path:            &vttPath,
+	})
 }
 
 func isBitmapSubtitle(codec string) bool {
@@ -1133,6 +1412,25 @@ func isBitmapSubtitle(codec string) bool {
 		return true
 	}
 	return false
+}
+
+func packageSubtitleBytes(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
 }
 
 func nullString(v string) *string {

@@ -19,9 +19,13 @@ func mediaRow(id, group string, durMs int64) db.Media {
 		CodecCheckPassed: true,
 	}
 	if group != "" {
-		m.SchedulingGroup = group
+		m.CollectionName = group
 	}
 	return m
+}
+
+func int64ptr(v int64) *int64 {
+	return &v
 }
 
 const ep = int64(24 * 60 * 1000) // 24 minutes, 6s-aligned
@@ -165,5 +169,64 @@ func TestBlockScheduler_TimeHorizonStopsBuild(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected 0 entries within sub-episode horizon, got %d", len(entries))
+	}
+}
+
+func TestBlockScheduler_CollectionPlaybackUsesSeasonEpisodeOrdering(t *testing.T) {
+	media := []db.Media{
+		mediaRow("e3", "Show A", ep),
+		mediaRow("e1", "Show A", ep),
+		mediaRow("e2", "Show A", ep),
+	}
+	media[0].SeasonNumber = int64ptr(1)
+	media[0].EpisodeNumber = int64ptr(3)
+	media[1].SeasonNumber = int64ptr(1)
+	media[1].EpisodeNumber = int64ptr(1)
+	media[2].SeasonNumber = int64ptr(1)
+	media[2].EpisodeNumber = int64ptr(2)
+
+	entries, err := BuildEntriesBlock("ch", media, map[string]db.GroupCursor{}, "", 0, 3*ep)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := []string{"e1", "e2", "e3"}
+	if len(entries) != len(want) {
+		t.Fatalf("want %d entries, got %d", len(want), len(entries))
+	}
+	for i, mediaID := range want {
+		if entries[i].MediaID != mediaID {
+			t.Fatalf("entry %d: got %s, want %s", i, entries[i].MediaID, mediaID)
+		}
+	}
+}
+
+func TestBlockScheduler_UnorderedMediaSortAfterEpisodes(t *testing.T) {
+	media := []db.Media{
+		mediaRow("movie-b", "Mixed Library", ep),
+		mediaRow("ep2", "Mixed Library", ep),
+		mediaRow("movie-a", "Mixed Library", ep),
+		mediaRow("ep1", "Mixed Library", ep),
+	}
+	media[0].Title = "Movie B"
+	media[1].SeasonNumber = int64ptr(1)
+	media[1].EpisodeNumber = int64ptr(2)
+	media[1].Title = "Episode 2"
+	media[2].Title = "Movie A"
+	media[3].SeasonNumber = int64ptr(1)
+	media[3].EpisodeNumber = int64ptr(1)
+	media[3].Title = "Episode 1"
+
+	entries, err := BuildEntriesBlock("ch", media, map[string]db.GroupCursor{}, "", 0, 4*ep)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	want := []string{"ep1", "ep2", "movie-a", "movie-b"}
+	if len(entries) != len(want) {
+		t.Fatalf("want %d entries, got %d", len(want), len(entries))
+	}
+	for i, mediaID := range want {
+		if entries[i].MediaID != mediaID {
+			t.Fatalf("entry %d: got %s, want %s", i, entries[i].MediaID, mediaID)
+		}
 	}
 }

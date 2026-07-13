@@ -113,11 +113,12 @@ func ChannelMediaPackageList(ctx context.Context, conn Execer, channelID, rendit
 	}
 	rows, err := queryRows(ctx, conn, scanChannelMediaPackageRow, `
         SELECT cm.channel_id, cm.media_id, cm.added_at_ms,
-               m.path, m.title, m.scheduling_group, m.duration_ms,
+               m.path, m.title, COALESCE(CASE WHEN col.kind = 'movie' THEN 'movie:' || col.name ELSE col.name END, m.scheduling_group), m.duration_ms,
                m.codec_check_passed, m.codec_check_reason,
                p.id, p.status, p.packaged_duration_ms, p.error
         FROM channel_media cm
         JOIN media m ON m.id = cm.media_id
+        LEFT JOIN collections col ON col.id = m.collection_id
         LEFT JOIN media_packages p
           ON p.media_id = m.id
          AND p.rendition_profile = ?
@@ -199,13 +200,18 @@ func EligibleReadyPackagedChannelMedia(ctx context.Context, conn Execer, channel
 		return nil, nil
 	}
 	rows, err := queryRows(ctx, conn, scanValue(scanMedia), `
-        SELECT m.id, m.path, m.directory, m.title, m.scheduling_group, m.user_preference,
+        SELECT m.id, m.path, m.directory, m.title,
+               COALESCE(CASE WHEN col.kind = 'movie' THEN 'movie:' || col.name ELSE col.name END, m.scheduling_group),
+               m.collection_id, m.season_number, m.episode_number, m.user_preference,
                COALESCE(p.packaged_duration_ms, m.duration_ms) AS duration_ms,
-               m.container, m.video_codec, m.video_width, m.video_height,
+               m.container, m.video_codec, m.video_width, m.video_height, m.video_bitrate_bps,
                m.color_transfer, m.color_primaries, m.audio_codec,
-               m.codec_check_passed, m.codec_check_reason, m.ingested_at_ms, m.media_kind, m.source_ref
+               m.codec_check_passed, m.codec_check_reason, m.ingested_at_ms, m.media_kind, m.source_ref,
+               m.description, m.thumb_path, m.content_rating, col.genres_json,
+               m.codec_tag_string
         FROM channel_media cm
         JOIN media m ON m.id = cm.media_id
+        LEFT JOIN collections col ON col.id = m.collection_id
         JOIN channels c ON c.id = cm.channel_id
         JOIN media_packages p ON p.media_id = m.id
         WHERE cm.channel_id = ?
@@ -301,7 +307,7 @@ func scanChannelMediaPackageRow(row scanner) (ChannelMediaPackageRow, error) {
 	}
 	r.CodecCheckPassed = passed == 1
 	r.Title = title.String
-	r.SchedulingGroup = group.String
+	r.CollectionName = group.String
 	r.CodecCheckReason = codecReason.String
 	if pkgID.Valid {
 		v := pkgID.String

@@ -68,5 +68,5 @@ export function formatDateTime(ms: number): string {
 }
 
 export function streamUrlFor(channelID: string): string {
-  return `/hls/channel/${encodeURIComponent(channelID)}/stream.m3u8`;
+  return `/hls/channels/${encodeURIComponent(channelID)}/stream.m3u8`;
 }

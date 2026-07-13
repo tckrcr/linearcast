@@ -19,7 +19,43 @@ type subtitleSettingsUpdateRequest struct {
 	LanguagePreference []string `json:"subtitleLanguagePreference"`
 }
 
+type publicServerURLResponse struct {
+	PublicServerURL string `json:"publicServerUrl"`
+}
+
 var subtitleLangCodeRE = regexp.MustCompile(`^[a-z]{3}$`)
+
+func (a *App) handlePublicServerURL(w http.ResponseWriter, r *http.Request) {
+	value, err := db.GetPublicServerURL(r.Context(), a.dbConn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", "failed to read public server url")
+		return
+	}
+	writeJSON(w, publicServerURLResponse{PublicServerURL: value})
+}
+
+func (a *App) handlePublicServerURLUpdate(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var req publicServerURLResponse
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	value := strings.TrimSpace(req.PublicServerURL)
+	if value != "" {
+		normalized, err := normalizeAbsoluteHTTPURL(value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_public_server_url", err.Error())
+			return
+		}
+		value = normalized
+	}
+	if err := db.SetPublicServerURL(r.Context(), a.dbConn, value); err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", "failed to write public server url")
+		return
+	}
+	writeJSON(w, publicServerURLResponse{PublicServerURL: value})
+}
 
 func (a *App) handleSubtitleSettings(w http.ResponseWriter, r *http.Request) {
 	autoEnable, err := db.GetSubtitleAutoEnable(r.Context(), a.dbConn)
@@ -104,29 +140,6 @@ func (a *App) handleEncoderSweeperSettingsUpdate(w http.ResponseWriter, r *http.
 		return
 	}
 	if err := db.SetEncoderSweeperSettings(r.Context(), a.dbConn, req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_settings", err.Error())
-		return
-	}
-	writeJSON(w, req)
-}
-
-func (a *App) handleOnDemandSessionSettings(w http.ResponseWriter, r *http.Request) {
-	s, err := db.GetOnDemandSessionSettings(r.Context(), a.dbConn)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "db_error", "failed to read on-demand session settings")
-		return
-	}
-	writeJSON(w, s)
-}
-
-func (a *App) handleOnDemandSessionSettingsUpdate(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	var req db.OnDemandSessionSettings
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_json", err.Error())
-		return
-	}
-	if err := db.SetOnDemandSessionSettings(r.Context(), a.dbConn, req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_settings", err.Error())
 		return
 	}

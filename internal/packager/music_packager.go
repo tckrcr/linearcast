@@ -8,12 +8,13 @@ import (
 	"strings"
 
 	"github.com/tckrcr/linearcast/internal/ffmpegexec"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
 )
 
 // runFFmpegMusic packages an audio-only media file (FLAC, MP3, DSD, etc.) into
 // fMP4 HLS by synthesising a dark background video track. Audio is encoded
-// using the profile's audio settings; if the profile says copy, AAC 192k is
+// using the profile's audio settings; if the profile says copy, AAC 256k is
 // used instead because most audio codecs (FLAC, DSD, PCM) are not valid in
 // fMP4/HLS.
 func runFFmpegMusic(ctx context.Context, input, packageRoot string, targetSegmentMs int64, profile packageprofile.Profile) error {
@@ -39,7 +40,7 @@ func runFFmpegMusic(ctx context.Context, input, packageRoot string, targetSegmen
 }
 
 func ffmpegMusicArgs(input, packageRoot string, targetSegmentMs int64, profile packageprofile.Profile) []string {
-	segmentPattern := filepath.Join(packageRoot, "seg%06d.m4s")
+	segmentPattern := filepath.Join(packageRoot, layout.SegmentPattern)
 	targetSeconds := formatSeconds(targetSegmentMs)
 
 	// NTSC frame rate for the synthetic video — gives the browser decoder enough
@@ -85,7 +86,7 @@ func ffmpegMusicArgs(input, packageRoot string, targetSegmentMs int64, profile p
 			args = append(args, "-ac", strconv.Itoa(profile.Audio.Channels))
 		}
 	} else {
-		args = append(args, "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000")
+		args = append(args, "-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000")
 	}
 
 	args = append(args,
@@ -94,9 +95,9 @@ func ffmpegMusicArgs(input, packageRoot string, targetSegmentMs int64, profile p
 		"-hls_time", targetSeconds,
 		"-hls_list_size", "0",
 		"-hls_segment_type", "fmp4",
-		"-hls_fmp4_init_filename", "init.mp4",
+		"-hls_fmp4_init_filename", layout.InitName,
 		"-hls_segment_filename", segmentPattern,
-		filepath.Join(packageRoot, "stream.m3u8"),
+		layout.PlaylistPath(packageRoot),
 	)
 	return args
 }

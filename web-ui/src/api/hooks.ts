@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type {
   AdminNow,
   ChannelSummary,
@@ -67,10 +67,12 @@ export function usePlayableSources(intervalMs = 15000) {
   const [data, setData] = useState<PlayableSourcesResponse | null>(null);
   const [error, setError] = useState("");
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const [tick, setTick] = useState(0);
 
   usePolling({
     intervalMs,
     maxIntervalMs: 60_000,
+    resetKey: tick,
     task: async (signal) => {
       try {
         const body = await getPlayableSources(signal);
@@ -85,7 +87,8 @@ export function usePlayableSources(intervalMs = 15000) {
     },
   });
 
-  return { data, error, updatedAt };
+  const refresh = useCallback(() => setTick((t) => t + 1), []);
+  return { data, error, updatedAt, refresh };
 }
 
 // useGuide fetches the viewer-safe EPG for a time window and re-fetches when the

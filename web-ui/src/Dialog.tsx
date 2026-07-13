@@ -26,9 +26,6 @@ export function Dialog({ open, onClose, title, children }: Props) {
         event.preventDefault();
         onClose();
       }}
-      onClick={(event) => {
-        if (event.target === ref.current) onClose();
-      }}
     >
       <div className={styles["dialog-header"]}>
         <h3>{title}</h3>

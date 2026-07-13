@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/packager"
 )
 
@@ -37,7 +36,7 @@ func encodeJob(ctx context.Context, client *http.Client, cfg config, claim claim
 	}
 	fmt.Fprintf(out, "downloaded media=%s bytes=%d path=%s\n", claim.MediaID, n, sourcePath)
 
-	err = packager.EncodePackageOutput(ctx, sourcePath, packageDir, db.ScheduleGridMs, "veryfast", claim.Profile)
+	err = packager.EncodePackageOutput(ctx, sourcePath, packageDir, packager.PackagedSegmentMs, "veryfast", claim.Profile)
 	if err != nil {
 		_ = failClaimWithKind(ctx, client, cfg, claim.PackageID, classifyClaimFailure(err), err.Error())
 		return fmt.Errorf("encode package: %w", err)

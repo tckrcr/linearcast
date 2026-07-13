@@ -3,25 +3,6 @@
   max-width: 1180px;
 }
 
-.profiles-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
-}
-
-.profiles-panel-header h2 {
-  margin: 0;
-}
-
-.profiles-panel-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
 .profiles-list {
   min-width: 0;
   margin-top: 4px;
@@ -161,7 +142,7 @@
   color: var(--text-muted);
 }
 
-.encoder-badge.encoder-cpu { background: #2c4a6b; color: #e0eaf5; }
+.encoder-badge.encoder-cpu { background: #3a3a3a; color: var(--text); }
 .encoder-badge.encoder-apple { background: #4a3866; color: #ede0f5; }
 .encoder-badge.encoder-nvidia { background: #2d5a3d; color: #dff0e3; }
 .encoder-badge.encoder-copy { background: var(--bg-elev); color: var(--text-dim); }
@@ -363,15 +344,12 @@
   background: rgba(225, 92, 92, 0.12);
 }
 
-@media (max-width: 900px) {
-  .profiles-panel-header {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .profiles-panel-actions {
-    justify-content: flex-start;
-  }
+/* The list sets overflow-x:auto for narrow screens, which makes the browser
+   compute overflow-y as auto too — so a menu opening downward off the last row
+   gets clipped by that scroll box. The last row opens upward to stay inside it. */
+.profile-actions-menu.is-drop-up {
+  top: auto;
+  bottom: calc(100% + 4px);
 }
 
 /* Profile Form */

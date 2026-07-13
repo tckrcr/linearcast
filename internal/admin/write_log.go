@@ -59,6 +59,7 @@ func shouldSkipWriteLog(path string) bool {
 		"/api/auth/login", "/api/auth/logout",
 		"/api/media/package", "/api/media/package/cancel",
 		"/api/cache/invalid-profiles",
+		"/api/admin/plex/pin",
 		"/api/admin/plex/scan", "/api/admin/jellyfin/scan":
 		return true
 	}
@@ -95,7 +96,7 @@ func (a *App) writeLogMiddleware(next http.Handler) http.Handler {
 			DurationMs:  a.now().Sub(start).Milliseconds(),
 		}
 		if err := db.InsertAdminWriteLog(context.Background(), a.dbConn, entry); err != nil {
-			a.logger.Printf("write log: %v", err)
+			a.logger.Warn("write log failed", "err", err)
 		}
 	})
 }
@@ -129,17 +130,19 @@ func classifyRequest(method, path string) (action, targetType, targetID string) 
 		if len(parts) >= 3 && parts[2] == "local-sources" {
 			return classifyLocalSourceRequest(method, parts)
 		}
+		if len(parts) >= 3 && parts[2] == "maintenance" {
+			return classifyMaintenanceRequest(method, parts)
+		}
 	case "channels":
 		return classifyChannelRequest(method, parts)
-	case "schedule-builder":
-		if len(parts) == 3 && parts[2] == "channels" && method == http.MethodPost {
-			return "create_schedule_builder_channel", "channel", ""
-		}
 	case "subtitle-settings":
 		if len(parts) == 2 && method == http.MethodPut {
 			return "update_subtitle_settings", "settings", "subtitle"
 		}
 	case "package-profiles":
+		if len(parts) == 4 && parts[3] == "enable" && method == http.MethodPost {
+			return "enable_package_profile", "profile", parts[2]
+		}
 		if len(parts) == 3 {
 			switch method {
 			case http.MethodPut:
@@ -147,6 +150,13 @@ func classifyRequest(method, path string) (action, targetType, targetID string) 
 			case http.MethodDelete:
 				return "delete_package_profile", "profile", parts[2]
 			}
+		}
+	case "media":
+		if len(parts) == 3 && method == http.MethodPatch {
+			return "update_media_fields", "media", parts[2]
+		}
+		if len(parts) == 4 && parts[2] == "collections" && parts[3] == "bulk" && method == http.MethodPost {
+			return "bulk_update_media_collection", "media", "collection"
 		}
 	}
 	return "", "", ""
@@ -168,6 +178,9 @@ func classifyLocalSourceRequest(method string, parts []string) (action, targetTy
 }
 
 func classifyChannelRequest(method string, parts []string) (action, targetType, targetID string) {
+	if len(parts) == 2 && method == http.MethodPost {
+		return "create_channel", "channel", ""
+	}
 	if len(parts) < 3 {
 		return "", "", ""
 	}
@@ -177,6 +190,9 @@ func classifyChannelRequest(method string, parts []string) (action, targetType, 
 		if method == http.MethodDelete {
 			return "delete_channel", "channel", channelID
 		}
+		if method == http.MethodPatch {
+			return "patch_channel", "channel", channelID
+		}
 		return "", "", ""
 	}
 
@@ -185,18 +201,14 @@ func classifyChannelRequest(method string, parts []string) (action, targetType, 
 		return "clone_channel", "channel", channelID
 	case "restart-playback":
 		return "restart_playback", "channel", channelID
+	case "stop-encoder":
+		return "stop_encoder", "channel", channelID
 	case "extend":
 		return "extend_schedule", "channel", channelID
-	case "disable":
-		return "disable_channel", "channel", channelID
-	case "enable":
-		return "enable_channel", "channel", channelID
-	case "hide-from-guide":
-		return "hide_channel_from_guide", "channel", channelID
-	case "show-in-guide":
-		return "show_channel_in_guide", "channel", channelID
 	case "policy":
 		return "update_channel_policy", "channel", channelID
+	case "on-demand-profile":
+		return "update_on_demand_profile", "channel", channelID
 	case "media":
 		return classifyChannelMediaRequest(method, parts, channelID)
 	case "schedule":
@@ -245,6 +257,40 @@ func classifyScheduleRequest(method string, parts []string, channelID string) (a
 	// DELETE /api/channels/{channelID}/schedule/entries/{startMs}
 	if len(parts) == 6 && parts[4] == "entries" && method == http.MethodDelete {
 		return "delete_schedule_entry", "channel", channelID
+	}
+	return "", "", ""
+}
+
+func classifyMaintenanceRequest(method string, parts []string) (action, targetType, targetID string) {
+	if len(parts) < 4 {
+		return "", "", ""
+	}
+	switch parts[3] {
+	case "package-integrity":
+		if method == http.MethodPost {
+			return "repair_package_integrity", "maintenance", "package-integrity"
+		}
+	case "packages":
+		// POST /api/admin/maintenance/packages/{packageID}/requeue
+		if len(parts) == 6 && parts[5] == "requeue" && method == http.MethodPost {
+			return "requeue_package", "package", parts[4]
+		}
+	case "missing-media":
+		if method == http.MethodDelete {
+			return "delete_missing_media", "maintenance", "missing-media"
+		}
+	case "orphan-packages":
+		if method == http.MethodDelete {
+			return "delete_orphan_packages", "maintenance", "orphan-packages"
+		}
+	case "orphan-encodes":
+		if method == http.MethodDelete {
+			return "delete_orphan_encodes", "maintenance", "orphan-encodes"
+		}
+	case "optimize-db":
+		if method == http.MethodPost {
+			return "optimize_db", "maintenance", "optimize-db"
+		}
 	}
 	return "", "", ""
 }

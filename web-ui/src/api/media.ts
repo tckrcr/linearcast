@@ -3,49 +3,214 @@ import type {
   MediaPackageCancelResult,
   MediaPackageCandidateList,
   MediaPackageRequestResult,
+  MediaUpdateResponse,
   PackageProfile,
 } from "../types";
-import { apiFetch } from "./client";
+import { ApiError, apiFetch } from "./client";
+
+export async function updateMediaFields(
+  mediaId: string,
+  fields: { title?: string; collectionName?: string; seasonNumber?: number | null; episodeNumber?: number | null },
+) {
+  return apiFetch<MediaUpdateResponse>(`/api/media/${encodeURIComponent(mediaId)}`, {
+    method: "PATCH",
+    json: fields,
+  });
+}
 
 export type MediaSearchResult = {
   mediaId: string;
   title: string;
   path: string;
-  schedulingGroup: string;
+  collectionName: string;
+  sourceRef?: string;
   durationMs: number;
+  videoHeight?: number;
+  videoCodec?: string;
   codecCheckPassed: boolean;
 };
+
+export type MediaInventoryItem = {
+  mediaId: string;
+  title: string;
+  path: string;
+  pathRoot: string;
+  releaseGroup?: string;
+  episodeCode?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
+  collection: string;
+  sourceRef?: string;
+  source: string;
+  mediaKind: "video" | "music" | string;
+  durationMs: number;
+  container: string;
+  videoCodec: string;
+  videoWidth?: number;
+  videoHeight?: number;
+  audioCodec: string;
+  codecCheckPassed: boolean;
+  codecCheckReason?: string;
+  readyPackages: number;
+  pendingPackages: number;
+  processingPackages: number;
+  failedPackages: number;
+  packageProfiles?: string;
+};
+
+export type MediaInventoryResponse = {
+  count: number;
+  limit: number;
+  offset: number;
+  media: MediaInventoryItem[];
+};
+
+export type MediaInventoryFilters = {
+  q?: string;
+  title?: string;
+  episode?: string;
+  pathRoot?: string;
+  releaseGroup?: string;
+  media?: string;
+  source?: string;
+  kind?: string;
+  collection?: string;
+  packageStatus?: string;
+  codecStatus?: string;
+  sortBy?: string;
+  sortDir?: "asc" | "desc";
+  limit?: number;
+  offset?: number;
+};
+
+export type MediaCollectionBulkAction = "set" | "clear" | "rename";
+
+export type MediaCollectionBulkRequest = {
+  action: MediaCollectionBulkAction;
+  collection?: string;
+  fromCollection?: string;
+  mediaIds?: string[];
+  filter?: Omit<MediaInventoryFilters, "limit" | "offset">;
+  dryRun?: boolean;
+};
+
+export type MediaCollectionBulkResponse = {
+  action: string;
+  collection?: string;
+  fromCollection?: string;
+  dryRun: boolean;
+  matched: number;
+  updated: number;
+};
+
+export async function getMediaInventory(filters: MediaInventoryFilters = {}): Promise<MediaInventoryResponse> {
+  return apiFetch<MediaInventoryResponse>("/api/media/inventory", {
+    cache: "no-store",
+    query: {
+      q: filters.q,
+      title: filters.title,
+      episode: filters.episode,
+      pathRoot: filters.pathRoot,
+      releaseGroup: filters.releaseGroup,
+      media: filters.media,
+      source: filters.source,
+      kind: filters.kind,
+      collection: filters.collection,
+      packageStatus: filters.packageStatus,
+      codecStatus: filters.codecStatus,
+      sortBy: filters.sortBy,
+      sortDir: filters.sortDir,
+      limit: filters.limit != null ? String(filters.limit) : undefined,
+      offset: filters.offset != null ? String(filters.offset) : undefined,
+    },
+  });
+}
+
+export async function deleteMedia(mediaId: string) {
+  try {
+    return await apiFetch<{
+      mediaId: string;
+      deleted: boolean;
+      blockers?: { channelId: string; displayName: string; kind: string }[];
+      warnings?: string[];
+      packageIds?: string[];
+    }>(`/api/media/${encodeURIComponent(mediaId)}`, {
+      method: "DELETE",
+    });
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409 && err.body && typeof err.body === "object") {
+      return err.body as {
+        mediaId: string;
+        deleted: boolean;
+        blockers?: { channelId: string; displayName: string; kind: string }[];
+        warnings?: string[];
+        packageIds?: string[];
+      };
+    }
+    throw err;
+  }
+}
+
+export type EncodeReclaimItem = {
+  mediaId: string;
+  packageId: string;
+  profile: string;
+  status: string;
+  packageRoot?: string;
+  bytes?: number;
+  referenced: boolean;
+  skipped: boolean;
+  deleted: boolean;
+};
+
+export type EncodeReclaimResponse = {
+  generatedAt: string;
+  dryRun: boolean;
+  force: boolean;
+  candidates: number;
+  deletedRows: number;
+  skippedRows: number;
+  totalBytes: number;
+  items: EncodeReclaimItem[];
+  warnings?: string[];
+};
+
+export async function deleteMediaPackages(
+  mediaId: string,
+  profile?: string,
+): Promise<EncodeReclaimResponse> {
+  return apiFetch<EncodeReclaimResponse>("/api/admin/maintenance/packages", {
+    method: "DELETE",
+    query: {
+      media: mediaId,
+      "dry-run": "false",
+      ...(profile ? { profile } : {}),
+    },
+  });
+}
+
+export async function backfillMediaOrdering() {
+  return apiFetch<{
+    generatedAt: string;
+    scanned: number;
+    updated: number;
+  }>("/api/admin/maintenance/media-ordering", {
+    method: "POST",
+  });
+}
+
+export async function bulkUpdateMediaCollections(
+  input: MediaCollectionBulkRequest,
+): Promise<MediaCollectionBulkResponse> {
+  return apiFetch<MediaCollectionBulkResponse>("/api/media/collections/bulk", {
+    method: "POST",
+    json: input,
+  });
+}
 
 export async function getMediaGroups(): Promise<string[]> {
   const body = await apiFetch<{ groups: string[] } | null>("/api/media/groups", { cache: "no-store" });
   return body?.groups ?? [];
-}
-
-export type MediaShowHalf = {
-  half: number;
-  group: string;
-  episodeCount: number;
-  durationMs: number;
-};
-
-export type MediaShowSeason = {
-  season: number;
-  episodeCount: number;
-  durationMs: number;
-  halves: MediaShowHalf[];
-};
-
-export type MediaShow = {
-  showName: string;
-  episodeCount: number;
-  durationMs: number;
-  seasonCount: number;
-  seasons: MediaShowSeason[];
-};
-
-export async function getMediaShows(): Promise<MediaShow[]> {
-  const body = await apiFetch<{ shows: MediaShow[] } | null>("/api/media/shows", { cache: "no-store" });
-  return body?.shows ?? [];
 }
 
 export type MusicAlbum = {
@@ -62,6 +227,18 @@ export type MusicArtist = {
   durationMs: number;
   albums: MusicAlbum[];
 };
+
+export type MediaMovie = {
+  title: string;
+  group: string;
+  itemCount: number;
+  durationMs: number;
+};
+
+export async function getMediaMovies(): Promise<MediaMovie[]> {
+  const body = await apiFetch<{ movies: MediaMovie[] } | null>("/api/media/movies", { cache: "no-store" });
+  return body?.movies ?? [];
+}
 
 export async function getMediaAlbums(): Promise<MusicArtist[]> {
   const body = await apiFetch<{ artists: MusicArtist[] } | null>("/api/media/albums", { cache: "no-store" });
@@ -216,6 +393,12 @@ export async function startLocalMediaSourceScan(id: string): Promise<{ jobId: st
   });
 }
 
+export async function startAllLocalMediaSourcesScan(): Promise<{ jobId: string }> {
+  return apiFetch<{ jobId: string }>("/api/admin/local-sources/scan", {
+    method: "POST",
+  });
+}
+
 export async function upsertPackageProfile(profile: PackageProfile): Promise<{ name: string; status: string }> {
   return apiFetch<{ name: string; status: string }>(`/api/package-profiles/${encodeURIComponent(profile.name)}`, {
     method: "PUT",
@@ -229,39 +412,15 @@ export async function deletePackageProfile(name: string): Promise<{ name: string
   });
 }
 
-export async function setDefaultPackagedProfile(name: string): Promise<{ ok: boolean; default: string }> {
-  return apiFetch<{ ok: boolean; default: string }>("/api/admin/default-packaged-profile", {
-    method: "PUT",
-    json: { name },
-  });
-}
-
-export type SubtitleExtractResult = {
-  embeddedExtracted: boolean;
-  skipped: boolean;
-};
-
-export async function extractMediaSubtitles(mediaId: string): Promise<SubtitleExtractResult> {
-  return apiFetch<SubtitleExtractResult>(`/api/media/${encodeURIComponent(mediaId)}/subtitles/extract`, {
+export async function enablePackageProfile(name: string): Promise<{ name: string; enabled: boolean }> {
+  return apiFetch<{ name: string; enabled: boolean }>(`/api/package-profiles/${encodeURIComponent(name)}/enable`, {
     method: "POST",
   });
 }
 
-export type SubtitleTrack = {
-  language: string;
-  source: string;
-  codec: string;
-  hasFile: boolean;
-};
-
-export async function getMediaSubtitles(mediaId: string): Promise<SubtitleTrack[]> {
-  return apiFetch<SubtitleTrack[]>(`/api/media/${encodeURIComponent(mediaId)}/subtitles`, {
-    cache: "no-store",
-  });
-}
-
-export async function deleteMediaSubtitle(mediaId: string, language: string): Promise<{ deleted: boolean }> {
-  return apiFetch<{ deleted: boolean }>(`/api/media/${encodeURIComponent(mediaId)}/subtitles/${encodeURIComponent(language)}`, {
-    method: "DELETE",
+export async function setDefaultPackagedProfile(name: string): Promise<{ ok: boolean; default: string }> {
+  return apiFetch<{ ok: boolean; default: string }>("/api/admin/default-packaged-profile", {
+    method: "PUT",
+    json: { name },
   });
 }

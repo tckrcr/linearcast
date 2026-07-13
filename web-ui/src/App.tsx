@@ -5,7 +5,9 @@ import { ChannelGuide } from "./ChannelGuide";
 import { DebugDrawer } from "./DebugDrawer";
 import { Player } from "./Player";
 import { usePlayableSources, useStreamProbe } from "./api";
+import { usePlaybackClock } from "./hooks/usePlaybackClock";
 import { usePlayerKeyboardShortcuts } from "./hooks/usePlayerKeyboardShortcuts";
+import { resolveLiveSlot } from "./playbackClock";
 import type { PlaybackStats } from "./types";
 
 const ACTIVE_CHANNEL_KEY = "tc.activeChannelId";
@@ -20,12 +22,20 @@ const emptyStats: PlaybackStats = {
   paused: true,
   currentTime: 0,
   playbackRate: 1,
+  videoWidth: 0,
+  videoHeight: 0,
+  playerWidth: 0,
+  playerHeight: 0,
+  viewportWidth: 0,
+  viewportHeight: 0,
   droppedFrames: 0,
   totalFrames: 0,
   bufferAhead: 0,
   buffered: "",
   hlsLatency: null,
   liveSyncPosition: null,
+  bandwidthEstimate: null,
+  currentLevel: null,
   lastFrag: "",
   lastEvent: "",
   playbackEngine: "",
@@ -38,7 +48,8 @@ export function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
 
-  const { data: playableSources, error: sourceError } = usePlayableSources();
+  const { data: playableSources, error: sourceError, updatedAt: sourcesUpdatedAt, refresh: refreshSources } =
+    usePlayableSources();
   const visibleSourceError = sourceError === "admin api 502" ? "" : sourceError;
 
   const activeSources = useMemo(
@@ -190,30 +201,41 @@ export function App() {
     setChannelsOpen,
   });
 
-  // Pause keepalive: while paused, ping the server every 30s so the
-  // on-demand session stays alive (capped server-side at the configured
-  // keepalive ceiling, default 15 min).
-  const prevPausedRef = useRef(false);
-  useEffect(() => {
-    if (!activeChannelID) return;
-    if (!stats.paused) {
-      prevPausedRef.current = false;
-      return;
-    }
-    // Just transitioned to paused — clear any previous ceiling timer.
-    fetch(`/hls/channel/${encodeURIComponent(activeChannelID)}/keepalive`, { method: "POST" }).catch(() => {});
-    prevPausedRef.current = true;
-    const id = setInterval(() => {
-      fetch(`/hls/channel/${encodeURIComponent(activeChannelID)}/keepalive`, { method: "POST" }).catch(() => {});
-    }, 30000);
-    return () => clearInterval(id);
-  }, [activeChannelID, stats.paused]);
-
   const activeSource =
     activeSources.find((c) => c.id === activeChannelID) ?? null;
 
-  const appliedSource =
-    urlSourceOverride || activeSource?.manifestUrl || "";
+  // The wall clock currently on screen, ticking every second. Sourced from the
+  // playhead's program-date-time when available, falling back to a skew-corrected
+  // wall clock anchored to the last poll.
+  const clockAnchor = useMemo(
+    () =>
+      playableSources && sourcesUpdatedAt != null
+        ? { serverNowMs: playableSources.nowMs, localAtMs: sourcesUpdatedAt }
+        : null,
+    [playableSources, sourcesUpdatedAt],
+  );
+  const nowOnScreenMs = usePlaybackClock(hlsRef, clockAnchor);
+  const liveSlot = useMemo(
+    () => resolveLiveSlot(activeSource?.current, activeSource?.next, nowOnScreenMs),
+    [activeSource?.current, activeSource?.next, nowOnScreenMs],
+  );
+  // When the on-screen playhead crosses a program boundary, re-poll once so the
+  // now/next labels catch up promptly instead of lagging until the next tick.
+  const refreshedBoundaryRef = useRef<number | null>(null);
+  const currentEndMs = activeSource?.current?.endMs;
+  useEffect(() => {
+    if (
+      liveSlot.rolledPast &&
+      currentEndMs != null &&
+      refreshedBoundaryRef.current !== currentEndMs
+    ) {
+      refreshedBoundaryRef.current = currentEndMs;
+      refreshSources();
+    }
+  }, [liveSlot.rolledPast, currentEndMs, refreshSources]);
+
+  const baseSource = urlSourceOverride || activeSource?.manifestUrl || "";
+  const appliedSource = baseSource;
 
   const probe = useStreamProbe(appliedSource || "/__no_source__");
 
@@ -233,6 +255,7 @@ export function App() {
         onAbrModeChange={setAbrMode}
         probe={probe}
         activeSource={activeSource}
+        nowSlot={liveSlot}
         hasSources={activeSources.length > 0}
         onStats={setStats}
         videoRef={videoRef}
@@ -241,6 +264,7 @@ export function App() {
 
       <ChannelBanner
         channel={activeSource}
+        slot={liveSlot}
         visible={cornerVisible && !channelsOpen}
       />
 
@@ -306,10 +330,6 @@ export function App() {
         stats={stats}
         probe={probe}
         appliedSource={appliedSource}
-        autoPlay={autoPlay}
-        onAutoPlayChange={setAutoPlay}
-        videoRef={videoRef}
-        hlsRef={hlsRef}
       />
     </div>
   );

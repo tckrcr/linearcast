@@ -130,11 +130,12 @@ func ChannelFillerAssets(ctx context.Context, conn Execer, channelID, renditionP
 	return queryRows(ctx, conn, scanChannelFillerAsset, `
 		SELECT cfa.channel_id, cfa.weight, cfa.enabled,
 		       fa.id, fa.media_id, fa.label, fa.kind, fa.enabled, fa.created_at_ms,
-		       m.path, m.title, m.scheduling_group, m.duration_ms,
+		       m.path, m.title, COALESCE(CASE WHEN c.kind = 'movie' THEN 'movie:' || c.name ELSE c.name END, m.scheduling_group), m.duration_ms,
 		       p.id, p.status, p.packaged_duration_ms, p.error
 		FROM channel_filler_assets cfa
 		JOIN filler_assets fa ON fa.id = cfa.asset_id
 		JOIN media m ON m.id = fa.media_id
+		LEFT JOIN collections c ON c.id = m.collection_id
 		LEFT JOIN media_packages p
 		  ON p.media_id = m.id
 		 AND p.rendition_profile = ?
@@ -216,21 +217,37 @@ func RegisterFillerAssetsFromDirectory(ctx context.Context, conn *sql.DB, dir st
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+
+	type fillerAssetRegistration struct {
+		mediaID string
+		label   string
+	}
+	var registrations []fillerAssetRegistration
 	for rows.Next() {
 		var mediaID, label string
 		if err := rows.Scan(&mediaID, &label); err != nil {
 			continue
 		}
+		registrations = append(registrations, fillerAssetRegistration{mediaID: mediaID, label: label})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, r := range registrations {
 		id := uuid.New().String()
 		if _, err := conn.ExecContext(ctx, `
 			INSERT OR IGNORE INTO filler_assets (id, media_id, label, kind, enabled, created_at_ms)
 			VALUES (?, ?, ?, 'filler', 1, ?)`,
-			id, mediaID, label, nowMs); err != nil {
+			id, r.mediaID, r.label, nowMs); err != nil {
 			return err
 		}
 	}
-	return rows.Err()
+	return nil
 }
 
 func scanFillerAsset(row scanner) (FillerAsset, error) {
@@ -258,7 +275,7 @@ func scanChannelFillerAsset(row scanner) (ChannelFillerAsset, error) {
 	item.Enabled = assetEnabled == 1
 	item.ChannelEnabled = channelEnabled == 1
 	item.Title = title.String
-	item.SchedulingGroup = group.String
+	item.CollectionName = group.String
 	if pkgID.Valid {
 		v := pkgID.String
 		item.PackageID = &v

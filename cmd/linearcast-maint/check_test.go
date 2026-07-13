@@ -7,14 +7,8 @@ import (
 	"testing"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/schedcheck"
 )
-
-func backfillScheduleAnchors(t *testing.T, conn *sql.DB, channelID string) {
-	t.Helper()
-	if err := db.BackfillScheduleEntryAnchorsForChannel(conn, channelID); err != nil {
-		t.Fatalf("backfill schedule anchors for %s: %v", channelID, err)
-	}
-}
 
 func newScheduleCLITestDB(t *testing.T) *sql.DB {
 	t.Helper()
@@ -36,7 +30,7 @@ func TestCheckScheduleIntegrityPassesCleanSchedule(t *testing.T) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -47,8 +41,8 @@ func TestCheckScheduleIntegrityPassesCleanSchedule(t *testing.T) {
 	}
 	dur := int64(12000)
 	for _, pkg := range []db.MediaPackage{
-		{ID: "pkg-m1", MediaID: "m1", RenditionProfile: "h264-main-1080p", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
-		{ID: "pkg-m2", MediaID: "m2", RenditionProfile: "h264-main-1080p", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		{ID: "pkg-m1", MediaID: "m1", RenditionProfile: "h264-1080p-8mbps", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		{ID: "pkg-m2", MediaID: "m2", RenditionProfile: "h264-1080p-8mbps", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
 	} {
 		if err := db.UpsertMediaPackage(context.Background(), conn, pkg); err != nil {
 			t.Fatalf("upsert package %s: %v", pkg.ID, err)
@@ -61,12 +55,12 @@ func TestCheckScheduleIntegrityPassesCleanSchedule(t *testing.T) {
 		t.Fatalf("insert schedule: %v", err)
 	}
 
-	issues, err := checkScheduleIntegrity(conn, integrityOptions{FromMs: 0, ToMs: 24000, GapMs: 30000})
+	result, err := schedcheck.Check(context.Background(), conn, schedcheck.Options{FromMs: 0, ToMs: 24000, GapMs: 30000})
 	if err != nil {
 		t.Fatalf("check integrity: %v", err)
 	}
-	if len(issues) != 0 {
-		t.Fatalf("issues=%+v, want none", issues)
+	if len(result.Issues) != 0 {
+		t.Fatalf("issues=%+v, want none", result.Issues)
 	}
 }
 
@@ -76,7 +70,7 @@ func TestCheckScheduleIntegrityReportsOperationalIssues(t *testing.T) {
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
 			playback_mode, required_package_profile
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p')`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -90,10 +84,10 @@ func TestCheckScheduleIntegrityReportsOperationalIssues(t *testing.T) {
 	}
 	dur := int64(12000)
 	for _, pkg := range []db.MediaPackage{
-		{ID: "pkg-ready", MediaID: "m-ready", RenditionProfile: "h264-main-1080p", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
-		{ID: "pkg-overlap", MediaID: "m-overlap", RenditionProfile: "h264-main-1080p", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
-		{ID: "pkg-gap", MediaID: "m-gap", RenditionProfile: "h264-main-1080p", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
-		{ID: "pkg-invalid", MediaID: "m-invalid", RenditionProfile: "h264-main-1080p", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		{ID: "pkg-ready", MediaID: "m-ready", RenditionProfile: "h264-1080p-8mbps", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		{ID: "pkg-overlap", MediaID: "m-overlap", RenditionProfile: "h264-1080p-8mbps", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		{ID: "pkg-gap", MediaID: "m-gap", RenditionProfile: "h264-1080p-8mbps", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
+		{ID: "pkg-invalid", MediaID: "m-invalid", RenditionProfile: "h264-1080p-8mbps", Status: db.PackageStatusReady, PackagedDurationMs: &dur, CreatedAtMs: 1, UpdatedAtMs: 1},
 	} {
 		if err := db.UpsertMediaPackage(context.Background(), conn, pkg); err != nil {
 			t.Fatalf("upsert package %s: %v", pkg.ID, err)
@@ -122,17 +116,23 @@ func TestCheckScheduleIntegrityReportsOperationalIssues(t *testing.T) {
 		t.Fatalf("insert missing media schedule: %v", err)
 	}
 
-	issues, err := checkScheduleIntegrity(conn, integrityOptions{ChannelID: "ch", FromMs: 0, ToMs: 120000, GapMs: 30000})
+	result, err := schedcheck.Check(context.Background(), conn, schedcheck.Options{ChannelID: "ch", FromMs: 0, ToMs: 120000, GapMs: 30000})
 	if err != nil {
 		t.Fatalf("check integrity: %v", err)
 	}
-	kinds := map[string]int{}
-	for _, issue := range issues {
+	kinds := map[schedcheck.IssueKind]int{}
+	for _, issue := range result.Issues {
 		kinds[issue.Kind]++
 	}
-	for _, kind := range []string{"overlap", "gap", "package_not_ready", "invalid_alignment", "missing_media"} {
+	for _, kind := range []schedcheck.IssueKind{
+		schedcheck.KindOverlap,
+		schedcheck.KindGap,
+		schedcheck.KindPackageNotReady,
+		schedcheck.KindInvalidAlignment,
+		schedcheck.KindMissingMedia,
+	} {
 		if kinds[kind] == 0 {
-			t.Fatalf("missing issue kind %s in %+v", kind, issues)
+			t.Fatalf("missing issue kind %s in %+v", kind, result.Issues)
 		}
 	}
 }

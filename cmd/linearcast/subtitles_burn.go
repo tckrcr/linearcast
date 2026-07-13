@@ -7,49 +7,99 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
-	"github.com/tckrcr/linearcast/internal/packager"
+	"github.com/tckrcr/linearcast/internal/subtitlepolicy"
 )
+
+var loggedOnDemandSubtitleDecisions sync.Map
 
 type burnSubtitleTrackResponse struct {
 	Language    string `json:"language"`
+	Mode        string `json:"mode"`
 	StreamIndex int    `json:"streamIndex"`
 	Codec       string `json:"codec,omitempty"`
 	Forced      bool   `json:"forced"`
 	Label       string `json:"label"`
 }
 
-func (a *app) burnSubtitleStreamIndexForMedia(ctx context.Context, channelID, mediaID string) int {
-	if a.sessions == nil {
+func (a *app) burnSubtitleStreamIndexForMedia(ctx context.Context, channelID, mediaID string, profile packageprofile.Profile) int {
+	mgr := a.encodingManagerForChannel(channelID)
+	if mgr == nil {
 		return -1
 	}
-	lang := a.sessions.BurnSubtitleLanguage(channelID)
-	if lang == "" {
-		return -1
-	}
-	if media, err := db.MediaByID(ctx, a.dbConn, mediaID); err == nil && media != nil {
-		if err := packager.BackfillSubtitleTracks(ctx, a.dbConn, media.ID, media.Path, "", nil); err != nil {
-			log.Printf("WARN burn subtitle admission inventory channel=%s media=%s: %v", channelID, mediaID, err)
-		}
-	}
-	tracks, err := db.BitmapSubtitleTracksForMedia(ctx, a.dbConn, mediaID)
+	tracks, err := a.bitmapSubtitleTracksForMedia(ctx, channelID, mediaID)
 	if err != nil {
 		log.Printf("WARN burn subtitle track lookup channel=%s media=%s: %v", channelID, mediaID, err)
 		return -1
 	}
-	for _, t := range tracks {
-		if strings.EqualFold(t.Language, lang) {
-			return t.StreamIndex
+	if lang := mgr.BurnSubtitleLanguage(channelID); lang != "" {
+		for _, t := range tracks {
+			if strings.EqualFold(t.Language, lang) {
+				logOnDemandSubtitleDecision(channelID, mediaID, "burn", "manual_language", t.StreamIndex, strings.ToLower(t.Language))
+				return t.StreamIndex
+			}
 		}
+		return -1
 	}
-	return -1
+	decision := subtitlepolicy.Resolve(subtitlepolicy.Request{
+		Mode:     subtitlepolicy.Mode(profile.Subtitles.Mode),
+		Language: profile.Subtitles.Language,
+	}, profile, tracks)
+	if decision.Action != subtitlepolicy.ActionBurn {
+		return -1
+	}
+	logOnDemandSubtitleDecision(channelID, mediaID, string(decision.Action), string(decision.Reason), decision.StreamIndex, decision.Language)
+	return decision.StreamIndex
+}
+
+func logOnDemandSubtitleDecision(channelID, mediaID, action, reason string, streamIndex int, language string) {
+	key := fmt.Sprintf("%s|%s|%s|%s|%d|%s", channelID, mediaID, action, reason, streamIndex, language)
+	if _, loaded := loggedOnDemandSubtitleDecisions.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	log.Printf("INFO on-demand subtitle decision channel_id=%s media_id=%s action=%s reason=%s stream_index=%d language=%s",
+		channelID, mediaID, action, reason, streamIndex, language)
+}
+
+func (a *app) bitmapSubtitleTracksForMedia(ctx context.Context, channelID, mediaID string) ([]db.PackageTrack, error) {
+	media, err := db.MediaByID(ctx, a.dbConn, mediaID)
+	if err != nil {
+		return nil, err
+	}
+	if media == nil {
+		return nil, nil
+	}
+	infos := a.subtitleStreams(ctx, media.ID, media.Path)
+	tracks := make([]db.PackageTrack, 0, len(infos))
+	for _, si := range infos {
+		if !si.IsBitmap {
+			continue
+		}
+		lang := strings.ToLower(strings.TrimSpace(si.Language))
+		if lang == "" {
+			lang = "und"
+		}
+		tracks = append(tracks, db.PackageTrack{
+			Kind:        "subtitle",
+			StreamIndex: si.Index,
+			Language:    lang,
+			Title:       si.Title,
+			Codec:       strings.ToLower(si.Codec),
+			Source:      db.TrackSourceEmbeddedBitmap,
+			Forced:      si.Forced,
+		})
+	}
+	return tracks, nil
 }
 
 type burnSubtitleListResponse struct {
 	ActiveLanguage string                      `json:"activeLanguage,omitempty"`
+	Mode           string                      `json:"mode,omitempty"`
+	Unavailable    string                      `json:"unavailable,omitempty"`
 	Tracks         []burnSubtitleTrackResponse `json:"tracks"`
 }
 
@@ -63,8 +113,8 @@ func (a *app) handleBurnSubtitleList(w http.ResponseWriter, r *http.Request) {
 	if rt == nil {
 		return
 	}
-	if _, ok := a.burnSubtitleProfile(r, rt); !ok {
-		writeBurnSubtitleJSON(w, burnSubtitleListResponse{})
+	if _, unavailable := a.burnSubtitleProfile(r, rt); unavailable != "" {
+		writeBurnSubtitleJSON(w, burnSubtitleListResponse{Mode: "burn", Unavailable: unavailable, Tracks: []burnSubtitleTrackResponse{}})
 		return
 	}
 	tracks, err := a.burnSubtitleTracksForWindow(r, channelID)
@@ -73,10 +123,10 @@ func (a *app) handleBurnSubtitleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	active := ""
-	if a.sessions != nil {
-		active = a.sessions.BurnSubtitleLanguage(channelID)
+	if mgr := a.encodingManagerForChannel(channelID); mgr != nil {
+		active = mgr.BurnSubtitleLanguage(channelID)
 	}
-	writeBurnSubtitleJSON(w, burnSubtitleListResponse{ActiveLanguage: active, Tracks: tracks})
+	writeBurnSubtitleJSON(w, burnSubtitleListResponse{ActiveLanguage: active, Mode: "burn", Tracks: tracks})
 }
 
 func (a *app) handleBurnSubtitleSet(w http.ResponseWriter, r *http.Request) {
@@ -85,8 +135,8 @@ func (a *app) handleBurnSubtitleSet(w http.ResponseWriter, r *http.Request) {
 	if rt == nil {
 		return
 	}
-	if _, ok := a.burnSubtitleProfile(r, rt); !ok {
-		http.Error(w, "burn-in subtitles require an on-demand transcode channel", http.StatusBadRequest)
+	if _, unavailable := a.burnSubtitleProfile(r, rt); unavailable != "" {
+		http.Error(w, unavailable, http.StatusBadRequest)
 		return
 	}
 	var req burnSubtitleSetRequest
@@ -113,21 +163,27 @@ func (a *app) handleBurnSubtitleSet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if a.sessions != nil {
-		a.sessions.SetBurnSubtitleLanguage(channelID, lang)
+	if mgr := a.encodingManagerForChannel(channelID); mgr != nil {
+		mgr.SetBurnSubtitleLanguage(channelID, lang)
 	}
-	writeBurnSubtitleJSON(w, burnSubtitleListResponse{ActiveLanguage: lang})
+	writeBurnSubtitleJSON(w, burnSubtitleListResponse{ActiveLanguage: lang, Mode: "burn"})
 }
 
-func (a *app) burnSubtitleProfile(r *http.Request, rt *channelRuntime) (*packageprofile.Profile, bool) {
-	if rt.PrefillMode != "on_demand" || rt.PlaybackMode != db.PlaybackModePackaged {
-		return nil, false
+func (a *app) burnSubtitleProfile(r *http.Request, rt *channelRuntime) (*packageprofile.Profile, string) {
+	if rt.PlaybackMode != db.PlaybackModePackaged {
+		return nil, "burn-in subtitles require packaged playback"
+	}
+	if rt.PrefillMode == "eager" {
+		return nil, "burn-in subtitles require an on-demand channel"
 	}
 	p, err := db.GetPackageProfile(r.Context(), a.dbConn, rt.RequiredPackageProfile)
 	if err != nil || p == nil {
-		return nil, false
+		return nil, "burn-in subtitles require a valid package profile"
 	}
-	return p, p.Video.Mode == packageprofile.VideoModeTranscode
+	if p.Video.Mode != packageprofile.VideoModeTranscode {
+		return nil, "burn-in subtitles require a transcode video profile"
+	}
+	return p, ""
 }
 
 func (a *app) burnSubtitleTracksForWindow(r *http.Request, channelID string) ([]burnSubtitleTrackResponse, error) {
@@ -139,17 +195,7 @@ func (a *app) burnSubtitleTracksForWindow(r *http.Request, channelID string) ([]
 	seen := map[string]bool{}
 	var out []burnSubtitleTrackResponse
 	for _, entry := range entries {
-		media, err := db.MediaByID(r.Context(), a.dbConn, entry.MediaID)
-		if err != nil {
-			return nil, fmt.Errorf("media %s: %w", entry.MediaID, err)
-		}
-		if media == nil {
-			continue
-		}
-		if err := packager.BackfillSubtitleTracks(r.Context(), a.dbConn, media.ID, media.Path, "", nil); err != nil {
-			log.Printf("WARN burn subtitle inventory media=%s path=%s: %v", media.ID, media.Path, err)
-		}
-		tracks, err := db.BitmapSubtitleTracksForMedia(r.Context(), a.dbConn, media.ID)
+		tracks, err := a.bitmapSubtitleTracksForMedia(r.Context(), channelID, entry.MediaID)
 		if err != nil {
 			return nil, err
 		}
@@ -161,6 +207,7 @@ func (a *app) burnSubtitleTracksForWindow(r *http.Request, channelID string) ([]
 			seen[lang] = true
 			out = append(out, burnSubtitleTrackResponse{
 				Language:    lang,
+				Mode:        "burn",
 				StreamIndex: t.StreamIndex,
 				Codec:       t.Codec,
 				Forced:      t.Forced,

@@ -6,8 +6,8 @@ exposed for operating a deployment.
 ## Playback (`:8888`)
 
 ```
-GET /channel/<id>/stream.m3u8      HLS playlist
-GET /channel/<id>/now              What's on (JSON)
+GET /channels/<id>/stream.m3u8     HLS playlist
+GET /channels/<id>/now              What's on (JSON)
 GET /healthz                       Liveness
 GET /readyz                        Readiness (503 until packages are ready)
 GET /status                        Per-channel packaged playback state
@@ -24,8 +24,11 @@ GET    /api/now                          Verbose grid for the UI
 GET    /api/playing                      Per-channel current item
 GET    /api/queue-depth                  Schedule coverage + cache lookahead
 GET    /api/channels                     Channel list
-POST   /api/channels/{id}/disable        Disable a channel
-POST   /api/channels/{id}/enable         Enable a channel
+PATCH  /api/channels/{id}                 Update channel flags (enabled,
+                                       hiddenFromGuide)
+PUT    /api/channels/{id}/on-demand-profile
+                                         Change the package profile for an
+                                         on-demand packaged channel
 DELETE /api/channels/{id}                Delete a disabled channel; add
                                          ?reclaim-encodes=true to delete
                                          unshared packaged encodes for its media
@@ -36,9 +39,26 @@ DELETE /api/admin/plex/config            Clear the admin Plex connection
 GET    /api/admin/plex/libraries         List Plex libraries
 POST   /api/admin/plex/scan              Scan a Plex library into the DB
 
-GET    /api/schedule-builder/shows       Media-group browse for the builder
-GET    /api/schedule-builder/package-candidates
-POST   /api/schedule-builder/channels    Create a channel from the builder
+GET    /api/public-server-url            Read the configured public origin used
+                                         for copyable IPTV/DVR URLs
+PUT    /api/public-server-url            Set the public origin; empty means
+                                         use the current browser origin
+GET    /api/art/media/{id}               Public proxied media artwork for
+                                         XMLTV/IPTV clients
+
+GET    /api/admin/media-sources/status   Media-source readiness for the admin UI
+GET    /api/media/inventory              Paginated media inventory for the
+                                         Inventory panel
+PATCH  /api/media/{id}                   Update media title, show
+                                         (`collectionName`), seasonNumber, or
+                                         episodeNumber
+POST   /api/media/collections/bulk       Preview or apply bulk collection
+                                         set/clear/rename operations
+GET    /api/media/shows                  Collection-backed show browse for the
+                                         Schedule Builder
+GET    /api/media/package-candidates
+GET    /api/filler-assets/candidates
+POST   /api/channels                     Create a channel
 
 GET    /api/admin/maintenance/package-integrity
 DELETE /api/admin/maintenance/packages
@@ -48,12 +68,19 @@ POST   /api/channels/{id}/schedule/gaps/fill
                                          attached ready filler asset slice
 ```
 
-`POST /api/channels` and `POST /api/schedule-builder/channels` accept optional
-`scheduleMode` (`back_to_back` or `slot_grid`) and `slotDurationMs` for opt-in
-slot-grid scheduling. They also accept `playbackMode: "plex_relay"` for
-scheduled Plex relay channels; relay channels require Plex-imported media and
-do not queue linearcast packages. `GET /api/channels` returns those fields for
-each channel.
+`POST /api/channels` accepts optional `scheduleMode` (`back_to_back` or
+`slot_grid`) and `slotDurationMs` for opt-in slot-grid scheduling. It also
+channels require Plex-imported media and do not queue linearcast packages.
+It accepts `prefillMode: "on_demand"` for packaged channels that should encode
+at tune-in instead of pre-encoding the whole channel. `GET /api/channels`
+returns those fields for each channel.
+
+`PUT /api/channels/{id}/on-demand-profile` accepts `{"profile":"<name>"}` and
+only works for packaged channels whose `prefillMode` is `on_demand`. It changes
+the channel's required package profile without clearing schedule rows or queuing
+durable package work; playback starts using the new profile after the next
+runtime refresh/viewer request. Pre-encoded channels should be
+recreated when their profile strategy changes.
 
 `POST /api/channels/{id}/schedule/gaps/fill` accepts `mediaId`, `startMs`, an
 optional `offsetMs`, and an optional `offsetMode`. `offsetMode` defaults to
@@ -69,12 +96,36 @@ on-disk artifacts for every media item from the deleted channel that is not
 still referenced by another channel; `?force=true` includes shared media.
 
 `GET /api/admin/maintenance/package-integrity` checks package files, optionally
-scoped with `?media=<id>`. `DELETE /api/admin/maintenance/packages?media=<id>`
+scoped with `?media=<id>`. `POST /api/admin/maintenance/import-packages`
+reattaches finalized package directories already on disk to existing media rows
+without re-encoding video; finalize also rebuilds package-owned subtitle track
+metadata from the source. `DELETE /api/admin/maintenance/packages?media=<id>`
 reclaims package rows and artifacts for one media item; it defaults to dry-run,
 and `?dry-run=false&force=true` commits deletion including referenced media.
 
 Jellyfin mirrors the Plex `status`/`config`/`libraries`/`scan` shape under
 `/api/admin/jellyfin/*`.
+
+Plex scans hydrate media titles, descriptions, ratings, thumbnail paths, and
+collection genres when Plex provides them. Public artwork URLs in XMLTV point
+at `/api/art/media/{id}`; that route fetches the configured Plex thumbnail with
+the stored token server-side, so clients never receive the Plex token.
+
+`POST /api/media/collections/bulk` accepts `action` (`set`, `clear`, or
+`rename`), either `mediaIds` or an inventory-style `filter`, and `dryRun`.
+`set` and `rename` require `collection`; `rename` also requires
+`fromCollection`. A dry run returns the matched row count without writing.
+Collection writes attach media rows to canonical `collections` records.
+
+`PATCH /api/media/{id}` accepts any subset of `title`, `collectionName`,
+`seasonNumber`, and `episodeNumber`. Empty strings clear text fields; `null`
+clears season or episode ordering. Non-null ordering values must be positive
+integers.
+
+`GET /api/media/shows` returns video collections as shows with season summaries
+derived from each row's `SxxEyy` title/path metadata. New filename ingest writes
+TV collections at the show level rather than exposing half-season `H1`/`H2`
+buckets.
 
 ## Observability
 

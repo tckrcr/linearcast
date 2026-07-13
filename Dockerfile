@@ -1,7 +1,14 @@
 # syntax=docker/dockerfile:1.7
 
 ARG GO_VERSION=1.26.1
-ARG ALPINE_VERSION=3.22
+
+# Runtime base pinned to an alpine:edge snapshot that ships ffmpeg 8.1.2, which
+# carries the 2026-01-26 readrate_initial_burst fix (issue #21510). Stable Alpine
+# (3.22/3.23) still ships the broken 8.0.1 where the burst is a silent no-op, so
+# on-demand HEVC long-GOP cold-start cannot fast-fill. edge is a rolling target,
+# so the DIGEST is the version pin: an unpinned `apk add ffmpeg` would drift off
+# the verified build. To bump, see deploy/ffmpeg-pin.md (records the verification).
+ARG ALPINE_RUNTIME=alpine:edge@sha256:9a341ff2287c54b86425cbee0141114d811ae69d88a36019087be6d896cef241
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 
@@ -22,9 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-extender ./cmd/linearcast-extender && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-ingest ./cmd/linearcast-ingest && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-encoder ./cmd/linearcast-encoder && \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-maint ./cmd/linearcast-maint && \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-subtitle-extract ./cmd/linearcast-subtitle-extract && \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-subtitle-audit ./cmd/linearcast-subtitle-audit
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-maint ./cmd/linearcast-maint
 
 # Cross-compile linearcast-encoder for all supported client platforms so the
 # admin server can hand them out from the UI. These are the binaries operators
@@ -50,9 +55,12 @@ COPY web-ui/src ./src
 
 RUN npm run build
 
-FROM alpine:${ALPINE_VERSION} AS runtime
+FROM ${ALPINE_RUNTIME} AS runtime
 
-RUN apk add --no-cache bash ca-certificates ffmpeg nginx tzdata && \
+# ffmpeg version is fixed by the ALPINE_RUNTIME digest above (8.1.2), so no apk
+# version pin here — edge drops old -rN revisions, which would break a pinned
+# build. The digest snapshot is what guarantees a known-good, burst-capable build.
+RUN apk add --no-cache bash ca-certificates ffmpeg gettext-envsubst nginx tzdata && \
     mkdir -p /app /data/linearcast /data/cache /data/media \
       /usr/share/nginx/html /tmp/nginx/client-body /tmp/nginx/proxy \
       /tmp/nginx/fastcgi /tmp/nginx/uwsgi /tmp/nginx/scgi && \
@@ -65,11 +73,9 @@ COPY --from=build /out/linearcast-extender /usr/local/bin/linearcast-extender
 COPY --from=build /out/linearcast-ingest /usr/local/bin/linearcast-ingest
 COPY --from=build /out/linearcast-encoder /usr/local/bin/linearcast-encoder
 COPY --from=build /out/linearcast-maint /usr/local/bin/linearcast-maint
-COPY --from=build /out/linearcast-subtitle-extract /usr/local/bin/linearcast-subtitle-extract
-COPY --from=build /out/linearcast-subtitle-audit /usr/local/bin/linearcast-subtitle-audit
 COPY --from=build /out/encoder-dist /opt/linearcast/encoder-dist
 COPY --from=web-build /src/web-ui/dist /usr/share/nginx/html
-COPY deploy/nginx.single.conf /etc/nginx/nginx.conf
+COPY deploy/nginx.single.conf.template /etc/nginx/nginx.conf.template
 COPY deploy/linearcast-entrypoint.sh /usr/local/bin/linearcast-entrypoint
 RUN chmod +x /usr/local/bin/linearcast-entrypoint
 

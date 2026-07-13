@@ -2,6 +2,8 @@ package admin
 
 import (
 	"archive/tar"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +16,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
-	"github.com/tckrcr/linearcast/internal/packageid"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
 	"github.com/tckrcr/linearcast/internal/packager"
 )
@@ -88,7 +90,7 @@ func (a *App) handleEncoderClaim(w http.ResponseWriter, r *http.Request) {
 
 	nowMs := a.now().UTC().UnixMilli()
 	for _, c := range cands {
-		packageID := packageid.For(c.MediaID, c.Profile)
+		packageID := layout.ID(c.MediaID, c.Profile)
 		ok, err := db.ClaimPackage(r.Context(), a.dbConn, db.ClaimRequest{
 			MediaID:   c.MediaID,
 			Profile:   c.Profile,
@@ -98,8 +100,12 @@ func (a *App) handleEncoderClaim(w http.ResponseWriter, r *http.Request) {
 			NowMs:     nowMs,
 		})
 		if err != nil {
-			a.logger.Printf("encoder claim media=%s profile=%s encoder=%s error: %v",
-				c.MediaID, c.Profile, enc.ID, err)
+			a.logger.Warn("claim failed",
+				"media", c.MediaID,
+				"profile", c.Profile,
+				"encoder", enc.ID,
+				"err", err,
+			)
 			continue
 		}
 		if !ok {
@@ -109,8 +115,12 @@ func (a *App) handleEncoderClaim(w http.ResponseWriter, r *http.Request) {
 		// Claimed. Load media + profile config for the response.
 		media, err := db.MediaByID(r.Context(), a.dbConn, c.MediaID)
 		if err != nil || media == nil {
-			a.logger.Printf("encoder claim media=%s profile=%s encoder=%s claimed but media gone: %v",
-				c.MediaID, c.Profile, enc.ID, err)
+			a.logger.Warn("claimed but media gone",
+				"media", c.MediaID,
+				"profile", c.Profile,
+				"encoder", enc.ID,
+				"err", err,
+			)
 			// Mark the claim failed; the encoder can't do anything with a vanished file.
 			_, _ = db.FailEncoderJob(r.Context(), a.dbConn, packageID, enc.ID,
 				"terminal", "source media row vanished after claim", 0, a.now().UTC().UnixMilli())
@@ -118,7 +128,10 @@ func (a *App) handleEncoderClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		profile, err := db.GetPackageProfile(r.Context(), a.dbConn, c.Profile)
 		if err != nil || profile == nil {
-			a.logger.Printf("encoder claim profile=%s lookup failed: %v", c.Profile, err)
+			a.logger.Warn("profile lookup failed",
+				"profile", c.Profile,
+				"err", err,
+			)
 			_, _ = db.FailEncoderJob(r.Context(), a.dbConn, packageID, enc.ID,
 				"terminal", "profile config not found", 0, a.now().UTC().UnixMilli())
 			continue
@@ -217,6 +230,13 @@ func (a *App) handleEncoderHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, "heartbeat_failed", err.Error())
 		return
 	}
+	if req.ProgressPct != nil {
+		a.encoderBroadcaster.publish(encoderProgressEvent{
+			PackageID:      packageID,
+			ProgressPct:    req.ProgressPct,
+			LeaseExpiresMs: newLease,
+		})
+	}
 	writeJSON(w, encoderHeartbeatResponse{LeaseExpiresMs: newLease})
 }
 
@@ -275,12 +295,11 @@ func (a *App) handleEncoderComplete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "media_not_found", "media row not found")
 		return
 	}
-	outputRoot := a.effectivePackageRoot()
-	if outputRoot == "" {
-		writeError(w, http.StatusInternalServerError, "package_root_missing", "LINEARCAST_PACKAGE_ROOT or CACHE_DIR is required")
+	if a.cache.Root() == "" {
+		writeError(w, http.StatusInternalServerError, "package_root_missing", "CACHE_DIR is required")
 		return
 	}
-	packageRoot := filepath.Join(outputRoot, pkg.MediaID, pkg.RenditionProfile)
+	packageRoot := a.cache.PackageRoot(pkg.MediaID, pkg.RenditionProfile)
 	if err := receivePackageTar(r.Body, packageRoot); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_package_tar", err.Error())
 		return
@@ -289,16 +308,18 @@ func (a *App) handleEncoderComplete(w http.ResponseWriter, r *http.Request) {
 		MediaPath:        media.Path,
 		MediaID:          pkg.MediaID,
 		Profile:          pkg.RenditionProfile,
-		OutputRoot:       outputRoot,
+		OutputRoot:       a.cache.PackagesDir(),
 		PackageID:        packageID,
 		NowMs:            a.now().UTC().UnixMilli(),
 		SourceDurationMs: media.DurationMs,
 	})
 	if err != nil {
+		a.cleanupUnpromotedPackageUpload(packageID, packageRoot, "finalize_failed")
 		writeError(w, http.StatusBadRequest, "finalize_failed", err.Error())
 		return
 	}
 	if err := db.CompleteEncoderJob(r.Context(), a.dbConn, packageID, enc.ID, finalized, a.now().UTC().UnixMilli()); err != nil {
+		a.cleanupUnpromotedPackageUpload(packageID, packageRoot, "complete_failed")
 		writeError(w, classifyJobOpError(err), "complete_failed", err.Error())
 		return
 	}
@@ -314,14 +335,57 @@ func (a *App) handleEncoderComplete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) effectivePackageRoot() string {
-	if strings.TrimSpace(a.packageRoot) != "" {
-		return strings.TrimSpace(a.packageRoot)
+func (a *App) cleanupUnpromotedPackageUpload(packageID, packageRoot, stage string) {
+	if err := os.RemoveAll(packageRoot); err != nil {
+		a.logger.Warn("encoder complete cleanup",
+			"stage", stage,
+			"package_id", packageID,
+			"path", packageRoot,
+			"err", err,
+		)
 	}
-	if strings.TrimSpace(a.cacheDir) != "" {
-		return filepath.Join(strings.TrimSpace(a.cacheDir), "packages")
+	if err := db.DeletePackagedSegments(context.Background(), a.dbConn, packageID); err != nil {
+		a.logger.Warn("encoder complete segment cleanup",
+			"stage", stage,
+			"package_id", packageID,
+			"err", err,
+		)
 	}
-	return ""
+	if err := a.requeueLeaselessCompletionFailure(packageID, stage); err != nil {
+		a.logger.Warn("encoder complete requeue cleanup",
+			"stage", stage,
+			"package_id", packageID,
+			"err", err,
+		)
+	}
+}
+
+func (a *App) requeueLeaselessCompletionFailure(packageID, stage string) error {
+	ctx := context.Background()
+	var status string
+	var leases int
+	err := a.dbConn.QueryRowContext(ctx, `
+		SELECT p.status, COUNT(j.package_id)
+		  FROM media_packages p
+		  LEFT JOIN encoder_jobs j ON j.package_id = p.id
+		 WHERE p.id = ?
+		 GROUP BY p.id, p.status`, packageID).Scan(&status, &leases)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if status != string(db.PackageStatusProcessing) || leases > 0 {
+		return nil
+	}
+	settings, err := db.GetEncoderSweeperSettings(ctx, a.dbConn)
+	if err != nil {
+		return fmt.Errorf("read sweeper settings: %w", err)
+	}
+	_, err = db.MarkPackageFailedWithKind(ctx, a.dbConn, packageID, "transient",
+		"encoder complete failed before ready: "+stage, settings.MaxAttempts, a.now().UTC().UnixMilli())
+	return err
 }
 
 func (a *App) requireEncoderLease(packageID, encoderID string) error {
@@ -385,21 +449,21 @@ func receivePackageTar(body io.Reader, packageRoot string) error {
 		}
 		seen[name] = true
 	}
-	if !seen["init.mp4"] {
-		return errors.New("package tar must contain init.mp4")
+	if !seen[layout.InitName] {
+		return fmt.Errorf("package tar must contain %s", layout.InitName)
 	}
-	if !seen["stream.m3u8"] {
-		return errors.New("package tar must contain stream.m3u8")
+	if !seen[layout.PlaylistName] {
+		return fmt.Errorf("package tar must contain %s", layout.PlaylistName)
 	}
 	hasSegment := false
 	for name := range seen {
-		if strings.HasPrefix(name, "seg") && strings.HasSuffix(name, ".m4s") {
+		if layout.IsSegment(name) {
 			hasSegment = true
 			break
 		}
 	}
 	if !hasSegment {
-		return errors.New("package tar must contain at least one seg*.m4s")
+		return fmt.Errorf("package tar must contain at least one %s", layout.SegmentGlob)
 	}
 	if err := os.RemoveAll(packageRoot); err != nil {
 		return fmt.Errorf("clear package root: %w", err)
@@ -425,7 +489,7 @@ func validatePackageTarEntry(hdr *tar.Header) (string, error) {
 	if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 		return "", fmt.Errorf("tar entry %q is not a regular file", hdr.Name)
 	}
-	if name != "init.mp4" && name != "stream.m3u8" && !(strings.HasPrefix(name, "seg") && strings.HasSuffix(name, ".m4s")) {
+	if name != layout.InitName && name != layout.PlaylistName && !layout.IsSegment(name) {
 		return "", fmt.Errorf("tar entry %q is not part of the package contract", hdr.Name)
 	}
 	return name, nil

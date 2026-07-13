@@ -9,26 +9,16 @@ import (
 )
 
 var StandardVideoABRLadder = []string{
-	packageprofile.H264CopySourceName,
 	packageprofile.DefaultName,
-	packageprofile.H264Main720pName,
-	packageprofile.H264Main480pName,
-}
-
-var StandardVideoNVENCABRLadder = []string{
-	packageprofile.H264NVENCCopySrcName,
-	packageprofile.H264NVENC1080pName,
-	packageprofile.H264NVENC720pName,
-	packageprofile.H264NVENC480pName,
+	packageprofile.H2641080p20MbpsName,
 }
 
 // StandardVideoHDRABRLadder is the ABR ladder for HDR-capable channels. The
-// hevc-copy-source rung preserves HDR metadata (PQ/HLG); the 1080p SDR rung
-// provides a fallback for non-HDR clients or constrained links. No 720p/480p
-// SDR rungs are included because the binary HDR/SDR split does not benefit
-// from further ABR tiers.
+// hevc-copy-source rung preserves HDR metadata (PQ/HLG); H.264 rungs provide
+// browser-safe SDR fallbacks.
 var StandardVideoHDRABRLadder = []string{
 	packageprofile.HEVCCopySourceName,
+	packageprofile.HEVC2160p40MbpsHDRName,
 	packageprofile.DefaultName,
 }
 

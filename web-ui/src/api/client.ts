@@ -42,6 +42,20 @@ function failure(response: Response, body: any): ApiError {
   return new ApiError(body?.hint ? `${message} ${body.hint}` : message, response.status, body);
 }
 
+// UNAUTHORIZED_EVENT fires whenever a request 401s on a non-auth endpoint —
+// i.e. the session expired out from under an already-loaded page (e.g. after a
+// redeploy restarts the admin). The admin shell listens for it and drops back
+// to the login screen instead of leaving the operator on a half-broken page.
+export const UNAUTHORIZED_EVENT = "linearcast:unauthorized";
+
+function notifyUnauthorized(path: string) {
+  if (typeof window === "undefined") return;
+  // Login / logout / status / change-password report 401 as normal flow
+  // (wrong password, no session yet) and drive their own UI.
+  if (path.startsWith("/api/auth/")) return;
+  window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: ApiFetchOptions = {},
@@ -56,7 +70,10 @@ export async function apiFetch<T = unknown>(
   }
   const response = await fetch(buildPath(path, query), init);
   const body = await readBody(response);
-  if (!response.ok) throw failure(response, body);
+  if (!response.ok) {
+    if (response.status === 401) notifyUnauthorized(path);
+    throw failure(response, body);
+  }
   return body as T;
 }
 
@@ -74,6 +91,7 @@ export async function apiFetchRaw(
   }
   const response = await fetch(buildPath(path, query), init);
   if (!response.ok) {
+    if (response.status === 401) notifyUnauthorized(path);
     const body = await readBody(response);
     throw failure(response, body);
   }

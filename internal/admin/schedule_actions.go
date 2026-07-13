@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/scheduler"
 )
 
@@ -95,11 +96,11 @@ func (a *App) handleChannelFillScheduleGap(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "missing_media_id", "mediaId is required")
 		return
 	}
-	if req.StartMs%segmentMs != 0 {
+	if req.StartMs%db.ScheduleGridMs != 0 {
 		writeError(w, http.StatusBadRequest, "invalid_start_ms", "startMs must be aligned to the schedule segment grid", hintScheduleBoundary)
 		return
 	}
-	if req.OffsetMs < 0 || req.OffsetMs%segmentMs != 0 {
+	if req.OffsetMs < 0 || req.OffsetMs%db.ScheduleGridMs != 0 {
 		writeError(w, http.StatusBadRequest, "invalid_offset_ms", "offsetMs must be non-negative and aligned to the schedule segment grid", hintScheduleBoundary)
 		return
 	}
@@ -177,7 +178,7 @@ func (a *App) handleChannelSaveScheduleWindowOrdered(w http.ResponseWriter, r *h
 	if req.ExtendTail != nil {
 		extendTail = *req.ExtendTail
 	}
-	if req.FromMs%segmentMs != 0 {
+	if req.FromMs%db.ScheduleGridMs != 0 {
 		writeError(w, http.StatusBadRequest, "invalid_from_ms", "fromMs must be aligned to the schedule segment grid", hintScheduleBoundary)
 		return
 	}
@@ -309,7 +310,7 @@ func (a *App) handleChannelUpsertScheduleEntry(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "missing_media_id", "mediaId is required")
 		return
 	}
-	if req.StartMs%segmentMs != 0 {
+	if req.StartMs%db.ScheduleGridMs != 0 {
 		writeError(w, http.StatusBadRequest, "invalid_start_ms", "startMs must be aligned to the schedule segment grid", hintScheduleBoundary)
 		return
 	}

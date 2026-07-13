@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
 import {
   deletePackageProfile,
+  enablePackageProfile,
   getMediaPackageProfileList,
   setDefaultPackagedProfile,
   upsertPackageProfile,
@@ -11,11 +12,16 @@ import styles from "./ProfilesPanel.module.css";
 type EncoderChoice = "cpu" | "apple" | "nvidia" | "copy";
 type ResolutionChoice = "source" | "1080" | "720" | "480";
 type QualityChoice = "good" | "better" | "best";
+// Copy mode is a bitstream remux, so it can't transcode the codec — it can only
+// pass through a source whose codec matches. The choice pins codecRequired so an
+// HEVC/HDR copy profile doesn't fail validation expecting h264.
+type CopyCodecChoice = "h264" | "hevc";
 
 type SimpleProfileDraft = {
   encoder: EncoderChoice;
   resolution: ResolutionChoice;
   quality: QualityChoice;
+  copyCodec: CopyCodecChoice;
 };
 
 type ProfileSettings = Pick<PackageProfile, "video" | "audio">;
@@ -35,6 +41,7 @@ const DEFAULT_SIMPLE_DRAFT: SimpleProfileDraft = {
   encoder: "cpu",
   resolution: "1080",
   quality: "better",
+  copyCodec: "h264",
 };
 
 const ENCODER_OPTIONS: Array<{ value: EncoderChoice; label: string }> = [
@@ -57,10 +64,21 @@ const QUALITY_OPTIONS: Array<{ value: QualityChoice; label: string }> = [
   { value: "best", label: "Best" },
 ];
 
+const COPY_CODEC_OPTIONS: Array<{ value: CopyCodecChoice; label: string }> = [
+  { value: "h264", label: "H.264" },
+  { value: "hevc", label: "HEVC (HDR / 4K)" },
+];
+
 const X264_CRF: Record<QualityChoice, number> = {
   good: 23,
   better: 20,
   best: 18,
+};
+
+const CPU_MAXRATE: Record<QualityChoice, string> = {
+  good: "8000k",
+  better: "20000k",
+  best: "30000k",
 };
 
 const VIDEOTOOLBOX_QUALITY: Record<QualityChoice, number> = {
@@ -89,9 +107,9 @@ const OVERRIDE_META: Record<OverrideKey, { label: string; placeholder?: string; 
 function applicableOverrides(encoder: EncoderChoice): OverrideKey[] {
   switch (encoder) {
     case "cpu":
-      return ["crf", "preset", "scaleHeight", "h264Profile"];
+      return ["crf", "videoMaxBitrate", "preset", "scaleHeight", "h264Profile"];
     case "apple":
-      return ["videoQuality", "scaleHeight", "h264Profile"];
+      return ["videoQuality", "videoMaxBitrate", "scaleHeight", "h264Profile"];
     case "nvidia":
       return ["preset", "videoBitrate", "videoMaxBitrate", "scaleHeight", "h264Profile"];
     case "copy":
@@ -188,21 +206,36 @@ export function ProfilesPanel() {
     }
   }
 
-  const abrProfiles = abrGroupProfiles(profiles);
-  const ladderGroups = buildLadderGroups(profiles);
-  const visibleProfiles = profiles.filter((p) => !isABRProfile(p));
+  async function handleEnable(profile: PackageProfile) {
+    try {
+      setStatus(`Enabling ${profile.name}...`);
+      await enablePackageProfile(profile.name);
+      setStatus(`Enabled ${profile.name}`);
+      loadProfiles();
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  const visibleProfiles = profiles;
 
   return (
     <div className="admin-panel profiles-panel">
       <section className="admin-panel-section">
-        <div className={styles["profiles-panel-header"]}>
-          <h2>Package Profiles</h2>
-          <div className={styles["profiles-panel-actions"]}>
+        <div className="section-headline">
+          <div className="section-headline-main">
+            <h2>Package profiles</h2>
+            <p className="section-purpose">
+              Encoding presets channels package to. Define resolution, codec, and bitrate here, then
+              assign a profile per channel.
+            </p>
+          </div>
+          <div className="section-headline-actions">
             <button type="button" disabled={loading} onClick={() => loadProfiles()}>
-              {loading ? "Refreshing" : "Refresh"}
+              {loading ? "refreshing" : "refresh"}
             </button>
             <button type="button" onClick={() => { setEditing(null); setCloning(null); setShowCreate(true); }}>
-              Create Profile
+              Create profile
             </button>
           </div>
         </div>
@@ -219,44 +252,12 @@ export function ProfilesPanel() {
             <span>Status</span>
             <span>Actions</span>
           </div>
-          {abrProfiles.length > 0 && (
-            <Fragment key="abr-ladder">
-              <div className={`${styles["profiles-list-row"]}${expanded === "abr-ladder" ? " is-expanded" : ""}`} role="row">
-                <div className={styles["profile-identity"]}>
-                  <button
-                    type="button"
-                    className={styles["profile-identity-toggle"]}
-                    onClick={() => setExpanded(expanded === "abr-ladder" ? null : "abr-ladder")}
-                    aria-expanded={expanded === "abr-ladder"}
-                  >
-                    <span className={styles["profile-identity-chevron"]}>{expanded === "abr-ladder" ? "▾" : "▸"}</span>
-                    <span className={styles["profile-identity-text"]}>
-                      <span className={styles["profile-identity-label"]}>Adaptive bitrate</span>
-                      {ladderGroups.map((g) => g.profiles.length > 0 && (
-                        <code key={g.label} className={styles["profile-identity-name"]} style={{ marginRight: "0.5rem" }}>
-                          {g.label} ({g.profiles.length})
-                        </code>
-                      ))}
-                    </span>
-                  </button>
-                </div>
-                <div><span className={`${styles["encoder-badge"]} encoder-cpu`}>ABR</span></div>
-                <div>{formatABROutput(abrProfiles)}</div>
-                <div>{formatABRAudio(abrProfiles)}</div>
-                <div><span className={styles["profile-type"]}>Built-in</span></div>
-                <div><span className={styles["profile-status"]}>{abrProfiles.some((p) => p.disabled) ? "Partial" : "Active"}</span></div>
-                <div className={styles["profile-actions"]} />
-              </div>
-              {expanded === "abr-ladder" && (
-                <div className={styles["profile-detail-row"]} role="row">
-                  <ABRProfileDetail profiles={abrProfiles} ladderGroups={ladderGroups} />
-                </div>
-              )}
-            </Fragment>
-          )}
-          {visibleProfiles.map((p) => {
+          {visibleProfiles.map((p, idx) => {
             const isDefault = p.name === defaultProfile;
             const isExpanded = expanded === p.name;
+            // The last row's actions menu opens upward; opening down would drop
+            // it past the bottom of the list's scroll box and get clipped.
+            const isLastRow = idx === visibleProfiles.length - 1;
             return (
               <Fragment key={p.name}>
                 <div className={`${styles["profiles-list-row"]}${p.isBuiltin ? " is-builtin" : ""}${p.disabled ? " is-disabled" : ""}${isDefault ? " is-default" : ""}${isExpanded ? " is-expanded" : ""}`} role="row">
@@ -292,7 +293,7 @@ export function ProfilesPanel() {
                       ⋯
                     </button>
                     {menuOpen === p.name && (
-                      <div className={styles["profile-actions-menu"]} role="menu">
+                      <div className={`${styles["profile-actions-menu"]}${isLastRow ? ` ${styles["is-drop-up"]}` : ""}`} role="menu">
                         {!p.disabled && !isDefault && (
                           <button
                             type="button"
@@ -318,7 +319,16 @@ export function ProfilesPanel() {
                         >
                           Clone
                         </button>
-                        {!p.disabled && (
+                        {p.disabled && (
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => { setMenuOpen(null); void handleEnable(p); }}
+                          >
+                            Enable
+                          </button>
+                        )}
+                        {(!p.disabled || (!p.isBuiltin && !profileHasReferences(p))) && (
                           <button
                             type="button"
                             role="menuitem"
@@ -327,9 +337,6 @@ export function ProfilesPanel() {
                           >
                             {p.isBuiltin || profileHasReferences(p) ? "Disable" : "Delete"}
                           </button>
-                        )}
-                        {p.disabled && (
-                          <span className={styles["profile-actions-menu-empty"]}>Read-only</span>
                         )}
                       </div>
                     )}
@@ -351,7 +358,7 @@ export function ProfilesPanel() {
 
       {(showCreate || editing || cloning) && (
         <section className="admin-panel-section">
-          <h3>{editing ? "Edit Profile" : cloning ? `Clone ${cloning.name}` : "Create New Profile"}</h3>
+          <h3>{editing ? "Edit profile" : cloning ? `Clone ${cloning.name}` : "Create new profile"}</h3>
           <ProfileForm
             key={editing?.name ?? (cloning ? `clone-${cloning.name}` : "create")}
             profile={editing}
@@ -363,85 +370,6 @@ export function ProfilesPanel() {
       )}
     </div>
   );
-}
-
-function isABRProfile(profile: PackageProfile): boolean {
-  return (profile.tags ?? []).includes("abr");
-}
-
-function isABRBridgeProfile(profile: PackageProfile): boolean {
-  return profile.mediaKind !== "music" && (profile.tags ?? []).includes("default");
-}
-
-type LadderGroup = { label: string; profiles: PackageProfile[] };
-
-const LADDER_DEFS: { label: string; names: string[] }[] = [
-  { label: "CPU",  names: ["h264-copy-source", "h264-main-1080p", "h264-main-720p", "h264-main-480p"] },
-  { label: "NVENC", names: ["h264-nvenc-copy-source", "h264-nvenc-main-1080p", "h264-nvenc-main-720p", "h264-nvenc-main-480p"] },
-  { label: "HDR",  names: ["hevc-copy-source", "h264-main-1080p"] },
-];
-
-function buildLadderGroups(profiles: PackageProfile[]): LadderGroup[] {
-  const byName = new Map(profiles.map((p) => [p.name, p]));
-  return LADDER_DEFS.map((def) => ({
-    label: def.label,
-    profiles: def.names.map((n) => byName.get(n)).filter((p): p is PackageProfile => p != null),
-  }));
-}
-
-function abrGroupProfiles(profiles: PackageProfile[]): PackageProfile[] {
-  const grouped = profiles.filter((p) => isABRProfile(p) || isABRBridgeProfile(p));
-  const order = new Map([
-    ["h264-copy-source", 0],
-    ["h264-main-1080p", 1],
-    ["h264-main-720p", 2],
-    ["h264-main-480p", 3],
-    ["h264-nvenc-copy-source", 10],
-    ["h264-nvenc-main-1080p", 11],
-    ["h264-nvenc-main-720p", 12],
-    ["h264-nvenc-main-480p", 13],
-    ["hevc-copy-source", 20],
-  ]);
-  return grouped.sort((a, b) => (order.get(a.name) ?? 100) - (order.get(b.name) ?? 100));
-}
-
-function ABRProfileDetail({ profiles, ladderGroups }: { profiles: PackageProfile[]; ladderGroups: LadderGroup[] }) {
-  return (
-    <div className={styles["profile-detail"]}>
-      <p className={styles["profile-detail-desc"]}>
-        Three standard ABR ladders are available. Each ladder is assigned as a unit when creating a channel with adaptive bitrate enabled.
-      </p>
-      {ladderGroups.map((group) => group.profiles.length > 0 && (
-        <fieldset key={group.label} className={styles["profile-ladder-group"]}>
-          <legend>{group.label} ladder ({group.profiles.length} rungs)</legend>
-          <div className={styles["profile-detail-grid"]}>
-            {group.profiles.map((p) => (
-              <section key={p.name}>
-                <h4>{p.label}</h4>
-                <dl>
-                  <dt>Profile</dt><dd>{p.name}</dd>
-                  <dt>Video</dt><dd>{formatOutput(p)}</dd>
-                  <dt>Audio</dt><dd>{formatAudioCell(p)}</dd>
-                  <dt>Status</dt><dd>{p.disabled ? "Disabled" : "Active"}</dd>
-                </dl>
-              </section>
-            ))}
-          </div>
-        </fieldset>
-      ))}
-    </div>
-  );
-}
-
-function formatABROutput(profiles: PackageProfile[]): string {
-  const labels = profiles.map((p) => p.video.mode === "copy" ? "source" : p.video.scaleHeight ? `${p.video.scaleHeight}p` : "source");
-  return labels.join(" / ");
-}
-
-function formatABRAudio(profiles: PackageProfile[]): string {
-  const transcodes = profiles.filter((p) => p.audio.mode === "transcode");
-  if (transcodes.length === profiles.length) return "AAC";
-  return "mixed";
 }
 
 function ProfileDetail({ profile }: { profile: PackageProfile }) {
@@ -482,6 +410,18 @@ function ProfileDetail({ profile }: { profile: PackageProfile }) {
                 <dt>Bitrate</dt><dd>{a.bitrate || "—"}</dd>
                 <dt>Channels</dt><dd>{a.channels ? channelsLabel(a.channels) : "—"}</dd>
                 <dt>Sample rate</dt><dd>{a.sampleHz ? `${Math.round(a.sampleHz / 1000)} kHz` : "—"}</dd>
+              </>
+            )}
+          </dl>
+        </section>
+        <section>
+          <h4>Subtitles</h4>
+          <dl>
+            <dt>Mode</dt><dd>{profile.subtitles?.mode || "off"}</dd>
+            {profile.subtitles?.mode && (
+              <>
+                <dt>Language</dt><dd>{profile.subtitles.language || "—"}</dd>
+                <dt>Fallback</dt><dd>{profile.subtitles.fallback || "none"}</dd>
               </>
             )}
           </dl>
@@ -571,7 +511,12 @@ function packageProfileToSimpleDraft(profile: PackageProfile | null): SimpleProf
     encoder,
     resolution,
     quality: qualityFromProfile(profile, encoder, resolution),
+    copyCodec: copyCodecFromProfile(profile),
   };
+}
+
+function copyCodecFromProfile(profile: PackageProfile): CopyCodecChoice {
+  return profile.video.codecRequired === "hevc" ? "hevc" : "h264";
 }
 
 function encoderFromProfile(profile: PackageProfile): EncoderChoice {
@@ -621,7 +566,7 @@ function settingsForSimpleDraft(draft: SimpleProfileDraft): ProfileSettings {
   const audio: PackageProfile["audio"] = {
     mode: "transcode",
     codec: "aac",
-    bitrate: "192k",
+    bitrate: "256k",
     channels: 2,
     sampleHz: 48000,
   };
@@ -629,7 +574,7 @@ function settingsForSimpleDraft(draft: SimpleProfileDraft): ProfileSettings {
   if (draft.encoder === "copy") {
     const video: PackageProfile["video"] = {
       mode: "copy",
-      codecRequired: "h264",
+      codecRequired: draft.copyCodec,
     };
     return { video, audio };
   }
@@ -644,6 +589,7 @@ function settingsForSimpleDraft(draft: SimpleProfileDraft): ProfileSettings {
   if (draft.encoder === "cpu") {
     video.preset = draft.quality === "good" ? "veryfast" : "medium";
     video.crf = X264_CRF[draft.quality];
+    video.videoMaxBitrate = CPU_MAXRATE[draft.quality];
   } else if (draft.encoder === "apple") {
     video.videoQuality = VIDEOTOOLBOX_QUALITY[draft.quality];
   } else {
@@ -685,11 +631,12 @@ function identityForSimpleDraft(draft: SimpleProfileDraft) {
     copy: "h264-copy",
   };
   const resolutionSlug = draft.resolution === "source" ? "source" : `${draft.resolution}p`;
+  const copyCodecLabel = draft.copyCodec === "hevc" ? "HEVC" : "H.264";
   const name = draft.encoder === "copy"
-    ? `${encoderSlug[draft.encoder]}-${resolutionSlug}`
+    ? `${draft.copyCodec}-copy-source`
     : `${encoderSlug[draft.encoder]}-${draft.quality}-${resolutionSlug}`;
   const label = draft.encoder === "copy"
-    ? `${resolutionLabel(draft.resolution)} H.264 copy`
+    ? `${copyCodecLabel} source copy`
     : `${resolutionLabel(draft.resolution)} ${qualityLabel(draft.quality)} ${encoderLabel(draft.encoder)}`;
   return {
     name,
@@ -700,7 +647,8 @@ function identityForSimpleDraft(draft: SimpleProfileDraft) {
 
 function summaryForSimpleDraft(draft: SimpleProfileDraft) {
   if (draft.encoder === "copy") {
-    return `Copy H.264 video at ${resolutionLabel(draft.resolution).toLowerCase()} and transcode audio to AAC stereo.`;
+    const codecLabel = draft.copyCodec === "hevc" ? "HEVC" : "H.264";
+    return `Copy ${codecLabel} video without re-encoding and transcode audio to AAC stereo.`;
   }
   return `${qualityLabel(draft.quality)} ${encoderLabel(draft.encoder)} encode at ${resolutionLabel(draft.resolution).toLowerCase()} with AAC stereo.`;
 }
@@ -781,6 +729,7 @@ function ProfileForm({
   const [encoder, setEncoder] = useState<EncoderChoice>(initialSimpleDraft.encoder);
   const [resolution, setResolution] = useState<ResolutionChoice>(initialSimpleDraft.resolution);
   const [quality, setQuality] = useState<QualityChoice>(initialSimpleDraft.quality);
+  const [copyCodec, setCopyCodec] = useState<CopyCodecChoice>(initialSimpleDraft.copyCodec);
   const [nameEdited, setNameEdited] = useState(startSeeded);
   const [labelEdited, setLabelEdited] = useState(startSeeded);
   const [descriptionEdited, setDescriptionEdited] = useState(startSeeded);
@@ -789,7 +738,7 @@ function ProfileForm({
   const [description, setDescription] = useState(profile?.description ?? seed?.description ?? initialIdentity.description);
   const [audioMode, setAudioMode] = useState(initSource?.audio.mode ?? "transcode");
   const [audioCodec, setAudioCodec] = useState(initSource?.audio.codec ?? "aac");
-  const [audioBitrate, setAudioBitrate] = useState(initSource?.audio.bitrate ?? "192k");
+  const [audioBitrate, setAudioBitrate] = useState(initSource?.audio.bitrate ?? "256k");
   const [audioChannels, setAudioChannels] = useState(initSource?.audio.channels?.toString() ?? "2");
   const [audioSampleHz, setAudioSampleHz] = useState(initSource?.audio.sampleHz?.toString() ?? "48000");
   const [overrides, setOverrides] = useState<OverrideState>(initialOverrides);
@@ -797,16 +746,17 @@ function ProfileForm({
     Object.values(initialOverrides).some((o) => o.enabled)
   );
 
-  const draft: SimpleProfileDraft = { encoder, resolution, quality };
+  const draft: SimpleProfileDraft = { encoder, resolution, quality, copyCodec };
   const tierSettings = settingsForSimpleDraft(draft);
   const resolved = applyOverrides(tierSettings, encoder, overrides);
   const applicableKeys = applicableOverrides(encoder);
 
   function updateDraft(next: Partial<SimpleProfileDraft>) {
-    const updated: SimpleProfileDraft = { encoder, resolution, quality, ...next };
+    const updated: SimpleProfileDraft = { encoder, resolution, quality, copyCodec, ...next };
     setEncoder(updated.encoder);
     setResolution(updated.resolution);
     setQuality(updated.quality);
+    setCopyCodec(updated.copyCodec);
     if (!profile) {
       const nextIdentity = identityForSimpleDraft(updated);
       if (!nameEdited) setName(nextIdentity.name);
@@ -844,6 +794,7 @@ function ProfileForm({
       description: description.trim(),
       video: resolved.video,
       audio,
+      subtitles: profile?.subtitles ?? seed?.subtitles,
     };
     onSave(p);
   }
@@ -886,22 +837,31 @@ function ProfileForm({
               {ENCODER_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
             </select>
           </label>
-          <label>
-            <span>Resolution</span>
-            <select value={resolution} onChange={(e) => updateDraft({ resolution: e.target.value as ResolutionChoice })}>
-              {RESOLUTION_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-            </select>
-          </label>
-          <label>
-            <span>Quality</span>
-            <select
-              value={quality}
-              disabled={encoder === "copy"}
-              onChange={(e) => updateDraft({ quality: e.target.value as QualityChoice })}
-            >
-              {QUALITY_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-            </select>
-          </label>
+          {encoder === "copy" ? (
+            // A copy profile is a bitstream remux: resolution and quality don't
+            // apply, so the only knob is which source codec it passes through.
+            <label>
+              <span>Source codec</span>
+              <select value={copyCodec} onChange={(e) => updateDraft({ copyCodec: e.target.value as CopyCodecChoice })}>
+                {COPY_CODEC_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+            </label>
+          ) : (
+            <>
+              <label>
+                <span>Resolution</span>
+                <select value={resolution} onChange={(e) => updateDraft({ resolution: e.target.value as ResolutionChoice })}>
+                  {RESOLUTION_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                </select>
+              </label>
+              <label>
+                <span>Quality</span>
+                <select value={quality} onChange={(e) => updateDraft({ quality: e.target.value as QualityChoice })}>
+                  {QUALITY_OPTIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                </select>
+              </label>
+            </>
+          )}
         </div>
       </fieldset>
 
@@ -982,7 +942,7 @@ function ProfileForm({
         {audioMode === "transcode" && (
           <>
             <label><span>Codec</span><input value={audioCodec} onChange={(e) => setAudioCodec(e.target.value)} /></label>
-            <label><span>Bitrate</span><input value={audioBitrate} onChange={(e) => setAudioBitrate(e.target.value)} placeholder="192k" /></label>
+            <label><span>Bitrate</span><input value={audioBitrate} onChange={(e) => setAudioBitrate(e.target.value)} placeholder="256k" /></label>
             <label><span>Channels</span><input value={audioChannels} onChange={(e) => setAudioChannels(e.target.value)} type="number" /></label>
             <label><span>Sample Hz</span><input value={audioSampleHz} onChange={(e) => setAudioSampleHz(e.target.value)} type="number" /></label>
           </>

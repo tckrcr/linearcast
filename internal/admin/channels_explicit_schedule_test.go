@@ -69,10 +69,10 @@ func insertFillerAsset(t *testing.T, conn *sql.DB, assetID, mediaID string) {
 
 func postCreateChannel(t *testing.T, app *App, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/schedule-builder/channels", bytes.NewBufferString(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/channels", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	res := httptest.NewRecorder()
-	app.handleScheduleBuilderCreateChannel(res, req)
+	app.handleCreateChannel(res, req)
 	return res
 }
 
@@ -94,7 +94,7 @@ func TestCreateChannelExplicitSlotGridContiguous(t *testing.T) {
 
 	res := postCreateChannel(t, app, `{
 		"displayName": "Grid A",
-		"packageProfile": "h264-main-1080p",
+		"packageProfile": "h264-1080p-8mbps",
 		"scheduleMode": "slot_grid",
 		"slotDurationMs": 1800000,
 		"mediaIds": ["show1", "show2"],
@@ -134,7 +134,7 @@ func TestCreateChannelExplicitSlotGridFillerAttached(t *testing.T) {
 
 	res := postCreateChannel(t, app, `{
 		"displayName": "Grid B",
-		"packageProfile": "h264-main-1080p",
+		"packageProfile": "h264-1080p-8mbps",
 		"scheduleMode": "slot_grid",
 		"slotDurationMs": 1800000,
 		"mediaIds": ["show1", "show2"],
@@ -183,7 +183,7 @@ func TestCreateChannelExplicitSlotGridRejectsGap(t *testing.T) {
 
 	res := postCreateChannel(t, app, `{
 		"displayName": "Grid C",
-		"packageProfile": "h264-main-1080p",
+		"packageProfile": "h264-1080p-8mbps",
 		"scheduleMode": "slot_grid",
 		"slotDurationMs": 1800000,
 		"mediaIds": ["show1", "show2"],
@@ -209,14 +209,14 @@ func TestCreateChannelExplicitSlotGridRejectsGap(t *testing.T) {
 	}
 }
 
-// A duration that is not aligned to the 6s segment grid is rejected.
+// A duration that is not aligned to the 6000ms schedule grid is rejected.
 func TestCreateChannelExplicitRejectsMisalignedDuration(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertMedia(t, conn, "show1", 1800000)
 
 	res := postCreateChannel(t, app, `{
 		"displayName": "Grid D",
-		"packageProfile": "h264-main-1080p",
+		"packageProfile": "h264-1080p-8mbps",
 		"scheduleMode": "slot_grid",
 		"slotDurationMs": 1800000,
 		"mediaIds": ["show1"],

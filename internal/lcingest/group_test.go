@@ -7,16 +7,17 @@ func TestDeriveSchedulingGroup(t *testing.T) {
 		path string
 		want string
 	}{
-		{"/media/Mad.Men.S03E07.The.Title.mkv", "Mad Men S03 H2"},
-		{"/media/Mad Men - S03E04 - Title.mkv", "Mad Men S03 H1"},
-		{"/media/Mad_Men_S01E06_Title.mkv", "Mad Men S01 H1"},
-		{"/media/Mad_Men_S01E07_Title.mkv", "Mad Men S01 H2"},
-		{"/media/the.office.s02e15.dinner.party.1080p.mkv", "The Office S02 H2"},
+		{"/media/Harbor.Lights.S03E07.The.Title.mkv", "Harbor Lights"},
+		{"/media/Harbor Lights - S03E04 - Title.mkv", "Harbor Lights"},
+		{"/media/Harbor_Lights_S01E06_Title.mkv", "Harbor Lights"},
+		{"/media/Harbor_Lights_S01E07_Title.mkv", "Harbor Lights"},
+		{"/media/city.watch.s02e15.dinner.party.1080p.mkv", "City Watch"},
 		// Year tag stripped from show name.
-		{"/media/Doctor.Who.2005.S04E01.mkv", "Doctor Who S04 H1"},
-		// Movies / unparseable filenames return "" → solo bucket.
-		{"/media/Inception.2010.1080p.mkv", ""},
-		{"/media/random.mkv", ""},
+		{"/media/Northern.Skies.2005.S04E01.mkv", "Northern Skies"},
+		// Movies get a "movie:<title>" group derived from their filename.
+		{"/media/Dream.Circuit.2010.1080p.mkv", "movie:Dream Circuit (2010)"},
+		// Files with no parseable title fall back to titlecased stem.
+		{"/media/random.mkv", "movie:Random"},
 	}
 	for _, c := range cases {
 		got := DeriveSchedulingGroup(c.path)
@@ -26,26 +27,24 @@ func TestDeriveSchedulingGroup(t *testing.T) {
 	}
 }
 
-func TestParseSchedulingGroup(t *testing.T) {
+func TestParseEpisodeCode(t *testing.T) {
 	cases := []struct {
-		group      string
-		wantShow   string
+		input      string
 		wantSeason int
-		wantHalf   int
+		wantEp     int
 		wantOK     bool
 	}{
-		{"Mad Men S03 H2", "Mad Men", 3, 2, true},
-		{"The Office S02 H1", "The Office", 2, 1, true},
-		{"Doctor Who S10 H2", "Doctor Who", 10, 2, true},
-		{"Movie Bucket", "", 0, 0, false},
-		{"Mad Men S3 H2", "", 0, 0, false},
-		{"Mad Men S03 H3", "", 0, 0, false},
+		{"Harbor Lights S03E07 — The Title", 3, 7, true},
+		{"/media/city.watch.s02e15.dinner.party.1080p.mkv", 2, 15, true},
+		{"Northern Skies S10E02", 10, 2, true},
+		{"Movie Bucket", 0, 0, false},
+		{"Harbor Lights S3 H2", 0, 0, false},
 	}
 	for _, c := range cases {
-		gotShow, gotSeason, gotHalf, gotOK := ParseSchedulingGroup(c.group)
-		if gotShow != c.wantShow || gotSeason != c.wantSeason || gotHalf != c.wantHalf || gotOK != c.wantOK {
-			t.Errorf("ParseSchedulingGroup(%q) = (%q, %d, %d, %v), want (%q, %d, %d, %v)",
-				c.group, gotShow, gotSeason, gotHalf, gotOK, c.wantShow, c.wantSeason, c.wantHalf, c.wantOK)
+		gotSeason, gotEp, gotOK := ParseEpisodeCode(c.input)
+		if gotSeason != c.wantSeason || gotEp != c.wantEp || gotOK != c.wantOK {
+			t.Errorf("ParseEpisodeCode(%q) = (%d, %d, %v), want (%d, %d, %v)",
+				c.input, gotSeason, gotEp, gotOK, c.wantSeason, c.wantEp, c.wantOK)
 		}
 	}
 }
@@ -55,25 +54,30 @@ func TestDeriveTitle(t *testing.T) {
 		path string
 		want string
 	}{
-		// Real ingest path the user hit.
+		// Nested show/season path.
 		{
 			"/data/media/tv/ShowName/Season 1/ShowName.S01E03.Episode.Name.1080p.mkv",
 			"Showname S01E03 — Episode Name",
 		},
 		// Standard episode patterns.
-		{"/m/Mad.Men.S03E07.The.Suitcase.1080p.BluRay.x264-FLEET.mkv", "Mad Men S03E07 — The Suitcase"},
-		{"/m/the.office.s02e15.dinner.party.720p.HDTV.x264.mkv", "The Office S02E15 — Dinner Party"},
-		{"/m/Mad Men - S03E04 - The Arrangements.mkv", "Mad Men S03E04 — The Arrangements"},
+		{"/m/Harbor.Lights.S03E07.The.Lighthouse.1080p.BluRay.x264-GROUP.mkv", "Harbor Lights S03E07 — The Lighthouse"},
+		{"/m/city.watch.s02e15.dinner.party.720p.HDTV.x264.mkv", "City Watch S02E15 — Dinner Party"},
+		{"/m/Harbor Lights - S03E04 - The Reunion.mkv", "Harbor Lights S03E04 — The Reunion"},
 		// Episode with no human title between SnnEnn and quality marker.
 		{"/m/ShowName.S01E03.1080p.mkv", "Showname S01E03"},
 		{"/m/ShowName.S01E03.mkv", "Showname S01E03"},
+		// Release year sits where the episode title would be — must not become
+		// the title.
+		{"/srv/media/tv/Example.Show.S03E01.2013.1080p.WEB-DL.x264.DDP5.1-Scene.mkv", "Example Show S03E01"},
+		// Year followed by a real title: strip only the year, keep the title.
+		{"/m/ShowName.S02E05.2014.The.Real.Title.1080p.mkv", "Showname S02E05 — The Real Title"},
 		// Show name carries a year tag.
-		{"/m/Doctor.Who.2005.S04E01.Partners.in.Crime.1080p.mkv", "Doctor Who S04E01 — Partners In Crime"},
+		{"/m/Northern.Skies.2005.S04E01.Old.Friends.1080p.mkv", "Northern Skies S04E01 — Old Friends"},
 		// Show with year in parens; entire quality block also parenthesized.
-		{"/m/The Witcher (2019) S01E01 (2160p NF WEB-DL Hybrid H265 DV HDR DDP Atmos 5.1 English - HONE).mkv", "The Witcher S01E01"},
+		{"/m/Signal Keepers (2019) S01E01 (2160p NF WEB-DL Hybrid H265 DV HDR DDP Atmos 5.1 English - GROUP).mkv", "Signal Keepers S01E01"},
 		// Movies: junk stripped, year promoted to "(YYYY)".
-		{"/m/Inception.2010.1080p.BluRay.x264-RARBG.mkv", "Inception (2010)"},
-		{"/m/Mad.Max.Fury.Road.2015.1080p.BluRay.x264.DTS-HD.MA.7.1-FGT.mkv", "Mad Max Fury Road (2015)"},
+		{"/m/Dream.Circuit.2010.1080p.BluRay.x264-GROUP.mkv", "Dream Circuit (2010)"},
+		{"/m/Road.Through.Ember.2015.1080p.BluRay.x264.DTS-HD.MA.7.1-GROUP.mkv", "Road Through Ember (2015)"},
 		// Movie without quality markers — falls back to titlecasing the stem.
 		{"/m/random.mkv", "Random"},
 	}

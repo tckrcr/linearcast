@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/ffmpegexec"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/sysinfo"
 )
 
@@ -186,17 +186,17 @@ func completeClaim(ctx context.Context, client *http.Client, cfg config, package
 func writePackageTar(w io.Writer, packageDir string) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
-	for _, name := range []string{"init.mp4", "stream.m3u8"} {
+	for _, name := range []string{layout.InitName, layout.PlaylistName} {
 		if err := addTarFile(tw, filepath.Join(packageDir, name), name); err != nil {
 			return err
 		}
 	}
-	matches, err := filepath.Glob(filepath.Join(packageDir, "seg*.m4s"))
+	matches, err := filepath.Glob(filepath.Join(packageDir, layout.SegmentGlob))
 	if err != nil {
 		return err
 	}
 	if len(matches) == 0 {
-		return errors.New("encoded package has no seg*.m4s files")
+		return fmt.Errorf("encoded package has no %s files", layout.SegmentGlob)
 	}
 	for _, p := range matches {
 		if err := addTarFile(tw, p, filepath.Base(p)); err != nil {

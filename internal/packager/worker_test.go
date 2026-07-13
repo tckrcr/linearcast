@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
-	"github.com/tckrcr/linearcast/internal/packageid"
+	"github.com/tckrcr/linearcast/internal/layout"
 )
 
 func newWorkerTestDB(t *testing.T) string {
@@ -37,7 +37,7 @@ func seedPackagedChannel(t *testing.T, path string) {
 
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled,
 		created_at_ms, playback_mode, required_package_profile, package_prefill_ms)
-		VALUES ('ch-pkg', 'Packaged', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-main-1080p', 86400000),
+		VALUES ('ch-pkg', 'Packaged', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 86400000),
 		       ('ch-gen', 'Generated', '/tmp', 'alphabetical', 1, 0, 'generated', NULL, NULL)`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
@@ -80,8 +80,8 @@ func TestDiscoverCandidatesForEnabledChannels(t *testing.T) {
 	}
 	want := map[string]bool{"m1": false, "m2": false, "m-gen-only": false}
 	for _, c := range got {
-		if c.Profile != "h264-main-1080p" {
-			t.Fatalf("candidate = %+v, want h264-main-1080p profile", c)
+		if c.Profile != "h264-1080p-8mbps" {
+			t.Fatalf("candidate = %+v, want h264-1080p-8mbps profile", c)
 		}
 		if _, ok := want[c.MediaID]; !ok {
 			t.Fatalf("unexpected candidate = %+v", c)
@@ -105,7 +105,7 @@ func TestDiscoverCandidatesIncludesConfiguredABRLadderRungs(t *testing.T) {
 	}
 	defer rw.Close()
 	if _, err := rw.Exec(`UPDATE channels
-		SET abr_ladder_json = '["h264-copy-source","h264-main-1080p","h264-main-720p"]'
+		SET abr_ladder_json = '["h264-1080p-8mbps","h264-1080p-20mbps","hevc-2160p-40mbps-hdr"]'
 		WHERE id = 'ch-pkg'`); err != nil {
 		t.Fatalf("set ladder: %v", err)
 	}
@@ -120,13 +120,13 @@ func TestDiscoverCandidatesIncludesConfiguredABRLadderRungs(t *testing.T) {
 			seen[c.Profile] = true
 		}
 	}
-	for _, profile := range []string{"h264-copy-source", "h264-main-1080p", "h264-main-720p"} {
+	for _, profile := range []string{"h264-1080p-8mbps", "h264-1080p-20mbps", "hevc-2160p-40mbps-hdr"} {
 		if !seen[profile] {
 			t.Fatalf("missing m1 profile %s in candidates %+v", profile, got)
 		}
 	}
-	if seen["h264-main-480p"] {
-		t.Fatalf("unexpected unconfigured 480p rung in candidates %+v", got)
+	if seen["hevc-copy-source"] {
+		t.Fatalf("unexpected unconfigured HEVC copy rung in candidates %+v", got)
 	}
 }
 
@@ -140,8 +140,8 @@ func TestDiscoverSkipsReadyAndProcessing(t *testing.T) {
 	}
 	defer rw.Close()
 	if _, err := rw.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
-		VALUES ('p-m1', 'm1', 'h264-main-1080p', 'ready', 0, 0),
-		       ('p-m2', 'm2', 'h264-main-1080p', 'processing', 0, 0)`); err != nil {
+		VALUES ('p-m1', 'm1', 'h264-1080p-8mbps', 'ready', 0, 0),
+		       ('p-m2', 'm2', 'h264-1080p-8mbps', 'processing', 0, 0)`); err != nil {
 		t.Fatalf("seed packages: %v", err)
 	}
 
@@ -164,8 +164,8 @@ func TestDiscoverIncludesPendingAndSkipsFailed(t *testing.T) {
 	}
 	defer rw.Close()
 	if _, err := rw.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
-		VALUES ('p-m1', 'm1', 'h264-main-1080p', 'pending', 0, 0),
-		       ('p-m2', 'm2', 'h264-main-1080p', 'failed', 0, 0)`); err != nil {
+		VALUES ('p-m1', 'm1', 'h264-1080p-8mbps', 'pending', 0, 0),
+		       ('p-m2', 'm2', 'h264-1080p-8mbps', 'failed', 0, 0)`); err != nil {
 		t.Fatalf("seed packages: %v", err)
 	}
 
@@ -201,10 +201,10 @@ func TestDiscoverIncludesOrphanPendingAfterChannelCandidates(t *testing.T) {
 		t.Fatalf("insert orphan media: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
-		VALUES ('p-orphan-pending', 'orphan-pending', 'h264-main-1080p', 'pending', 10, 10),
-		       ('p-orphan-failed', 'orphan-failed', 'h264-main-1080p', 'failed', 20, 20),
-		       ('p-orphan-ready', 'orphan-ready', 'h264-main-1080p', 'ready', 30, 30),
-		       ('p-orphan-bad', 'orphan-bad', 'h264-main-1080p', 'pending', 40, 40)`); err != nil {
+		VALUES ('p-orphan-pending', 'orphan-pending', 'h264-1080p-8mbps', 'pending', 10, 10),
+		       ('p-orphan-failed', 'orphan-failed', 'h264-1080p-8mbps', 'failed', 20, 20),
+		       ('p-orphan-ready', 'orphan-ready', 'h264-1080p-8mbps', 'ready', 30, 30),
+		       ('p-orphan-bad', 'orphan-bad', 'h264-1080p-8mbps', 'pending', 40, 40)`); err != nil {
 		t.Fatalf("insert orphan packages: %v", err)
 	}
 
@@ -332,11 +332,11 @@ func TestTryClaimInsertsThenRejectsDouble(t *testing.T) {
 	w := &Worker{DB: rw}
 	ctx := context.Background()
 
-	ok, err := w.tryClaim(ctx, "m1", "h264-main-1080p", 100)
+	ok, err := w.tryClaim(ctx, "m1", "h264-1080p-8mbps", 100)
 	if err != nil || !ok {
 		t.Fatalf("first claim: ok=%v err=%v", ok, err)
 	}
-	ok, err = w.tryClaim(ctx, "m1", "h264-main-1080p", 200)
+	ok, err = w.tryClaim(ctx, "m1", "h264-1080p-8mbps", 200)
 	if err != nil {
 		t.Fatalf("second claim err: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestTryClaimInsertsThenRejectsDouble(t *testing.T) {
 		t.Fatalf("second claim should fail (already processing)")
 	}
 
-	pkg, err := db.MediaPackageByID(context.Background(), rw, packageid.For("m1", "h264-main-1080p"))
+	pkg, err := db.MediaPackageByID(context.Background(), rw, layout.ID("m1", "h264-1080p-8mbps"))
 	if err != nil || pkg == nil {
 		t.Fatalf("lookup package: pkg=%v err=%v", pkg, err)
 	}
@@ -364,12 +364,12 @@ func TestTryClaimTransitionsFailedToProcessing(t *testing.T) {
 	defer rw.Close()
 
 	if _, err := rw.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, error, created_at_ms, updated_at_ms)
-		VALUES ('p-m1', 'm1', 'h264-main-1080p', 'failed', 'old error', 0, 0)`); err != nil {
+		VALUES ('p-m1', 'm1', 'h264-1080p-8mbps', 'failed', 'old error', 0, 0)`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	w := &Worker{DB: rw}
-	ok, err := w.tryClaim(context.Background(), "m1", "h264-main-1080p", 500)
+	ok, err := w.tryClaim(context.Background(), "m1", "h264-1080p-8mbps", 500)
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
@@ -396,12 +396,12 @@ func TestTryClaimSkipsReady(t *testing.T) {
 	defer rw.Close()
 
 	if _, err := rw.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
-		VALUES ('p-m1', 'm1', 'h264-main-1080p', 'ready', 0, 0)`); err != nil {
+		VALUES ('p-m1', 'm1', 'h264-1080p-8mbps', 'ready', 0, 0)`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	w := &Worker{DB: rw}
-	ok, err := w.tryClaim(context.Background(), "m1", "h264-main-1080p", 500)
+	ok, err := w.tryClaim(context.Background(), "m1", "h264-1080p-8mbps", 500)
 	if err != nil {
 		t.Fatalf("claim err: %v", err)
 	}
@@ -494,8 +494,8 @@ func TestRecoverOrphansRequeuesStrandedProcessing(t *testing.T) {
 	if localID == "" {
 		t.Fatal("local encoder id missing")
 	}
-	const profile = "h264-main-1080p"
-	m1Pkg := packageid.For("m1", profile)
+	const profile = "h264-1080p-8mbps"
+	m1Pkg := layout.ID("m1", profile)
 
 	// (1) Leased job stranded by this worker's previous run: claim m1 as the
 	// local encoder, then leave the lease behind (the "crash").
@@ -506,11 +506,13 @@ func TestRecoverOrphansRequeuesStrandedProcessing(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim m1: ok=%v err=%v", ok, err)
 	}
-	// (2) Pre-lease orphan: a processing row with no lease at all.
+	// (2) Leaseless processing row: recoverOrphans must leave it alone — reaping
+	// stranded leaseless rows belongs to the periodic FailStaleProcessingPackages
+	// backstop, not to startup recovery.
 	if _, err := rw.Exec(`INSERT INTO media_packages
 		(id, media_id, rendition_profile, status, attempts, created_at_ms, updated_at_ms)
 		VALUES ('pkg-m2', 'm2', ?, 'processing', 1, 0, 0)`, profile); err != nil {
-		t.Fatalf("seed leaseless orphan: %v", err)
+		t.Fatalf("seed leaseless row: %v", err)
 	}
 
 	w := &Worker{DB: rw, OutputRoot: t.TempDir(), EncoderID: localID}
@@ -521,14 +523,21 @@ func TestRecoverOrphansRequeuesStrandedProcessing(t *testing.T) {
 		t.Fatalf("recoverOrphans: %v", err)
 	}
 
-	for _, id := range []string{m1Pkg, "pkg-m2"} {
-		var status string
-		if err := rw.QueryRow(`SELECT status FROM media_packages WHERE id=?`, id).Scan(&status); err != nil {
-			t.Fatalf("status %s: %v", id, err)
-		}
-		if db.PackageStatus(status) != db.PackageStatusPending {
-			t.Fatalf("package %s status=%s, want pending", id, status)
-		}
+	// The worker's own stranded lease is requeued to pending and its lease cleared.
+	var m1Status string
+	if err := rw.QueryRow(`SELECT status FROM media_packages WHERE id=?`, m1Pkg).Scan(&m1Status); err != nil {
+		t.Fatalf("status %s: %v", m1Pkg, err)
+	}
+	if db.PackageStatus(m1Status) != db.PackageStatusPending {
+		t.Fatalf("package %s status=%s, want pending", m1Pkg, m1Status)
+	}
+	// The leaseless row is untouched.
+	var m2Status string
+	if err := rw.QueryRow(`SELECT status FROM media_packages WHERE id='pkg-m2'`).Scan(&m2Status); err != nil {
+		t.Fatalf("status pkg-m2: %v", err)
+	}
+	if db.PackageStatus(m2Status) != db.PackageStatusProcessing {
+		t.Fatalf("leaseless package pkg-m2 status=%s, want processing (untouched)", m2Status)
 	}
 	var leases int
 	rw.QueryRow(`SELECT COUNT(*) FROM encoder_jobs`).Scan(&leases)
@@ -571,7 +580,7 @@ func TestHeartbeatAbortsOnDefinitiveLeaseLoss(t *testing.T) {
 	ctx := context.Background()
 	encID := db.GetLocalEncoderID(ctx, rw)
 	w := &Worker{DB: rw, EncoderID: encID, LeaseTTL: 300 * time.Millisecond}
-	ok, err := w.tryClaim(ctx, "m1", "h264-main-1080p", time.Now().UTC().UnixMilli())
+	ok, err := w.tryClaim(ctx, "m1", "h264-1080p-8mbps", time.Now().UTC().UnixMilli())
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
@@ -582,7 +591,7 @@ func TestHeartbeatAbortsOnDefinitiveLeaseLoss(t *testing.T) {
 	}
 
 	lost := make(chan struct{})
-	go w.heartbeat(ctx, packageid.For("m1", "h264-main-1080p"), func() { close(lost) })
+	go w.heartbeat(ctx, layout.ID("m1", "h264-1080p-8mbps"), func() { close(lost) }, func() *int { return nil })
 	select {
 	case <-lost:
 	case <-time.After(5 * time.Second):
@@ -603,7 +612,7 @@ func TestHeartbeatToleratesTransientDBErrors(t *testing.T) {
 	ctx := context.Background()
 	encID := db.GetLocalEncoderID(ctx, rw)
 	w := &Worker{DB: rw, EncoderID: encID, LeaseTTL: 300 * time.Millisecond}
-	ok, err := w.tryClaim(ctx, "m1", "h264-main-1080p", time.Now().UTC().UnixMilli())
+	ok, err := w.tryClaim(ctx, "m1", "h264-1080p-8mbps", time.Now().UTC().UnixMilli())
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
@@ -621,7 +630,7 @@ func TestHeartbeatToleratesTransientDBErrors(t *testing.T) {
 	interval := w.LeaseTTL / 3
 	start := time.Now()
 	lost := make(chan struct{})
-	go wBroken.heartbeat(ctx, packageid.For("m1", "h264-main-1080p"), func() { close(lost) })
+	go wBroken.heartbeat(ctx, layout.ID("m1", "h264-1080p-8mbps"), func() { close(lost) }, func() *int { return nil })
 	select {
 	case <-lost:
 		if elapsed := time.Since(start); elapsed < time.Duration(heartbeatMaxMisses)*interval-50*time.Millisecond {
@@ -648,7 +657,7 @@ func TestRecordFailureLandsAfterContextCancel(t *testing.T) {
 	defer rw.Close()
 
 	if _, err := rw.Exec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, attempts, created_at_ms, updated_at_ms)
-		VALUES ('p-m1', 'm1', 'h264-main-1080p', 'processing', 1, 0, 0)`); err != nil {
+		VALUES ('p-m1', 'm1', 'h264-1080p-8mbps', 'processing', 1, 0, 0)`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 

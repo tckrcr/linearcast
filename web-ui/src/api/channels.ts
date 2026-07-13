@@ -7,12 +7,12 @@ import type {
   ChannelSchedulePreview,
   EncodeReclaimResponse,
   GuideResponse,
-  ProfileReadiness,
+  SpotifyUrl,
 } from "../types";
 import { apiFetch, channelPath } from "./client";
 
 // getGuide fetches the viewer-safe EPG (all guide channels + a trimmed
-// schedule window) in a single request. Public-tier; see docs/proxy-auth-policy.md.
+// schedule window) in a single request.
 export async function getGuide(fromMs: number, hours = 24, signal?: AbortSignal) {
   return apiFetch<GuideResponse>("/api/guide", {
     cache: "no-store",
@@ -38,20 +38,24 @@ export async function createChannel(req: {
   }>("/api/channels", { method: "POST", json: req });
 }
 
-// createExternalChannel makes a live channel that proxies an upstream HLS
-// manifest. The server requires only displayName + upstreamHlsUrl for this
-// kind; no media or package profile is involved.
-export async function createExternalChannel(req: {
-  displayName: string;
-  upstreamHlsUrl: string;
-  scheduleMode?: "back_to_back" | "slot_grid" | string;
-  slotDurationMs?: number;
-}) {
-  return apiFetch<{
-    channelID: string;
-    displayName: string;
-    created: boolean;
-  }>("/api/channels", { method: "POST", json: req });
+// The Spotify URL is a singleton (one Spotify→HLS stream per account):
+// getSpotifyUrl reads it, saveSpotifyUrl upserts the one URL, clearSpotifyUrl
+// deletes it.
+export async function getSpotifyUrl() {
+  return apiFetch<SpotifyUrl>("/api/spotify-url", { cache: "no-store" });
+}
+
+export async function saveSpotifyUrl(upstreamHlsUrl: string) {
+  return apiFetch<SpotifyUrl>("/api/spotify-url", {
+    method: "PUT",
+    json: { upstreamHlsUrl },
+  });
+}
+
+export async function clearSpotifyUrl() {
+  return apiFetch<{ configured: boolean; deleted: boolean }>("/api/spotify-url", {
+    method: "DELETE",
+  });
 }
 
 export type UpstreamProbeResult = {
@@ -63,8 +67,8 @@ export type UpstreamProbeResult = {
 };
 
 // probeUpstreamHLS asks the server to fetch the upstream once and report
-// reachability. It is advisory only — creating/saving a live channel never
-// requires the probe to pass.
+// reachability. It is advisory only — saving the Spotify URL never requires the
+// probe to pass.
 export async function probeUpstreamHLS(upstreamHlsUrl: string) {
   return apiFetch<UpstreamProbeResult>("/api/channels/probe-upstream", {
     method: "POST",
@@ -118,19 +122,20 @@ export async function restartChannelPlayback(channelID: string) {
   }>(channelPath(channelID, "/restart-playback"), { method: "POST" });
 }
 
-export async function setChannelEnabled(channelID: string, enabled: boolean) {
-  const verb = enabled ? "enable" : "disable";
-  return apiFetch(channelPath(channelID, `/${verb}`), { method: "POST" });
+export async function patchChannel(channelID: string, fields: { enabled?: boolean; hiddenFromGuide?: boolean }) {
+  return apiFetch<{
+    id: string;
+    displayName: string;
+    enabled: boolean;
+    hiddenFromGuide: boolean;
+  }>(channelPath(channelID), { method: "PATCH", json: fields });
 }
 
-export async function setChannelHiddenFromGuide(channelID: string, hidden: boolean) {
-  const verb = hidden ? "hide-from-guide" : "show-in-guide";
-  return apiFetch<{
-    channelID: string;
-    hiddenFromGuide: boolean;
-    wasHiddenFromGuide: boolean;
-    note?: string;
-  }>(channelPath(channelID, `/${verb}`), { method: "POST" });
+export async function stopChannelEncoder(channelID: string) {
+  return apiFetch<{ channelID: string; note: string }>(
+    channelPath(channelID, "/stop-encoder"),
+    { method: "POST" },
+  );
 }
 
 export async function deleteChannel(
@@ -157,34 +162,11 @@ export async function cloneChannel(channelID: string) {
   });
 }
 
-export async function getChannelPolicy(channelID: string) {
-  return apiFetch<ChannelPolicy>(channelPath(channelID, "/policy"), {
-    cache: "no-store",
-  });
-}
-
-export async function updateChannelPolicy(
-  channelID: string,
-  policy: Pick<ChannelPolicy, "requiredPackageProfile" | "packagePrefillMs" | "mediaKind"> & { force?: boolean },
-) {
-  return apiFetch<ChannelPolicy>(channelPath(channelID, "/policy"), {
+export async function updateChannelOnDemandProfile(channelID: string, profile: string) {
+  return apiFetch<ChannelPolicy>(channelPath(channelID, "/on-demand-profile"), {
     method: "PUT",
-    json: policy,
+    json: { profile },
   });
-}
-
-export async function getChannelProfileMigrationStatus(channelID: string, profile: string) {
-  return apiFetch<ProfileReadiness>(channelPath(channelID, "/profile-migration"), {
-    query: { profile },
-    cache: "no-store",
-  });
-}
-
-export async function queueChannelProfileMigration(channelID: string, profile: string) {
-  return apiFetch<ProfileReadiness & { queued: number }>(
-    channelPath(channelID, "/profile-migration"),
-    { method: "POST", json: { profile } },
-  );
 }
 
 export async function getChannelArtwork(channelID: string) {

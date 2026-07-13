@@ -2,40 +2,41 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/codec"
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/metrics"
 	"github.com/tckrcr/linearcast/internal/ondemand"
 	"github.com/tckrcr/linearcast/internal/packageprofile"
+	"github.com/tckrcr/linearcast/internal/packager"
 	"github.com/tckrcr/linearcast/internal/scheduler"
+	"github.com/tckrcr/linearcast/internal/subtitlepolicy"
 )
 
-func (a *app) handleKeepalive(w http.ResponseWriter, r *http.Request) {
-	channelID := r.PathValue("channelID")
-	if a.lookupChannelOr404(r.Context(), w, channelID) == nil {
-		return
-	}
-	alive := true
-	if a.sessions != nil {
-		alive = a.sessions.KeepAlive(channelID)
-	}
-	if !alive {
-		w.Header().Set("Retry-After", "2")
-		http.Error(w, "keepalive ceiling reached", http.StatusServiceUnavailable)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+// redirectRelative issues a 302 whose Location is a path relative to the
+// request URL. Unlike http.Redirect, it does not resolve location against the
+// backend request path: that resolution would drop any reverse-proxy mount
+// prefix (e.g. /hls) the client used, because the backend never sees that
+// prefix. Emitting a bare relative reference lets the browser resolve it
+// against its original request URL, preserving the prefix.
+func redirectRelative(w http.ResponseWriter, location string) {
+	w.Header().Set("Location", location)
+	w.WriteHeader(http.StatusFound)
 }
 
 func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
@@ -44,12 +45,8 @@ func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 	if rt == nil {
 		return
 	}
-	if rt.PlaybackMode == db.PlaybackModePlexRelay {
-		http.Redirect(w, r, "/channel/"+channelID+"/plexrelay.m3u8", http.StatusFound)
-		return
-	}
-	if a.sessions != nil {
-		a.sessions.Touch(rt.ID)
+	if a.encodings != nil {
+		a.encodings.Touch(rt.ID)
 	}
 	profile := rt.RequiredPackageProfile
 	nowMs := time.Now().UTC().UnixMilli()
@@ -65,7 +62,7 @@ func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 		currentEntry = &entries[0]
 	}
 
-	burnActive := a.sessions != nil && a.sessions.BurnSubtitleLanguage(channelID) != ""
+	burnActive := a.encodings != nil && a.encodings.BurnSubtitleLanguage(channelID) != ""
 	variants := a.readyPackagedVariants(r.Context(), rt, currentEntry.MediaID)
 	var pkg *db.MediaPackage
 	for _, v := range variants {
@@ -79,17 +76,41 @@ func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 		variants = nil
 	}
 	if pkg == nil {
-		if rt.PrefillMode != "on_demand" {
+		if rt.PrefillMode == "eager" {
 			// No package is ready; fall back to the segment playlist directly so
 			// the player sees the 503 "warming up" UX.
 			a.writePackagedManifest(w, r, channelID, profile)
 			return
 		}
-		initPath, bps, err := a.ensureOnDemandMasterReady(r.Context(), channelID, profile, *currentEntry, nowMs)
+		readyCoverageMs := readyCoverageMsForMasterGate()
+		warmDeadline := time.Now().Add(15 * time.Second)
+		var initPath string
+		var bps int64
+		var subEntries []subtitleEntry
+		var err error
+		for {
+			initPath, bps, subEntries, err = a.ensureOnDemandMasterReady(r.Context(), channelID, profile, *currentEntry, nowMs, readyCoverageMs)
+			if err == nil || !strings.Contains(err.Error(), "warming") || time.Now().After(warmDeadline) {
+				break
+			}
+			select {
+			case <-r.Context().Done():
+				err = r.Context().Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+			if r.Context().Err() != nil {
+				break
+			}
+		}
 		if err != nil {
 			if errors.Is(err, ondemand.ErrAtCapacity) {
 				metrics.OnDemandAtCapacity503Total.Inc()
 				w.Header().Set("Retry-After", "2")
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			if retryAfter, ok := ondemand.RetryAfterSeconds(err, time.Now().UTC().UnixMilli()); ok {
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
 				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
@@ -103,14 +124,39 @@ func (a *app) handleManifest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		codecs := a.codecStringForInit(initPath)
+		manifestSentAt := time.Now().UnixMilli()
 		a.writeMasterManifest(r.Context(), w, channelID, []masterVariant{{
-			Profile: profile,
-			BPS:     bps,
-			Codecs:  codecs,
-		}}, entries)
+			Profile:    profile,
+			BPS:        bps,
+			Res:        mediaResolution(r.Context(), a.dbConn, currentEntry.MediaID),
+			Codecs:     codecs,
+			VideoRange: hdrVideoRange(r.Context(), a.dbConn, currentEntry.MediaID, profile),
+		}}, entries, subEntries)
+		slog.Info("ondemand first manifest response",
+			"channel_id", channelID,
+			"entry_id", currentEntry.ID,
+			"manifest_sent_at_ms", manifestSentAt,
+			"total_elapsed_ms", manifestSentAt-nowMs,
+		)
 		return
 	}
-	a.writeMasterManifest(r.Context(), w, channelID, variants, entries)
+	a.writeMasterManifest(r.Context(), w, channelID, variants, entries, nil)
+}
+
+func readyCoverageMsForMasterGate() int64 {
+	return onDemandReadyCoverageMs
+}
+
+// subtitleEntry describes one WebVTT track to include in the master playlist for
+// an on-demand channel encoding. EncodingID points at the encoding directory and
+// Slug maps to the subtitle rendition stem (s{streamIndex}).
+type subtitleEntry struct {
+	EncodingID string
+	Lang       string
+	Name       string
+	Slug       string
+	Default    bool
+	Forced     bool
 }
 
 type masterVariant struct {
@@ -141,7 +187,7 @@ func (a *app) readyPackagedVariants(ctx context.Context, rt *channelRuntime, med
 func (a *app) masterVariantForPackage(ctx context.Context, profile string, pkg *db.MediaPackage) masterVariant {
 	var profileBPS int64
 	if p, err := db.GetPackageProfile(ctx, a.dbConn, profile); err == nil && p != nil && p.Video.VideoMaxBitrate != "" {
-		profileBPS = parseBitrateString(p.Video.VideoMaxBitrate)
+		profileBPS = packageprofile.ParseBitrate(p.Video.VideoMaxBitrate)
 	}
 	bps := db.PeakSegmentBps(ctx, a.dbConn, pkg.ID)
 	if bps == 0 {
@@ -170,10 +216,23 @@ func (a *app) masterVariantForPackage(ctx context.Context, profile string, pkg *
 // hdrVideoRange queries the source media's color_transfer to determine the HDR
 // video range. Returns "PQ", "HLG", or "" (SDR default).
 //
-// Only HEVC copy profiles preserve HDR metadata. SDR transcoded rungs must not
-// advertise VIDEO-RANGE even when the source is HDR.
+// Only HDR-preserving profiles (tagged "hdr": the HEVC copy rung and the
+// HDR-preserving HEVC transcode profiles) carry HDR through to the segments.
+// SDR transcoded rungs must not advertise VIDEO-RANGE even when the source is
+// HDR.
 func hdrVideoRange(ctx context.Context, conn *sql.DB, mediaID string, profileName string) string {
-	if !strings.Contains(profileName, "hevc-copy") {
+	p, err := db.GetPackageProfile(ctx, conn, profileName)
+	if err != nil || p == nil {
+		return ""
+	}
+	hdrProfile := false
+	for _, t := range p.Tags {
+		if strings.EqualFold(t, "hdr") {
+			hdrProfile = true
+			break
+		}
+	}
+	if !hdrProfile {
 		return ""
 	}
 	m, err := db.MediaByID(ctx, conn, mediaID)
@@ -191,61 +250,148 @@ func hdrVideoRange(ctx context.Context, conn *sql.DB, mediaID string, profileNam
 	return ""
 }
 
-func (a *app) writeMasterManifest(ctx context.Context, w http.ResponseWriter, channelID string, variants []masterVariant, entries []db.ScheduleEntry) {
-	mediaIDs := make([]string, 0, len(entries))
-	seen := make(map[string]bool)
-	for _, e := range entries {
-		if !seen[e.MediaID] {
-			seen[e.MediaID] = true
-			mediaIDs = append(mediaIDs, e.MediaID)
+func mediaResolution(ctx context.Context, conn *sql.DB, mediaID string) string {
+	m, err := db.MediaByID(ctx, conn, mediaID)
+	if err != nil || m == nil || m.VideoWidth <= 0 || m.VideoHeight <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(",RESOLUTION=%dx%d", m.VideoWidth, m.VideoHeight)
+}
+
+func subtitleLangOrUnd(t db.PackageTrack) string {
+	lang := strings.TrimSpace(t.Language)
+	if lang == "" {
+		return "und"
+	}
+	return lang
+}
+
+func (a *app) manifestSubtitleProfile(ctx context.Context, profileName string) packageprofile.Profile {
+	profileName = strings.TrimSpace(profileName)
+	if profileName == "" {
+		return packageprofile.Profile{}
+	}
+	if a != nil && a.dbConn != nil {
+		if p, err := db.GetPackageProfile(ctx, a.dbConn, profileName); err == nil && p != nil {
+			return *p
 		}
 	}
-	subtitleTracks, err := db.SubtitleTracksForMediaIDs(ctx, a.dbConn, mediaIDs)
-	if err != nil {
-		subtitleTracks = nil
-	}
+	return packageprofile.Profile{}
+}
 
-	autoEnable, _ := db.GetSubtitleAutoEnable(ctx, a.dbConn)
-	langPrefs, _ := db.GetSubtitleLanguagePreference(ctx, a.dbConn)
-	topLang := ""
-	if autoEnable && len(langPrefs) > 0 {
-		topLang = strings.ToLower(langPrefs[0])
-	}
-
+func (a *app) writeMasterManifest(ctx context.Context, w http.ResponseWriter, channelID string, variants []masterVariant, entries []db.ScheduleEntry, subEntries []subtitleEntry) {
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:7\n")
 
-	if len(subtitleTracks) > 0 {
-		for _, t := range subtitleTracks {
-			lang := t.Language
-			if lang == "" {
-				lang = "und"
-			}
-			name := languageLabel(lang)
+	hasSubs := false
+	if subEntries != nil {
+		// On-demand: subtitle renditions live under the active encoding directory.
+		// DEFAULT/AUTOSELECT come from the entry itself (ensureOnDemandMasterReady
+		// picks at most one non-forced default), while forced renditions are
+		// advertised as spec-level auto-selected forced subtitles.
+		hasSubs = len(subEntries) > 0
+		subtitleProfile := ""
+		if len(variants) > 0 {
+			subtitleProfile = variants[0].Profile
+		}
+		for _, se := range subEntries {
 			isDefault := "NO"
-			if topLang != "" && strings.ToLower(lang) == topLang {
+			if se.Default && !se.Forced {
 				isDefault = "YES"
 			}
+			autoselect := "YES"
+			forcedAttr := ""
+			if se.Forced {
+				forcedAttr = ",FORCED=YES"
+			}
+			// Stable, channel-encoding-independent URL: hls.js loads the master once and
+			// then polls this playlist like a live media playlist. The handler
+			// re-resolves the channel's current on-demand encoding on every poll,
+			// so the URL survives schedule-entry/encoding rotation (an encoding ID in
+			// the path would 404 the moment playback advanced to the next entry).
 			fmt.Fprintf(&b,
-				"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=%q,LANGUAGE=%q,DEFAULT=%s,AUTOSELECT=%s,URI=\"/channel/%s/%s/subs/%s/playlist.m3u8\"\n",
-				name, lang, isDefault, isDefault, channelID, packagedPath, lang)
+				"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=%q,LANGUAGE=%q,DEFAULT=%s,AUTOSELECT=%s%s,URI=\"%s/%s/%s/%s/playlist.m3u8\"\n",
+				se.Name, se.Lang, isDefault, autoselect, forcedAttr, streamPath, subtitleProfile, onDemandSubtitlePath, se.Slug)
+		}
+	} else {
+		// Packaged: query subtitle tracks from the DB.
+		mediaIDs := make([]string, 0, len(entries))
+		seen := make(map[string]bool)
+		for _, e := range entries {
+			if !seen[e.MediaID] {
+				seen[e.MediaID] = true
+				mediaIDs = append(mediaIDs, e.MediaID)
+			}
+		}
+		subtitleProfile := ""
+		if len(variants) > 0 {
+			subtitleProfile = variants[0].Profile
+		}
+		plainTracks, err := db.PackageSubtitleTracksForMediaIDs(ctx, a.dbConn, mediaIDs, subtitleProfile)
+		if err != nil {
+			plainTracks = nil
+		}
+		forcedTracks, err := db.ForcedPackageSubtitleTracksForMediaIDs(ctx, a.dbConn, mediaIDs, subtitleProfile)
+		if err != nil {
+			forcedTracks = nil
+		}
+
+		// A forced track this profile bakes into the video must not also be
+		// advertised as a soft forced rendition, or the player shows it twice.
+		prof := a.manifestSubtitleProfile(ctx, subtitleProfile)
+		forcedTracks = slices.DeleteFunc(forcedTracks, func(t db.PackageTrack) bool {
+			return subtitlepolicy.BurnsForcedLanguage(prof, subtitleLangOrUnd(t))
+		})
+
+		hasSubs = len(plainTracks) > 0 || len(forcedTracks) > 0
+		if hasSubs {
+			autoEnable, _ := db.GetSubtitleAutoEnable(ctx, a.dbConn)
+			langPrefs, _ := db.GetSubtitleLanguagePreference(ctx, a.dbConn)
+			topLang := ""
+			if autoEnable && len(langPrefs) > 0 {
+				topLang = strings.ToLower(langPrefs[0])
+			}
+			for _, t := range plainTracks {
+				lang := subtitleLangOrUnd(t)
+				isDefault := "NO"
+				if topLang != "" && strings.ToLower(lang) == topLang {
+					isDefault = "YES"
+				}
+				fmt.Fprintf(&b,
+					"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=%q,LANGUAGE=%q,DEFAULT=%s,AUTOSELECT=%s,URI=\"%s/%s/subs/%s/playlist.m3u8\"\n",
+					languageLabel(lang), lang, isDefault, isDefault, streamPath, subtitleProfile, lang)
+			}
+			// Forced renditions are auto-selected by the player when the audio
+			// language matches, independent of the CC toggle, so they carry
+			// FORCED=YES,AUTOSELECT=YES and are never DEFAULT. The URI slug adds a
+			// -forced suffix (handleSubtitlePlaylist parses it back).
+			for _, t := range forcedTracks {
+				lang := subtitleLangOrUnd(t)
+				fmt.Fprintf(&b,
+					"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=%q,LANGUAGE=%q,DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI=\"%s/%s/subs/%s-forced/playlist.m3u8\"\n",
+					languageLabel(lang)+" (Forced)", lang, streamPath, subtitleProfile, lang)
+			}
 		}
 	}
 
 	subsAttr := ""
-	if len(subtitleTracks) > 0 {
+	if hasSubs {
 		subsAttr = ",SUBTITLES=\"subs\""
 	}
 
 	for _, v := range variants {
 		extraAttr := subsAttr
+		codecs := v.Codecs
+		if hasSubs {
+			codecs = codecsWithWebVTT(codecs)
+		}
 		if v.VideoRange != "" {
 			extraAttr += ",VIDEO-RANGE=" + v.VideoRange
 		}
 		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d%s,CODECS=%q%s\n",
-			v.BPS, v.Res, v.Codecs, extraAttr)
-		fmt.Fprintf(&b, "/channel/%s/%s/%s/stream.m3u8\n", channelID, packagedPath, v.Profile)
+			v.BPS, v.Res, codecs, extraAttr)
+		fmt.Fprintf(&b, "%s/%s/stream.m3u8\n", streamPath, v.Profile)
 	}
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -253,40 +399,238 @@ func (a *app) writeMasterManifest(ctx context.Context, w http.ResponseWriter, ch
 	_, _ = w.Write([]byte(b.String()))
 }
 
-func (a *app) ensureOnDemandMasterReady(ctx context.Context, channelID, profile string, entry db.ScheduleEntry, nowMs int64) (string, int64, error) {
-	if a.sessions == nil {
-		return "", 0, fmt.Errorf("on-demand sessions unavailable")
+func codecsWithWebVTT(codecs string) string {
+	codecs = strings.TrimSpace(codecs)
+	if codecs == "" {
+		return "wvtt"
+	}
+	for _, c := range strings.Split(codecs, ",") {
+		if strings.EqualFold(strings.TrimSpace(c), "wvtt") {
+			return codecs
+		}
+	}
+	return codecs + ",wvtt"
+}
+
+func currentSubtitleEntryID(entries []db.ScheduleEntry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	return entries[0].ID
+}
+
+// subtitleStreams returns all source subtitle streams, probed once per media and
+// cached so on-demand encoding spawn paths request stable subtitle options.
+func (a *app) subtitleStreams(ctx context.Context, mediaID, mediaPath string) []packager.SubtitleStreamInfo {
+	if v, ok := a.subtitleStreamCache.Load(mediaID); ok {
+		return v.([]packager.SubtitleStreamInfo)
+	}
+	infos, _ := packager.ProbeSubtitleStreams(ctx, mediaPath)
+	a.subtitleStreamCache.Store(mediaID, infos)
+	return infos
+}
+
+// englishSubtitleStreams returns the media's non-bitmap English subtitle streams.
+// Both on-demand channel-encoding spawn paths — the master-ready gate and the
+// steady-state rendition manifest — use this so they request the same
+// SubtitleStreamIndexes. If they disagree, reserveEncoding treats the option
+// mismatch as a config change and tears down / respawns the encoding on every
+// video poll, dropping the subtitle outputs.
+func (a *app) englishSubtitleStreams(ctx context.Context, mediaID, mediaPath string) []packager.SubtitleStreamInfo {
+	infos := a.subtitleStreams(ctx, mediaID, mediaPath)
+	out := make([]packager.SubtitleStreamInfo, 0, len(infos))
+	for _, si := range infos {
+		if si.IsBitmap || !isEnglishSubtitleLanguage(si.Language) {
+			continue
+		}
+		out = append(out, si)
+	}
+	return out
+}
+
+// subtitleStreamIndexesOf extracts the absolute source stream indexes, preserving
+// order so both spawn paths produce identical slices for sameIntSlice.
+func subtitleStreamIndexesOf(infos []packager.SubtitleStreamInfo) []int {
+	idx := make([]int, 0, len(infos))
+	for _, si := range infos {
+		idx = append(idx, si.Index)
+	}
+	return idx
+}
+
+// subtitleEntriesForMedia builds the advertisable WebVTT renditions for a media's
+// English text subtitle streams, with EncodingID set to encodingID. Used by the
+// on-demand master path to advertise slugs, names, and the single default
+// rendition. Returns nil when the media has no English text subs.
+func (a *app) subtitleEntriesForMedia(ctx context.Context, mediaID, mediaPath, encodingID string) []subtitleEntry {
+	subInfos := a.englishSubtitleStreams(ctx, mediaID, mediaPath)
+	if len(subInfos) == 0 {
+		return nil
+	}
+	autoEnable, _ := db.GetSubtitleAutoEnable(ctx, a.dbConn)
+	topLang := ""
+	if autoEnable {
+		topLang = "eng"
+	}
+	subEntries := make([]subtitleEntry, 0, len(subInfos))
+	defaultAssigned := false
+	for _, si := range subInfos {
+		name := languageLabel(si.Language)
+		if si.Title != "" && !strings.EqualFold(si.Title, name) {
+			name += " " + si.Title
+		}
+		// Mark exactly one non-forced track in the preferred language as the default
+		// rendition; a forced track only carries foreign-dialogue cues and must never
+		// be auto-selected.
+		isDefault := false
+		if !si.Forced && !defaultAssigned && topLang != "" && strings.ToLower(si.Language) == topLang {
+			isDefault = true
+			defaultAssigned = true
+		}
+		subEntries = append(subEntries, subtitleEntry{
+			EncodingID: encodingID,
+			Lang:       si.Language,
+			Name:       name,
+			Slug:       layout.SubtitleSlug(si.Index),
+			Forced:     si.Forced,
+			Default:    isDefault,
+		})
+	}
+	return subEntries
+}
+
+// ensureOnDemandEncoding resolves the package profile, media, and subtitle/burn
+// options for a schedule entry, then ensures a channel encoding is running for it
+// seeked to startWallMs. It returns the resolved media/profile, the advertisable
+// subtitle renditions (with their encoding id filled in), and the encoding id.
+//
+// EncodingOptions are built here so encoding reuse stays consistent: reserveEncoding
+// restarts an encoding whenever the subtitle/burn options change, so every request
+// for the same entry must produce identical options or it throws away the warm
+// buffer.
+func (a *app) ensureOnDemandEncoding(ctx context.Context, channelID, profile string, entry db.ScheduleEntry, startWallMs int64, traceID string) (*db.Media, *packageprofile.Profile, []subtitleEntry, string, error) {
+	if a.encodings == nil {
+		return nil, nil, nil, "", fmt.Errorf("on-demand channel encodings unavailable")
 	}
 	p, err := db.GetPackageProfile(ctx, a.dbConn, profile)
 	if err != nil {
-		return "", 0, fmt.Errorf("package profile %s: %w", profile, err)
+		slog.Warn("ondemand precheck failed: profile lookup error",
+			"channel_id", channelID, "entry_id", entry.ID, "profile", profile, "err", err)
+		return nil, nil, nil, "", fmt.Errorf("package profile %s: %w", profile, err)
 	}
 	if p == nil {
-		return "", 0, fmt.Errorf("package profile %s not found", profile)
+		// A channel can name a profile that no longer exists (renamed/deleted
+		// built-in, disabled custom). This dead-ends the encoder before any
+		// encoding is reserved, so without this line the failure is invisible —
+		// exactly how a renamed default profile silently broke a live channel.
+		slog.Warn("ondemand precheck failed: package profile not found",
+			"channel_id", channelID, "entry_id", entry.ID, "profile", profile)
+		return nil, nil, nil, "", fmt.Errorf("package profile %s not found", profile)
 	}
 	media, err := db.MediaByID(ctx, a.dbConn, entry.MediaID)
 	if err != nil {
-		return "", 0, fmt.Errorf("media %s: %w", entry.MediaID, err)
+		slog.Warn("ondemand precheck failed: media lookup error",
+			"channel_id", channelID, "entry_id", entry.ID, "media_id", entry.MediaID, "err", err)
+		return nil, nil, nil, "", fmt.Errorf("media %s: %w", entry.MediaID, err)
 	}
 	if media == nil {
-		return "", 0, fmt.Errorf("media %s not found", entry.MediaID)
+		slog.Warn("ondemand precheck failed: media not found",
+			"channel_id", channelID, "entry_id", entry.ID, "media_id", entry.MediaID)
+		return nil, nil, nil, "", fmt.Errorf("media %s not found", entry.MediaID)
 	}
-	opts := ondemand.SessionOptions{BurnSubtitleStreamIndex: a.burnSubtitleStreamIndexForMedia(ctx, channelID, media.ID)}
-	if err := a.sessions.EnsureSessionWithOptions(ctx, channelID, entry, media.Path, *p, scheduler.TargetSegmentMs, opts); err != nil {
-		return "", 0, err
+
+	// Advertise the English text subtitle streams this channel encoding will mux
+	// alongside video/audio. Shared (cached) with the rendition path so both request
+	// the same indexes — see englishSubtitleStreams.
+	subtitleStreamIndexes := subtitleStreamIndexesOf(a.englishSubtitleStreams(ctx, media.ID, media.Path))
+
+	opts := ondemand.EncodingOptions{
+		BurnSubtitleStreamIndex: a.burnSubtitleStreamIndexForMedia(ctx, channelID, media.ID, *p),
+		SubtitleStreamIndexes:   subtitleStreamIndexes,
+		StartWallMs:             startWallMs,
+		TraceID:                 traceID,
 	}
-	mediaPosMs := entry.OffsetMs + (nowMs - entry.StartMs)
-	segs := a.sessions.SegmentsFrom(channelID, entry.ID, mediaPosMs, 1)
-	if len(segs) == 0 {
-		return "", 0, fmt.Errorf("on-demand session warming media=%s profile=%s", entry.MediaID, profile)
+	if err := a.encodings.EnsureEncodingWithOptions(ctx, channelID, entry, media.Path, *p, scheduler.TargetSegmentMs, opts); err != nil {
+		slog.Warn("ondemand channel encoding spawn failed",
+			"trace_id", traceID, "channel_id", channelID, "entry_id", entry.ID,
+			"media_id", entry.MediaID, "err", err)
+		return nil, nil, nil, "", err
 	}
-	bps := parseBitrateString(p.Video.VideoMaxBitrate)
+	encodingID, ok := a.encodings.EncodingID(channelID, entry.ID)
+	if !ok {
+		slog.Warn("ondemand channel encoding missing after spawn",
+			"trace_id", traceID, "channel_id", channelID, "entry_id", entry.ID, "media_id", entry.MediaID)
+		return nil, nil, nil, "", fmt.Errorf("on-demand channel encoding not available after spawn for entry %s", entry.ID)
+	}
+	subEntries := a.subtitleEntriesForMedia(ctx, media.ID, media.Path, encodingID)
+	return media, p, subEntries, encodingID, nil
+}
+
+// ensureOnDemandMasterReady spawns/reuses the live encoding for entry and blocks
+// until readyCoverageMs of playable coverage is buffered ahead of the serve
+// position before returning a playable master. Callers pass the coverage cushion
+// explicitly so startup policy stays outside the low-level encoding readiness check.
+func (a *app) ensureOnDemandMasterReady(ctx context.Context, channelID, profile string, entry db.ScheduleEntry, nowMs int64, readyCoverageMs int64) (string, int64, []subtitleEntry, error) {
+	if a.encodings == nil {
+		return "", 0, nil, fmt.Errorf("on-demand channel encodings unavailable")
+	}
+	playbackLagMs, warmupMs, err := a.onDemandTiming()
+	if err != nil {
+		return "", 0, nil, err
+	}
+	playbackWallMs := nowMs - playbackLagMs
+	if playbackWallMs < entry.StartMs {
+		playbackWallMs = entry.StartMs
+	}
+	traceID := make([]byte, 6)
+	rand.Read(traceID)
+	tid := hex.EncodeToString(traceID)
+	slog.Info("ondemand ready-gate begin",
+		"trace_id", tid,
+		"channel_id", channelID,
+		"entry_id", entry.ID,
+		"media_id", entry.MediaID,
+		"profile", profile,
+		"ready_coverage_ms", readyCoverageMs,
+	)
+	media, p, subEntries, encodingID, err := a.ensureOnDemandEncoding(ctx, channelID, profile, entry, playbackWallMs, tid)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	slog.Info("ondemand encoding ready",
+		"trace_id", tid, "channel_id", channelID, "entry_id", entry.ID, "encoding_id", encodingID)
+	servePosWallMs := playbackWallMs - warmupMs
+	if servePosWallMs < entry.StartMs {
+		servePosWallMs = entry.StartMs
+	}
+	mediaPosMs := entry.OffsetMs + (servePosWallMs - entry.StartMs)
+	// Gate on actual playable coverage summed from the served segments' real
+	// durations, not a nominal segment count. Copy mode (and any future transport
+	// duration) produces irregular segment lengths, so "N segments" is not a
+	// reliable proxy for "X ms buffered": one long GOP can satisfy the cushion
+	// alone, while several short segments may not. Near the entry's end the
+	// coverage remaining may be less than the target; accept what is there so a
+	// program's tail still serves.
+	needCoverageMs := readyCoverageMs
+	if remainingMs := entry.OffsetMs + entry.DurationMs - mediaPosMs; remainingMs < needCoverageMs {
+		needCoverageMs = remainingMs
+	}
+	if needCoverageMs < 1 {
+		needCoverageMs = 1
+	}
+	segs := a.encodings.SegmentsFrom(channelID, entry.ID, mediaPosMs, packagedManifestLimit)
+	var coverageMs int64
+	for _, seg := range segs {
+		coverageMs += seg.DurationMs
+		if coverageMs >= needCoverageMs {
+			break
+		}
+	}
+	if coverageMs < needCoverageMs {
+		return "", 0, nil, fmt.Errorf("on-demand channel encoding warming media=%s profile=%s", entry.MediaID, profile)
+	}
+	bps := packageprofile.ParseBitrate(p.Video.VideoMaxBitrate)
 	if p.Video.Mode == packageprofile.VideoModeCopy {
-		// Copy mode preserves the source video bitrate, so the profile's
-		// transcode cap (or the 8 Mbps fallback) can understate BANDWIDTH by
-		// 3-4x for remux sources. hls.js sizes its buffer byte budget from
-		// BANDWIDTH; understating it makes players buffer far more bytes than
-		// intended and trip the browser's SourceBuffer quota.
 		if src := sourceAverageBps(media.Path, media.DurationMs); src > bps {
 			bps = src
 		}
@@ -294,7 +638,25 @@ func (a *app) ensureOnDemandMasterReady(ctx context.Context, channelID, profile 
 	if bps == 0 {
 		bps = 8_000_000
 	}
-	return segs[0].InitPath, bps, nil
+	if spawnedAt, firstSegAt, ok := a.encodings.EncodingTiming(channelID, entry.ID); ok {
+		now := time.Now().UnixMilli()
+		slog.Info("ondemand ready-gate complete",
+			"trace_id", tid,
+			"channel_id", channelID,
+			"entry_id", entry.ID,
+			"spawned_at_ms", spawnedAt,
+			"first_segment_at_ms", firstSegAt,
+			"ready_at_ms", now,
+			"spawn_to_ready_ms", now-spawnedAt,
+			"spawn_to_segment_ms", firstSegAt-spawnedAt,
+			"segment_to_ready_ms", now-firstSegAt,
+			"served_media_pos_ms", mediaPosMs,
+			"ready_coverage_ms", readyCoverageMs,
+			"need_coverage_ms", needCoverageMs,
+			"served_coverage_ms", coverageMs,
+		)
+	}
+	return segs[0].InitPath, bps, subEntries, nil
 }
 
 // sourceAverageBps estimates stream bitrate from the source file's size and
@@ -313,7 +675,7 @@ func sourceAverageBps(path string, durationMs int64) int64 {
 }
 
 // handleRenditionManifest serves per-profile segment playlists at
-// /channel/{channelID}/packaged/{rendition}/stream.m3u8.
+// /channels/{channelID}/streams/{profile}/stream.m3u8.
 func (a *app) handleRenditionManifest(w http.ResponseWriter, r *http.Request) {
 	channelID := r.PathValue("channelID")
 	rt := a.lookupChannelOr404(r.Context(), w, channelID)
@@ -324,13 +686,13 @@ func (a *app) handleRenditionManifest(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	rendition := r.PathValue("rendition")
-	profile, err := db.GetPackageProfile(r.Context(), a.dbConn, rendition)
+	profileName := r.PathValue("profile")
+	profile, err := db.GetPackageProfile(r.Context(), a.dbConn, profileName)
 	if err != nil || profile == nil {
 		http.NotFound(w, r)
 		return
 	}
-	a.writePackagedManifest(w, r, channelID, rendition)
+	a.writePackagedManifest(w, r, channelID, profileName)
 }
 
 // codecStringForInit runs ffprobe on initPath (combined with the first segment
@@ -352,7 +714,7 @@ func probeCodecString(initPath string) string {
 	// Probe the HLS playlist alongside init.mp4 — ffprobe reads the playlist
 	// header and enough of the first segment to expose profile and level.
 	// Falling back to init.mp4 alone returns level=-99 which is unusable.
-	playlist := filepath.Join(filepath.Dir(initPath), "stream.m3u8")
+	playlist := layout.PlaylistPath(filepath.Dir(initPath))
 	probe := playlist
 	if err := exec.Command("test", "-f", probe).Run(); err != nil {
 		probe = initPath
@@ -418,29 +780,6 @@ func probeCodecString(initPath string) string {
 	cc := constraintByte[s.Profile]
 	ll := fmt.Sprintf("%02x", s.Level)
 	return fmt.Sprintf("avc1.%s%s%s,mp4a.40.2", pid, cc, ll)
-}
-
-// parseBitrateString converts a bitrate string like "6000k" or "8M" to bps.
-func parseBitrateString(s string) int64 {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	mult := int64(1)
-	switch s[len(s)-1] {
-	case 'k', 'K':
-		mult = 1000
-		s = s[:len(s)-1]
-	case 'm', 'M':
-		mult = 1_000_000
-		s = s[:len(s)-1]
-	case 'g', 'G':
-		mult = 1_000_000_000
-		s = s[:len(s)-1]
-	}
-	var v int64
-	fmt.Sscan(s, &v)
-	return v * mult
 }
 
 func languageLabel(bcp47 string) string {

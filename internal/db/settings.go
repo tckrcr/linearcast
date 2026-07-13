@@ -10,12 +10,17 @@ import (
 )
 
 const (
-	plexTokenSettingKey       = "plex_token"
-	plexURLSettingKey         = "plex_url"
-	plexPathMapSettingKey     = "plex_path_map"
-	jellyfinURLSettingKey     = "jellyfin_url"
-	jellyfinAPIKeySettingKey  = "jellyfin_api_key"
-	jellyfinPathMapSettingKey = "jellyfin_path_map"
+	plexTokenSettingKey          = "plex_token"
+	plexURLSettingKey            = "plex_url"
+	plexPathMapSettingKey        = "plex_path_map"
+	plexUsernameSettingKey       = "plex_username"
+	plexServerNameSettingKey     = "plex_server_name"
+	jellyfinURLSettingKey        = "jellyfin_url"
+	jellyfinAPIKeySettingKey     = "jellyfin_api_key"
+	jellyfinPathMapSettingKey    = "jellyfin_path_map"
+	jellyfinServerNameSettingKey = "jellyfin_server_name"
+	jellyfinVersionSettingKey    = "jellyfin_version"
+	publicServerURLSettingKey    = "public_server_url"
 )
 
 func getSetting(ctx context.Context, conn *sql.DB, key string) (string, bool, error) {
@@ -37,6 +42,35 @@ func setSetting(ctx context.Context, conn *sql.DB, key, value string) error {
 		return fmt.Errorf("set setting %s: %w", key, err)
 	}
 	return nil
+}
+
+func deleteSetting(ctx context.Context, conn *sql.DB, key string) error {
+	if _, err := conn.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, key); err != nil {
+		return fmt.Errorf("delete setting %s: %w", key, err)
+	}
+	return nil
+}
+
+// getStringSetting reads a JSON-encoded string setting, returning "" when unset.
+func getStringSetting(ctx context.Context, conn *sql.DB, key string) (string, error) {
+	raw, ok, err := getSetting(ctx, conn, key)
+	if err != nil || !ok {
+		return "", err
+	}
+	var value string
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return "", fmt.Errorf("parse %s: %w", key, err)
+	}
+	return value, nil
+}
+
+// setStringSetting stores a JSON-encoded string setting, trimming whitespace.
+func setStringSetting(ctx context.Context, conn *sql.DB, key, value string) error {
+	b, err := json.Marshal(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", key, err)
+	}
+	return setSetting(ctx, conn, key, string(b))
 }
 
 // PlexTokenSettingExists reports whether the Plex token setting row exists.
@@ -148,6 +182,44 @@ func SetPlexPathMap(ctx context.Context, conn *sql.DB, value string) error {
 	return setSetting(ctx, conn, plexPathMapSettingKey, string(b))
 }
 
+// Plex identity (username / server name) is captured at connect time from the
+// live probe and replayed by the status endpoint so the panel can show the
+// account without probing on every open.
+
+func GetPlexUsername(ctx context.Context, conn *sql.DB) (string, error) {
+	return getStringSetting(ctx, conn, plexUsernameSettingKey)
+}
+
+func SetPlexUsername(ctx context.Context, conn *sql.DB, value string) error {
+	return setStringSetting(ctx, conn, plexUsernameSettingKey, value)
+}
+
+func GetPlexServerName(ctx context.Context, conn *sql.DB) (string, error) {
+	return getStringSetting(ctx, conn, plexServerNameSettingKey)
+}
+
+func SetPlexServerName(ctx context.Context, conn *sql.DB, value string) error {
+	return setStringSetting(ctx, conn, plexServerNameSettingKey, value)
+}
+
+// DeletePlexIdentity removes the stored Plex username/server name rows, called
+// when the Plex connection is cleared.
+func DeletePlexIdentity(ctx context.Context, conn *sql.DB) error {
+	if err := deleteSetting(ctx, conn, plexUsernameSettingKey); err != nil {
+		return err
+	}
+	return deleteSetting(ctx, conn, plexServerNameSettingKey)
+}
+
+func GetPublicServerURL(ctx context.Context, conn *sql.DB) (string, error) {
+	return getStringSetting(ctx, conn, publicServerURLSettingKey)
+}
+
+func SetPublicServerURL(ctx context.Context, conn *sql.DB, value string) error {
+	value = strings.TrimRight(strings.TrimSpace(value), "/")
+	return setStringSetting(ctx, conn, publicServerURLSettingKey, value)
+}
+
 // GetJellyfinURL returns the stored Jellyfin URL. Empty means callers should
 // use their configured env/default URL.
 func GetJellyfinURL(ctx context.Context, conn *sql.DB) (string, error) {
@@ -225,6 +297,35 @@ func SetJellyfinPathMap(ctx context.Context, conn *sql.DB, value string) error {
 		return fmt.Errorf("marshal jellyfin path map: %w", err)
 	}
 	return setSetting(ctx, conn, jellyfinPathMapSettingKey, string(b))
+}
+
+// Jellyfin identity (server name / version) is captured at connect time from the
+// live probe and replayed by the status endpoint so the panel can show the
+// server without probing on every open.
+
+func GetJellyfinServerName(ctx context.Context, conn *sql.DB) (string, error) {
+	return getStringSetting(ctx, conn, jellyfinServerNameSettingKey)
+}
+
+func SetJellyfinServerName(ctx context.Context, conn *sql.DB, value string) error {
+	return setStringSetting(ctx, conn, jellyfinServerNameSettingKey, value)
+}
+
+func GetJellyfinVersion(ctx context.Context, conn *sql.DB) (string, error) {
+	return getStringSetting(ctx, conn, jellyfinVersionSettingKey)
+}
+
+func SetJellyfinVersion(ctx context.Context, conn *sql.DB, value string) error {
+	return setStringSetting(ctx, conn, jellyfinVersionSettingKey, value)
+}
+
+// DeleteJellyfinIdentity removes the stored Jellyfin server name/version rows,
+// called when the Jellyfin connection is cleared.
+func DeleteJellyfinIdentity(ctx context.Context, conn *sql.DB) error {
+	if err := deleteSetting(ctx, conn, jellyfinServerNameSettingKey); err != nil {
+		return err
+	}
+	return deleteSetting(ctx, conn, jellyfinVersionSettingKey)
 }
 
 // GetSubtitleLanguagePreference returns the ordered list of ISO 639-2 language
@@ -330,119 +431,14 @@ const (
 	encoderMaxAttemptsSettingKey          = "encoder_max_attempts"
 )
 
-const (
-	onDemandGraceSecondsSettingKey           = "on_demand_grace_seconds"
-	onDemandMaxConcurrentSettingKey          = "on_demand_max_concurrent"
-	onDemandEvictIdleSecondsSettingKey       = "on_demand_evict_idle_seconds"
-	onDemandStallTimeoutSecondsSettingKey    = "on_demand_stall_timeout_seconds"
-	onDemandRestartBudgetSettingKey          = "on_demand_restart_budget"
-	onDemandKeepaliveCeilingSecSettingKey    = "on_demand_keepalive_ceiling_sec"
-)
-
-// OnDemandSessionSettings bundles the tunable knobs for on-demand live
-// sessions. Time values are in seconds (the unit shown in the admin UI).
-type OnDemandSessionSettings struct {
-	GraceSeconds        int `json:"graceSeconds"`
-	MaxConcurrent       int `json:"maxConcurrent"`
-	EvictIdleSeconds    int `json:"evictIdleSeconds"`
-	StallTimeoutSeconds int `json:"stallTimeoutSeconds"`
-	RestartBudget       int `json:"restartBudget"`
-	KeepaliveCeilingSec int `json:"keepaliveCeilingSec"`
-}
-
-const (
-	DefaultOnDemandGraceSeconds        = 120
-	DefaultOnDemandMaxConcurrent       = 4
-	DefaultOnDemandEvictIdleSeconds    = 10
-	DefaultOnDemandStallTimeoutSeconds = 45
-	DefaultOnDemandRestartBudget       = 3
-	DefaultOnDemandKeepaliveCeilingSec = 900
-)
-
-// GetOnDemandSessionSettings returns the on-demand session knobs. Missing or
-// invalid rows fall back to package defaults.
-func GetOnDemandSessionSettings(ctx context.Context, conn *sql.DB) (OnDemandSessionSettings, error) {
-	grace, err := getPositiveIntSetting(ctx, conn, onDemandGraceSecondsSettingKey, DefaultOnDemandGraceSeconds)
-	if err != nil {
-		return OnDemandSessionSettings{}, err
-	}
-	maxConc, err := getPositiveIntSetting(ctx, conn, onDemandMaxConcurrentSettingKey, DefaultOnDemandMaxConcurrent)
-	if err != nil {
-		return OnDemandSessionSettings{}, err
-	}
-	evictIdle, err := getPositiveIntSetting(ctx, conn, onDemandEvictIdleSecondsSettingKey, DefaultOnDemandEvictIdleSeconds)
-	if err != nil {
-		return OnDemandSessionSettings{}, err
-	}
-	stallTimeout, err := getPositiveIntSetting(ctx, conn, onDemandStallTimeoutSecondsSettingKey, DefaultOnDemandStallTimeoutSeconds)
-	if err != nil {
-		return OnDemandSessionSettings{}, err
-	}
-	restartBudget, err := getPositiveIntSetting(ctx, conn, onDemandRestartBudgetSettingKey, DefaultOnDemandRestartBudget)
-	if err != nil {
-		return OnDemandSessionSettings{}, err
-	}
-	keepaliveCeiling, err := getPositiveIntSetting(ctx, conn, onDemandKeepaliveCeilingSecSettingKey, DefaultOnDemandKeepaliveCeilingSec)
-	if err != nil {
-		return OnDemandSessionSettings{}, err
-	}
-	return OnDemandSessionSettings{
-		GraceSeconds:        grace,
-		MaxConcurrent:       maxConc,
-		EvictIdleSeconds:    evictIdle,
-		StallTimeoutSeconds: stallTimeout,
-		RestartBudget:       restartBudget,
-		KeepaliveCeilingSec: keepaliveCeiling,
-	}, nil
-}
-
-// SetOnDemandSessionSettings validates and persists all on-demand session
-// knobs. Each value must be > 0.
-func SetOnDemandSessionSettings(ctx context.Context, conn *sql.DB, s OnDemandSessionSettings) error {
-	if s.GraceSeconds <= 0 {
-		return fmt.Errorf("graceSeconds must be > 0 (got %d)", s.GraceSeconds)
-	}
-	if s.MaxConcurrent <= 0 {
-		return fmt.Errorf("maxConcurrent must be > 0 (got %d)", s.MaxConcurrent)
-	}
-	if s.EvictIdleSeconds <= 0 {
-		return fmt.Errorf("evictIdleSeconds must be > 0 (got %d)", s.EvictIdleSeconds)
-	}
-	if s.StallTimeoutSeconds <= 0 {
-		return fmt.Errorf("stallTimeoutSeconds must be > 0 (got %d)", s.StallTimeoutSeconds)
-	}
-	if s.RestartBudget <= 0 {
-		return fmt.Errorf("restartBudget must be > 0 (got %d)", s.RestartBudget)
-	}
-	if s.KeepaliveCeilingSec <= 0 {
-		return fmt.Errorf("keepaliveCeilingSec must be > 0 (got %d)", s.KeepaliveCeilingSec)
-	}
-	if err := setPositiveIntSetting(ctx, conn, onDemandGraceSecondsSettingKey, s.GraceSeconds); err != nil {
-		return err
-	}
-	if err := setPositiveIntSetting(ctx, conn, onDemandMaxConcurrentSettingKey, s.MaxConcurrent); err != nil {
-		return err
-	}
-	if err := setPositiveIntSetting(ctx, conn, onDemandEvictIdleSecondsSettingKey, s.EvictIdleSeconds); err != nil {
-		return err
-	}
-	if err := setPositiveIntSetting(ctx, conn, onDemandStallTimeoutSecondsSettingKey, s.StallTimeoutSeconds); err != nil {
-		return err
-	}
-	if err := setPositiveIntSetting(ctx, conn, onDemandRestartBudgetSettingKey, s.RestartBudget); err != nil {
-		return err
-	}
-	return setPositiveIntSetting(ctx, conn, onDemandKeepaliveCeilingSecSettingKey, s.KeepaliveCeilingSec)
-}
-
 // Default values for the scheduler tunables. Mirrored in schema.sql's settings
 // seed so fresh installs and migrations land on the same numbers.
 const (
-	// Horizon caps how far ahead the extender generates schedule. It is held at
-	// the EPG/guide visible window (24h) — generating beyond what the UI can show
-	// is wasted work. Raise this if the guide views are widened (e.g. to 7 days).
-	// Low-water must stay strictly below horizon; 23h keeps the full visible
-	// window filled while re-extending roughly hourly.
+	// Horizon caps how far ahead the extender generates schedule. The default
+	// stays conservative so small looping channels do not generate days of
+	// repetitive entries unless an operator widens the scheduler horizon in
+	// Tools. Low-water must stay strictly below horizon; 23h keeps the 24h
+	// guide window filled while re-extending roughly hourly.
 	DefaultSchedulerHorizonHours  = 24
 	DefaultSchedulerLowWaterHours = 23
 	DefaultSchedulerTickSeconds   = 300

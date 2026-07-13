@@ -21,13 +21,15 @@ type guideEntry struct {
 }
 
 type guideChannel struct {
-	ID          string              `json:"id"`
-	DisplayName string              `json:"displayName"`
-	ArtworkURL  string              `json:"artworkUrl,omitempty"`
-	Status      string              `json:"status"`
-	IsExternal  bool                `json:"isExternal,omitempty"`
-	PrefillMode string              `json:"prefillMode,omitempty"`
-	NowPlaying  *externalNowPlaying `json:"nowPlaying,omitempty"`
+	ID             string              `json:"id"`
+	DisplayName    string              `json:"displayName"`
+	ArtworkURL     string              `json:"artworkUrl,omitempty"`
+	Status         string              `json:"status"`
+	IsExternal     bool                `json:"isExternal,omitempty"`
+	PrefillMode    string              `json:"prefillMode,omitempty"`
+	ScheduleMode   string              `json:"scheduleMode,omitempty"`
+	SlotDurationMs *int64              `json:"slotDurationMs,omitempty"`
+	NowPlaying     *externalNowPlaying `json:"nowPlaying,omitempty"`
 	// ScheduleEndMs is the end of the channel's last scheduled entry. The guide
 	// uses it to stop paging past where a schedule has actually been built (so
 	// "next" doesn't advance into expected, not-yet-generated gaps).
@@ -87,7 +89,7 @@ func (a *App) handleGuide(w http.ResponseWriter, r *http.Request) {
 				ID:          ch.ID,
 				DisplayName: ch.DisplayName,
 				ArtworkURL:  artworkForExternalChannel(ch, nowPlaying),
-				Status:      "live",
+				Status:      a.externalChannelStatus(r.Context(), ch),
 				IsExternal:  true,
 				NowPlaying:  nowPlaying,
 				Entries:     []guideEntry{},
@@ -120,13 +122,15 @@ func (a *App) handleGuide(w http.ResponseWriter, r *http.Request) {
 		}
 
 		out = append(out, guideChannel{
-			ID:            now.ID,
-			DisplayName:   now.DisplayName,
-			ArtworkURL:    now.ArtworkURL,
-			Status:        now.Status,
-			PrefillMode:   now.PrefillMode,
-			ScheduleEndMs: now.ScheduleEndMs,
-			Entries:       entries,
+			ID:             now.ID,
+			DisplayName:    now.DisplayName,
+			ArtworkURL:     now.ArtworkURL,
+			Status:         now.Status,
+			PrefillMode:    now.PrefillMode,
+			ScheduleMode:   ch.ScheduleMode,
+			SlotDurationMs: ch.SlotDurationMs,
+			ScheduleEndMs:  now.ScheduleEndMs,
+			Entries:        entries,
 		})
 	}
 

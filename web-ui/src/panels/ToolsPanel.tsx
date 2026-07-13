@@ -1,34 +1,35 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useState } from "react";
 import {
   cleanupInvalidProfilePackages,
+  clearSpotifyUrl,
+  describeProbeResult,
   getCacheSummary,
   getEncoderSweeperSettings,
-  getOnDemandSessionSettings,
+  getPublicServerURL,
   getSchedulerTunables,
+  getSpotifyUrl,
   getSubtitleSettings,
-  optimizeDatabase,
+  probeUpstreamHLS,
+  saveSpotifyUrl,
   updateEncoderSweeperSettings,
-  updateOnDemandSessionSettings,
+  updatePublicServerURL,
   updateSchedulerTunables,
   updateSubtitleSettings,
 } from "../api";
 import { formatBytes, formatMs } from "../format";
-import { MediaSourcesPanel } from "./MediaSourcesPanel";
+import type { CacheSummary, SpotifyUrl } from "../types";
 import { MaintenancePanel } from "./MaintenancePanel";
-import { AddLiveChannelDialog } from "./AddLiveChannelDialog";
 import { WriteLogPanel } from "./WriteLogPanel";
-import type { CacheSummary } from "../types";
 import styles from "./ToolsPanel.module.css";
 
-export function ToolsPanel({ onChannelImported }: { onChannelImported: () => void }) {
+export function ToolsPanel({ onChannelChanged }: { onChannelChanged?: () => void }) {
   const [cacheSummary, setCacheSummary] = useState<CacheSummary | null>(null);
   const [cacheBusy, setCacheBusy] = useState(false);
   const [cacheStatus, setCacheStatus] = useState("");
-  const [addLiveOpen, setAddLiveOpen] = useState(false);
 
   async function refreshCache() {
     setCacheBusy(true);
-    setCacheStatus(cacheSummary ? "refreshing…" : "loading…");
+    setCacheStatus(cacheSummary ? "refreshing..." : "loading...");
     try {
       setCacheSummary(await getCacheSummary());
       setCacheStatus("");
@@ -45,82 +46,113 @@ export function ToolsPanel({ onChannelImported }: { onChannelImported: () => voi
 
   return (
     <>
-    <div className="admin-panel">
-      <MediaSourcesPanel />
+      <div className="admin-panel">
+        <SettingsSection onChannelChanged={onChannelChanged} />
 
-      <section className="admin-panel-section">
-        <div className="section-headline">
-          <h2>Live channels</h2>
-          <button type="button" onClick={() => setAddLiveOpen(true)}>
-            + Add live channel
-          </button>
-        </div>
-        <p className="muted">
-          Create a channel that proxies an upstream HLS manifest. It goes live
-          immediately and appears in the guide on linearcast's next ~60s refresh.
-        </p>
-      </section>
+        <section className="admin-panel-section">
+          <div className="section-headline">
+            <div className="section-headline-main">
+              <h2>Cache monitoring</h2>
+              <p className="section-purpose">
+                Packaged-media disk usage and readiness, broken down by channel and profile.
+              </p>
+            </div>
+            <button type="button" disabled={cacheBusy} onClick={() => void refreshCache()}>
+              {cacheBusy ? "refreshing" : "refresh"}
+            </button>
+          </div>
+          <CacheSummaryPanel
+            summary={cacheSummary}
+            status={cacheStatus}
+            onCleanupInvalidProfiles={async () => {
+              const preview = await cleanupInvalidProfilePackages(true);
+              if (preview.removed.length === 0) return;
+              const msg = `Remove ${preview.removed.length} invalid-profile package(s) (${formatBytes(preview.totalBytes)} on disk)?`;
+              if (!window.confirm(msg)) return;
+              await cleanupInvalidProfilePackages(false);
+              void refreshCache();
+            }}
+          />
+        </section>
 
-      <section className="admin-panel-section">
-        <div className="section-headline">
-          <h2>Cache monitoring</h2>
-          <button type="button" disabled={cacheBusy} onClick={() => void refreshCache()}>
-            {cacheBusy ? "refreshing" : "refresh"}
-          </button>
-        </div>
-        <CacheSummaryPanel
-          summary={cacheSummary}
-          status={cacheStatus}
-          onCleanupInvalidProfiles={async () => {
-            const preview = await cleanupInvalidProfilePackages(true);
-            if (preview.removed.length === 0) return;
-            const msg = `Remove ${preview.removed.length} invalid-profile package(s) (${formatBytes(preview.totalBytes)} on disk)?`;
-            if (!window.confirm(msg)) return;
-            await cleanupInvalidProfilePackages(false);
-            void refreshCache();
-          }}
-        />
-      </section>
+        <MaintenancePanel onChanged={() => {}} />
+      </div>
 
-      <MaintenancePanel onChanged={() => void refreshCache()} />
-
-      <section className={`admin-panel-section ${styles["settings-row"]}`}>
-        <SchedulerTunablesPanel />
-        <EncoderSweeperSettingsPanel />
-        <OnDemandSessionSettingsPanel />
-        <SubtitleSettingsPanel />
-      </section>
-    </div>
-
-    <WriteLogPanel />
-
-    <AddLiveChannelDialog
-      open={addLiveOpen}
-      onClose={() => setAddLiveOpen(false)}
-      onCreated={() => {
-        setAddLiveOpen(false);
-        onChannelImported();
-      }}
-    />
+      <WriteLogPanel />
     </>
   );
 }
 
-function SchedulerTunablesPanel() {
-  const [draft, setDraft] = useState({ horizonHours: "", lowWaterHours: "", tickSeconds: "" });
+// ---------------------------------------------------------------------------
+// Settings — one table consolidating the scalar operational tunables that used
+// to live in their own per-group sections (the scheduler tunables that lived
+// under Guide, the encoder sweeper, subtitles) plus the singleton Spotify→HLS
+// channel URL. The single top-right Save persists every underlying endpoint.
+// ---------------------------------------------------------------------------
+
+const SETTINGS_HELP = {
+  horizonHours: "How far ahead the scheduler tries to keep each channel filled. Larger values build more schedule in advance.",
+  lowWaterHours: "When remaining coverage drops below this many hours, the scheduler extends the channel back up toward the horizon. Must be less than horizon hours.",
+  tickSeconds: "How often the scheduler wakes up to check whether any channel has fallen below the low-water mark.",
+  sweepIntervalSeconds: "How often the admin server checks for encoder jobs whose lease expired because the worker stopped heartbeating.",
+  maxAttempts: "How many transient encode failures a package can accumulate before it is marked failed instead of being retried.",
+  subtitleLanguages: "Preferred subtitle languages, in order, used when extracting and selecting caption tracks. Comma-separated 3-letter ISO 639-2 codes, e.g. eng, spa.",
+  subtitleAutoEnable: "Automatically enable the top preferred language as a caption track in the player.",
+  spotifyUrl: "Play one external audio stream — a Spotify→HLS bridge — as a channel. Set or update the HLS URL to upsert the channel; clear it to remove the channel. Appears in the guide within a minute.",
+  publicServerUrl: "Public origin used for copyable IPTV/DVR URLs. Leave empty to use the address currently open in this browser.",
+};
+
+type SettingsDraft = {
+  horizonHours: string;
+  lowWaterHours: string;
+  tickSeconds: string;
+  sweepIntervalSeconds: string;
+  maxAttempts: string;
+  subtitleLanguages: string;
+  subtitleAutoEnable: boolean;
+  spotifyUrl: string;
+  publicServerUrl: string;
+};
+
+type NumericSettingKey = "horizonHours" | "lowWaterHours" | "tickSeconds" | "sweepIntervalSeconds" | "maxAttempts";
+
+const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
+  horizonHours: "",
+  lowWaterHours: "",
+  tickSeconds: "",
+  sweepIntervalSeconds: "",
+  maxAttempts: "",
+  subtitleLanguages: "",
+  subtitleAutoEnable: false,
+  spotifyUrl: "",
+  publicServerUrl: "",
+};
+
+export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () => void }) {
+  const [draft, setDraft] = useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
+  const [spotify, setSpotify] = useState<SpotifyUrl | null>(null);
+  const [probe, setProbe] = useState<{ ok: boolean; text: string } | null>(null);
+  const [probing, setProbing] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
 
   useEffect(() => {
     let cancelled = false;
-    getSchedulerTunables()
-      .then((t) => {
+    Promise.all([getSchedulerTunables(), getEncoderSweeperSettings(), getSubtitleSettings(), getSpotifyUrl(), getPublicServerURL()])
+      .then(([scheduler, sweeper, subtitles, spotifyUrl, publicServer]) => {
         if (cancelled) return;
+        setSpotify(spotifyUrl);
         setDraft({
-          horizonHours: String(t.horizonHours),
-          lowWaterHours: String(t.lowWaterHours),
-          tickSeconds: String(t.tickSeconds),
+          horizonHours: String(scheduler.horizonHours),
+          lowWaterHours: String(scheduler.lowWaterHours),
+          tickSeconds: String(scheduler.tickSeconds),
+          sweepIntervalSeconds: String(sweeper.sweepIntervalSeconds),
+          maxAttempts: String(sweeper.maxAttempts),
+          subtitleLanguages: subtitles.subtitleLanguagePreference.join(", "),
+          subtitleAutoEnable: subtitles.subtitleAutoEnable,
+          spotifyUrl: spotifyUrl.upstreamHlsUrl ?? "",
+          publicServerUrl: publicServer.publicServerUrl ?? "",
         });
         setLoaded(true);
         setStatus("");
@@ -128,153 +160,99 @@ function SchedulerTunablesPanel() {
       .catch((err) => {
         if (!cancelled) setStatus(err instanceof Error ? err.message : String(err));
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
+
+  function setField(key: keyof SettingsDraft, value: string | boolean) {
+    setDraft((prev) => ({ ...prev, [key]: value }));
+    setStatus("");
+  }
+
+  async function testSpotify() {
+    const trimmed = draft.spotifyUrl.trim();
+    if (!trimmed) return;
+    setProbing(true);
+    setProbe(null);
+    try {
+      setProbe(describeProbeResult(await probeUpstreamHLS(trimmed)));
+    } catch (err) {
+      setProbe({ ok: false, text: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setProbing(false);
+    }
+  }
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+
     const horizonHours = parseInt(draft.horizonHours, 10);
     const lowWaterHours = parseInt(draft.lowWaterHours, 10);
     const tickSeconds = parseInt(draft.tickSeconds, 10);
-
-    if (Number.isNaN(horizonHours) || horizonHours <= 0) {
-      setStatus("horizon hours must be > 0");
-      return;
-    }
-    if (Number.isNaN(lowWaterHours) || lowWaterHours <= 0) {
-      setStatus("low-water hours must be > 0");
-      return;
-    }
-    if (Number.isNaN(tickSeconds) || tickSeconds <= 0) {
-      setStatus("tick seconds must be > 0");
-      return;
-    }
-    if (lowWaterHours >= horizonHours) {
-      setStatus("low-water hours must be less than horizon hours");
-      return;
-    }
-
-    const payload = { horizonHours, lowWaterHours, tickSeconds };
-    setBusy(true);
-    setStatus("saving...");
-    try {
-      const saved = await updateSchedulerTunables(payload);
-      setDraft({
-        horizonHours: String(saved.horizonHours),
-        lowWaterHours: String(saved.lowWaterHours),
-        tickSeconds: String(saved.tickSeconds),
-      });
-      setStatus("saved");
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className={styles["settings-col"]}>
-      <h2>Scheduler tunables</h2>
-      <form className={`${styles["admin-form"]} scheduler-tunables-form`} onSubmit={(event) => void save(event)}>
-        <label>
-          <span>horizon hours</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.horizonHours}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, horizonHours: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>low-water hours</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.lowWaterHours}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, lowWaterHours: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>tick seconds</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.tickSeconds}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, tickSeconds: event.target.value }))
-            }
-          />
-        </label>
-        <div className="admin-form-actions">
-          <button type="submit" disabled={busy || !loaded}>
-            {busy ? "Saving..." : "Save tunables"}
-          </button>
-          {status && <span className="muted">{status}</span>}
-        </div>
-      </form>
-    </div>
-  );
-}
-
-function EncoderSweeperSettingsPanel() {
-  const [draft, setDraft] = useState({ sweepIntervalSeconds: "", maxAttempts: "" });
-  const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    getEncoderSweeperSettings()
-      .then((s) => {
-        if (cancelled) return;
-        setDraft({
-          sweepIntervalSeconds: String(s.sweepIntervalSeconds),
-          maxAttempts: String(s.maxAttempts),
-        });
-        setLoaded(true);
-        setStatus("");
-      })
-      .catch((err) => {
-        if (!cancelled) setStatus(err instanceof Error ? err.message : String(err));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  async function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
     const sweepIntervalSeconds = parseInt(draft.sweepIntervalSeconds, 10);
     const maxAttempts = parseInt(draft.maxAttempts, 10);
 
-    if (Number.isNaN(sweepIntervalSeconds) || sweepIntervalSeconds <= 0) {
-      setStatus("sweep interval seconds must be > 0");
+    const positive: [string, number][] = [
+      ["Horizon hours", horizonHours],
+      ["Low-water hours", lowWaterHours],
+      ["Tick seconds", tickSeconds],
+      ["Sweep interval (seconds)", sweepIntervalSeconds],
+      ["Max attempts", maxAttempts],
+    ];
+    for (const [label, value] of positive) {
+      if (Number.isNaN(value) || value <= 0) {
+        setStatus(`${label} must be greater than 0`);
+        return;
+      }
+    }
+    if (lowWaterHours >= horizonHours) {
+      setStatus("Low-water hours must be less than horizon hours");
       return;
     }
-    if (Number.isNaN(maxAttempts) || maxAttempts <= 0) {
-      setStatus("max attempts must be > 0");
+    const langs = parseSubtitleLanguageText(draft.subtitleLanguages);
+    if (!langs.valid) {
+      setStatus(langs.message);
       return;
     }
 
-    const payload = { sweepIntervalSeconds, maxAttempts };
+    // Spotify URL is upserted when set/changed and the channel is removed when
+    // the field is emptied — guard the destructive case before anything saves.
+    const spotifyTrimmed = draft.spotifyUrl.trim();
+    const spotifyOriginal = spotify?.upstreamHlsUrl ?? "";
+    const spotifyChanged = spotifyTrimmed !== spotifyOriginal;
+    const clearingSpotify = spotifyChanged && spotifyTrimmed === "" && (spotify?.configured ?? false);
+    if (clearingSpotify && !window.confirm("Remove the Spotify channel?")) return;
+
     setBusy(true);
-    setStatus("saving...");
+    setStatus("saving…");
     try {
-      const saved = await updateEncoderSweeperSettings(payload);
+      const [scheduler, sweeper, subtitles, publicServer] = await Promise.all([
+        updateSchedulerTunables({ horizonHours, lowWaterHours, tickSeconds }),
+        updateEncoderSweeperSettings({ sweepIntervalSeconds, maxAttempts }),
+        updateSubtitleSettings({
+          subtitleAutoEnable: draft.subtitleAutoEnable,
+          subtitleLanguagePreference: langs.languages,
+        }),
+        updatePublicServerURL(draft.publicServerUrl.trim()),
+      ]);
+      let nextSpotify = spotify;
+      if (spotifyChanged) {
+        nextSpotify = spotifyTrimmed ? await saveSpotifyUrl(spotifyTrimmed) : await clearSpotifyUrl();
+        setSpotify(nextSpotify);
+        setProbe(null);
+      }
       setDraft({
-        sweepIntervalSeconds: String(saved.sweepIntervalSeconds),
-        maxAttempts: String(saved.maxAttempts),
+        horizonHours: String(scheduler.horizonHours),
+        lowWaterHours: String(scheduler.lowWaterHours),
+        tickSeconds: String(scheduler.tickSeconds),
+        sweepIntervalSeconds: String(sweeper.sweepIntervalSeconds),
+        maxAttempts: String(sweeper.maxAttempts),
+        subtitleLanguages: subtitles.subtitleLanguagePreference.join(", "),
+        subtitleAutoEnable: subtitles.subtitleAutoEnable,
+        spotifyUrl: nextSpotify?.upstreamHlsUrl ?? "",
+        publicServerUrl: publicServer.publicServerUrl ?? "",
       });
       setStatus("saved");
+      if (spotifyChanged) onChannelChanged?.();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -282,287 +260,142 @@ function EncoderSweeperSettingsPanel() {
     }
   }
 
-  return (
-    <div className={styles["settings-col"]}>
-      <h2>Encoder sweeper</h2>
-      <form className={`${styles["admin-form"]} encoder-sweeper-form`} onSubmit={(event) => void save(event)}>
-        <label>
-          <span>sweep interval (seconds)</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.sweepIntervalSeconds}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, sweepIntervalSeconds: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>max attempts</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.maxAttempts}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, maxAttempts: event.target.value }))
-            }
-          />
-        </label>
-        <div className="admin-form-actions">
-          <button type="submit" disabled={busy || !loaded}>
-            {busy ? "Saving..." : "Save sweeper settings"}
-          </button>
-          {status && <span className="muted">{status}</span>}
-        </div>
-      </form>
+  const numberInput = (key: NumericSettingKey) => (
+    <input
+      type="number"
+      min={1}
+      value={draft[key]}
+      disabled={busy || !loaded}
+      onChange={(event) => setField(key, event.target.value)}
+    />
+  );
+
+  const np = spotify?.nowPlaying;
+  const spotifyControl = (
+    <div className={styles["spotify-cell"]}>
+      <input
+        type="url"
+        value={draft.spotifyUrl}
+        disabled={busy || !loaded}
+        placeholder="https://example.com/stream.m3u8"
+        onChange={(event) => {
+          setField("spotifyUrl", event.target.value);
+          setProbe(null);
+        }}
+      />
+      <div className={styles["spotify-cell-meta"]}>
+        <button
+          type="button"
+          className="link-button"
+          disabled={busy || probing || !draft.spotifyUrl.trim()}
+          onClick={() => void testSpotify()}
+        >
+          {probing ? "Testing…" : "Test reachability"}
+        </button>
+        {spotify?.configured && spotify.status && (
+          <span className={`status status-${spotify.status}`}>{spotify.status}</span>
+        )}
+      </div>
+      {probe && (
+        <span className={probe.ok ? "success" : "warn"}>
+          {probe.ok ? "✓ " : "⚠ "}
+          {probe.text}
+        </span>
+      )}
+      {spotify?.configured && np?.title && (
+        <span className="muted">
+          Now playing: {np.artist ? `${np.title} — ${np.artist}` : np.title}
+        </span>
+      )}
     </div>
   );
-}
 
-function SubtitleSettingsPanel() {
-  // Only controls auto-enable. Language preference lives in the Subtitles panel.
-  // We still fetch + round-trip the language preference so saving auto-enable
-  // doesn't clobber it.
-  const [autoEnable, setAutoEnable] = useState(false);
-  const [languagePreference, setLanguagePreference] = useState<string[]>(["eng"]);
-  const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    getSubtitleSettings()
-      .then((settings) => {
-        if (cancelled) return;
-        setAutoEnable(settings.subtitleAutoEnable);
-        setLanguagePreference(settings.subtitleLanguagePreference);
-        setLoaded(true);
-      })
-      .catch((err) => {
-        if (!cancelled) setStatus(err instanceof Error ? err.message : String(err));
-      });
-    return () => { cancelled = true; };
-  }, []);
-
-  async function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setBusy(true);
-    setStatus("saving...");
-    try {
-      const saved = await updateSubtitleSettings({
-        subtitleAutoEnable: autoEnable,
-        subtitleLanguagePreference: languagePreference,
-      });
-      setAutoEnable(saved.subtitleAutoEnable);
-      setLanguagePreference(saved.subtitleLanguagePreference);
-      setStatus("saved");
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className={styles["settings-col"]}>
-      <h2>Subtitle settings</h2>
-      <form className={`${styles["admin-form"]} ${styles["subtitle-settings-form"]}`} onSubmit={(event) => void save(event)}>
-        <label className={styles["admin-checkbox-label"]}>
-          <input
-            type="checkbox"
-            checked={autoEnable}
-            disabled={busy || !loaded}
-            onChange={(event) => setAutoEnable(event.target.checked)}
-          />
-          <span>auto-enable top language in player</span>
-        </label>
-        <div className="admin-form-actions">
-          <button type="submit" disabled={busy || !loaded}>
-            {busy ? "Saving..." : "Save"}
-          </button>
-          {status && <span className="muted">{status}</span>}
-        </div>
-      </form>
-    </div>
-  );
-}
-
-function OnDemandSessionSettingsPanel() {
-  const [draft, setDraft] = useState({
-    graceSeconds: "",
-    maxConcurrent: "",
-    evictIdleSeconds: "",
-    stallTimeoutSeconds: "",
-    restartBudget: "",
-    keepaliveCeilingSec: "",
-  });
-  const [loaded, setLoaded] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-    getOnDemandSessionSettings()
-      .then((s) => {
-        if (cancelled) return;
-        setDraft({
-          graceSeconds: String(s.graceSeconds),
-          maxConcurrent: String(s.maxConcurrent),
-          evictIdleSeconds: String(s.evictIdleSeconds),
-          stallTimeoutSeconds: String(s.stallTimeoutSeconds),
-          restartBudget: String(s.restartBudget),
-          keepaliveCeilingSec: String(s.keepaliveCeilingSec),
-        });
-        setLoaded(true);
-        setStatus("");
-      })
-      .catch((err) => {
-        if (!cancelled) setStatus(err instanceof Error ? err.message : String(err));
-      });
-    return () => { cancelled = true; };
-  }, []);
-
-  async function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const graceSeconds = parseInt(draft.graceSeconds, 10);
-    const maxConcurrent = parseInt(draft.maxConcurrent, 10);
-    const evictIdleSeconds = parseInt(draft.evictIdleSeconds, 10);
-    const stallTimeoutSeconds = parseInt(draft.stallTimeoutSeconds, 10);
-    const restartBudget = parseInt(draft.restartBudget, 10);
-    const keepaliveCeilingSec = parseInt(draft.keepaliveCeilingSec, 10);
-
-    if (Number.isNaN(graceSeconds) || graceSeconds <= 0) {
-      setStatus("grace seconds must be > 0");
-      return;
-    }
-    if (Number.isNaN(maxConcurrent) || maxConcurrent <= 0) {
-      setStatus("max concurrent must be > 0");
-      return;
-    }
-    if (Number.isNaN(evictIdleSeconds) || evictIdleSeconds <= 0) {
-      setStatus("evict idle seconds must be > 0");
-      return;
-    }
-    if (Number.isNaN(stallTimeoutSeconds) || stallTimeoutSeconds <= 0) {
-      setStatus("stall timeout seconds must be > 0");
-      return;
-    }
-    if (Number.isNaN(restartBudget) || restartBudget <= 0) {
-      setStatus("restart budget must be > 0");
-      return;
-    }
-    if (Number.isNaN(keepaliveCeilingSec) || keepaliveCeilingSec <= 0) {
-      setStatus("keepalive ceiling must be > 0");
-      return;
-    }
-
-    const payload = { graceSeconds, maxConcurrent, evictIdleSeconds, stallTimeoutSeconds, restartBudget, keepaliveCeilingSec };
-    setBusy(true);
-    setStatus("saving...");
-    try {
-      const saved = await updateOnDemandSessionSettings(payload);
-      setDraft({
-        graceSeconds: String(saved.graceSeconds),
-        maxConcurrent: String(saved.maxConcurrent),
-        evictIdleSeconds: String(saved.evictIdleSeconds),
-        stallTimeoutSeconds: String(saved.stallTimeoutSeconds),
-        restartBudget: String(saved.restartBudget),
-        keepaliveCeilingSec: String(saved.keepaliveCeilingSec),
-      });
-      setStatus("saved");
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
+  const rows: { label: string; control: ReactNode; description: string }[] = [
+    { label: "Horizon hours", control: numberInput("horizonHours"), description: SETTINGS_HELP.horizonHours },
+    { label: "Low-water hours", control: numberInput("lowWaterHours"), description: SETTINGS_HELP.lowWaterHours },
+    { label: "Tick seconds", control: numberInput("tickSeconds"), description: SETTINGS_HELP.tickSeconds },
+    { label: "Sweep interval (seconds)", control: numberInput("sweepIntervalSeconds"), description: SETTINGS_HELP.sweepIntervalSeconds },
+    { label: "Max attempts", control: numberInput("maxAttempts"), description: SETTINGS_HELP.maxAttempts },
+    {
+      label: "Subtitle languages",
+      control: (
+        <input
+          type="text"
+          value={draft.subtitleLanguages}
+          disabled={busy || !loaded}
+          placeholder="eng, spa"
+          onChange={(event) => setField("subtitleLanguages", event.target.value)}
+        />
+      ),
+      description: SETTINGS_HELP.subtitleLanguages,
+    },
+    {
+      label: "Auto-enable subtitles",
+      control: (
+        <select
+          value={draft.subtitleAutoEnable ? "yes" : "no"}
+          disabled={busy || !loaded}
+          onChange={(event) => setField("subtitleAutoEnable", event.target.value === "yes")}
+        >
+          <option value="yes">Yes</option>
+          <option value="no">No</option>
+        </select>
+      ),
+      description: SETTINGS_HELP.subtitleAutoEnable,
+    },
+    { label: "Spotify URL", control: spotifyControl, description: SETTINGS_HELP.spotifyUrl },
+    {
+      label: "Public server URL",
+      control: (
+        <input
+          type="url"
+          value={draft.publicServerUrl}
+          disabled={busy || !loaded}
+          placeholder={typeof window !== "undefined" ? window.location.origin : "http://localhost:8080"}
+          onChange={(event) => setField("publicServerUrl", event.target.value)}
+        />
+      ),
+      description: SETTINGS_HELP.publicServerUrl,
+    },
+  ];
 
   return (
-    <div className={styles["settings-col"]}>
-      <h2>On-demand session</h2>
-      <form className={`${styles["admin-form"]} on-demand-session-form`} onSubmit={(event) => void save(event)}>
-        <label>
-          <span>grace (seconds)</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.graceSeconds}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, graceSeconds: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>max concurrent</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.maxConcurrent}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, maxConcurrent: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>evict idle (seconds)</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.evictIdleSeconds}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, evictIdleSeconds: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>stall timeout (seconds)</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.stallTimeoutSeconds}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, stallTimeoutSeconds: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>restart budget</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.restartBudget}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, restartBudget: event.target.value }))
-            }
-          />
-        </label>
-        <label>
-          <span>keepalive ceiling (sec)</span>
-          <input
-            type="number"
-            min={1}
-            value={draft.keepaliveCeilingSec}
-            disabled={busy || !loaded}
-            onChange={(event) =>
-              setDraft((prev) => ({ ...prev, keepaliveCeilingSec: event.target.value }))
-            }
-          />
-        </label>
-        <div className="admin-form-actions">
-          <button type="submit" disabled={busy || !loaded}>
-            {busy ? "Saving..." : "Save session settings"}
-          </button>
-          {status && <span className="muted">{status}</span>}
+    <section className="admin-panel-section">
+      <form onSubmit={(event) => void save(event)}>
+        <div className="section-headline">
+          <div className="section-headline-main">
+            <h2>Settings</h2>
+            <p className="section-purpose">
+              Operational tunables for the scheduler, encoder sweeper, subtitles, IPTV URLs, and the Spotify channel.
+            </p>
+          </div>
+          <div className="section-headline-actions">
+            {status && <span className="muted">{status}</span>}
+            <button type="submit" disabled={busy || !loaded}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+          </div>
         </div>
+        <table className={styles["settings-table"]}>
+          <thead>
+            <tr>
+              <th scope="col">Setting</th>
+              <th scope="col">Value</th>
+              <th scope="col">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.label}>
+                <th scope="row">{row.label}</th>
+                <td className={styles["settings-value"]}>{row.control}</td>
+                <td className={styles["settings-desc"]}>{row.description}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </form>
-    </div>
+    </section>
   );
 }
 
@@ -588,7 +421,6 @@ function CacheSummaryPanel({
   const readyByChannel = new Map(readyRows.map((row) => [`${row.channelId}:${row.renditionProfile}`, row]));
   const needRows = (summary.channelNeeds ?? []).slice().sort((a, b) => b.remainingCount - a.remainingCount);
 
-  // Collapse per-status rows into one entry per profile, skipping pending.
   const profileMap = new Map<string, { ready: number; processing: number; bytes: number; durationMs: number; invalid: boolean; disabled: boolean }>();
   for (const row of summary.packageSummaries ?? []) {
     if (row.status === "pending") continue;
@@ -611,12 +443,14 @@ function CacheSummaryPanel({
   return (
     <div className={styles["cache-summary"]}>
       <div className={styles["cache-summary-grid"]}>
-        <span>cache</span>
-        <strong>{formatBytes(summary.cacheRootBytes)}</strong>
-        <span>packages</span>
-        <strong>{formatBytes(summary.packageRootBytes ?? summary.packageBytes)}</strong>
-        <span>roots</span>
-        <strong>{summary.packageRootCount}</strong>
+        <div>
+          <span>package cache</span>
+          <strong>{formatBytes(summary.packageRootBytes ?? summary.packageBytes)}</strong>
+        </div>
+        <div>
+          <span>package folders</span>
+          <strong>{summary.packageRootCount}</strong>
+        </div>
       </div>
 
       {profileRows.length > 0 && (
@@ -653,7 +487,7 @@ function CacheSummaryPanel({
                 .finally(() => setCleanupBusy(false));
             }}
           >
-            {cleanupBusy ? "cleaning…" : "Clean up invalid profiles"}
+            {cleanupBusy ? "cleaning..." : "Clean up invalid profiles"}
           </button>
           {cleanupStatus && <span className="muted">{cleanupStatus}</span>}
         </div>
@@ -687,4 +521,18 @@ function CacheSummaryPanel({
       {status && <span className={`muted ${styles["cache-warning"]}`}>{status}</span>}
     </div>
   );
+}
+
+function parseSubtitleLanguageText(text: string):
+  | { valid: true; languages: string[] }
+  | { valid: false; message: string } {
+  const languages = text
+    .split(/[,\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const unique = Array.from(new Set(languages));
+  if (unique.length === 0) return { valid: false, message: "enter at least one language code" };
+  const invalid = unique.find((l) => !/^[a-z]{3}$/.test(l));
+  if (invalid) return { valid: false, message: `${invalid} must be a 3-letter ISO 639-2 code` };
+  return { valid: true, languages: unique };
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -182,8 +183,27 @@ type localWorkerItem struct {
 }
 
 type encoderListResponse struct {
-	Encoders    []encoderListItem `json:"encoders"`
-	LocalWorker *localWorkerItem  `json:"localWorker"`
+	Encoders          []encoderListItem      `json:"encoders"`
+	LocalWorker       *localWorkerItem       `json:"localWorker"`
+	OnDemandEncodings []onDemandEncodingItem `json:"onDemandEncodings"`
+}
+
+type onDemandEncodingItem struct {
+	EncodingID       string `json:"encodingId"`
+	ChannelID        string `json:"channelId"`
+	ChannelName      string `json:"channelName"`
+	ScheduleEntryID  string `json:"scheduleEntryId"`
+	MediaID          string `json:"mediaId"`
+	MediaTitle       string `json:"mediaTitle"`
+	Profile          string `json:"profile"`
+	State            string `json:"state"`
+	ProcessRunning   bool   `json:"processRunning"`
+	SpawnedAtMs      int64  `json:"spawnedAtMs"`
+	FirstSegmentAtMs int64  `json:"firstSegmentAtMs"`
+	LastProgressMs   int64  `json:"lastProgressMs"`
+	SegmentCount     int    `json:"segmentCount"`
+	UpdatedAtMs      int64  `json:"updatedAtMs"`
+	LastError        string `json:"lastError,omitempty"`
 }
 
 func (a *App) localWorkerCapabilities() json.RawMessage {
@@ -197,8 +217,8 @@ func (a *App) localWorkerCapabilities() json.RawMessage {
 		reported["nvidiaGpus"] = gpus
 	}
 	workDir := ""
-	if a.cacheDir != "" {
-		workDir = a.cacheDir + "/encoder-work"
+	if a.cache.Root() != "" {
+		workDir = a.cache.Root() + "/encoder-work"
 	}
 	if workDir != "" {
 		if gb := sysinfo.DiskFreeGB(workDir); gb > 0 {
@@ -222,6 +242,11 @@ func (a *App) handleEncoderList(w http.ResponseWriter, r *http.Request) {
 	jobs, err := db.ListEncoderJobSummaries(r.Context(), a.dbConn)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list_jobs_failed", err.Error())
+		return
+	}
+	sessions, err := db.ListOnDemandEncodings(r.Context(), a.dbConn)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "list_encodings_failed", err.Error())
 		return
 	}
 	jobMap := make(map[string]db.EncoderJobSummary, len(jobs))
@@ -255,7 +280,8 @@ func (a *App) handleEncoderList(w http.ResponseWriter, r *http.Request) {
 	rows = filtered
 
 	out := encoderListResponse{
-		Encoders: make([]encoderListItem, 0, len(rows)),
+		Encoders:          make([]encoderListItem, 0, len(rows)),
+		OnDemandEncodings: make([]onDemandEncodingItem, 0, len(sessions)),
 	}
 
 	for _, e := range rows {
@@ -343,8 +369,63 @@ func (a *App) handleEncoderList(w http.ResponseWriter, r *http.Request) {
 		localItem.Jobs = append(localItem.Jobs, cj)
 	}
 	out.LocalWorker = &localItem
+	for _, s := range sessions {
+		out.OnDemandEncodings = append(out.OnDemandEncodings, onDemandEncodingItem{
+			EncodingID:       s.EncodingID,
+			ChannelID:        s.ChannelID,
+			ChannelName:      s.ChannelName,
+			ScheduleEntryID:  s.ScheduleEntryID,
+			MediaID:          s.MediaID,
+			MediaTitle:       s.MediaTitle,
+			Profile:          s.Profile,
+			State:            s.State,
+			ProcessRunning:   s.ProcessRunning,
+			SpawnedAtMs:      s.SpawnedAtMs,
+			FirstSegmentAtMs: s.FirstSegmentAtMs,
+			LastProgressMs:   s.LastProgressMs,
+			SegmentCount:     s.SegmentCount,
+			UpdatedAtMs:      s.UpdatedAtMs,
+			LastError:        s.LastError,
+		})
+	}
 
 	writeJSON(w, out)
+}
+
+// handleChannelStopEncoder proxies a kill request to the linearcast playback
+// server, which tears down the channel's active on-demand encoding and blocks
+// re-admission for 15 minutes. Returns 503 if the playback server is
+// unreachable (the kill cannot be confirmed).
+func (a *App) handleChannelStopEncoder(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelID")
+	if a.upstreamURL == "" {
+		writeError(w, http.StatusServiceUnavailable, "no_upstream", "upstream linearcast URL not configured")
+		return
+	}
+	url := a.upstreamURL + "/channels/" + channelID + "/ondemand/restart"
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "request_build", err.Error())
+		return
+	}
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "upstream_unreachable", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		writeError(w, http.StatusNotFound, "not_found", "channel not found or has no active encoding")
+		return
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		writeError(w, http.StatusBadGateway, "upstream_error", fmt.Sprintf("upstream returned %d", resp.StatusCode))
+		return
+	}
+	writeJSON(w, map[string]any{
+		"channelID": channelID,
+		"note":      "encoder stopped; channel is gated for 15 minutes before it can re-encode",
+	})
 }
 
 type encoderUpdateRequest struct {

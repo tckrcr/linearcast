@@ -37,7 +37,7 @@
 .mp-rail-tab.is-active {
   background: var(--accent-soft);
   color: var(--accent);
-  border-color: rgba(90, 169, 255, 0.4);
+  border-color: var(--accent-border);
 }
 
 .mp-rail-tools {
@@ -127,4 +127,3 @@
 .mp-rail-footer {
   font-size: 12px;
 }
-

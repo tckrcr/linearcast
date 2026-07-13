@@ -85,7 +85,7 @@ func TestBuildEntriesSlotGridFilledTilesEveryGapAndEndsOnBoundary(t *testing.T) 
 	filler := []SlotFiller{{MediaID: "f1", DurationMs: 5 * 60 * 1000}}
 	slotMs := int64(30 * 60 * 1000)
 
-	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 90*60*1000, slotMs)
+	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 90*60*1000, slotMs, false)
 	if err != nil {
 		t.Fatalf("BuildEntriesSlotGridFilled: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestBuildEntriesSlotGridFilledTagsEntryKind(t *testing.T) {
 	filler := []SlotFiller{{MediaID: "f1", DurationMs: 5 * 60 * 1000}}
 	slotMs := int64(30 * 60 * 1000)
 
-	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 90*60*1000, slotMs)
+	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 90*60*1000, slotMs, false)
 	if err != nil {
 		t.Fatalf("BuildEntriesSlotGridFilled: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestBuildEntriesSlotGridFilledRotatesFillerSequentially(t *testing.T) {
 		{MediaID: "f2", DurationMs: 120 * 1000},
 	}
 
-	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 30*60*1000, 30*60*1000)
+	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 30*60*1000, 30*60*1000, false)
 	if err != nil {
 		t.Fatalf("BuildEntriesSlotGridFilled: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestBuildEntriesSlotGridFilledContinuesFromCursorAndSplitsAcrossWrap(t *tes
 	media := []db.Media{mediaRow("e1", "", 28*60*1000)}
 	filler := []SlotFiller{{MediaID: "f1", DurationMs: 5 * 60 * 1000, CursorMs: 4 * 60 * 1000}}
 
-	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 30*60*1000, 30*60*1000)
+	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 30*60*1000, 30*60*1000, false)
 	if err != nil {
 		t.Fatalf("BuildEntriesSlotGridFilled: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestBuildEntriesSlotGridFilledTilesLeadingGap(t *testing.T) {
 	media := []db.Media{mediaRow("e1", "", 24*60*1000)}
 	filler := []SlotFiller{{MediaID: "f1", DurationMs: 10 * 60 * 1000}}
 
-	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 12*60*1000, 60*60*1000, 30*60*1000)
+	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 12*60*1000, 60*60*1000, 30*60*1000, false)
 	if err != nil {
 		t.Fatalf("BuildEntriesSlotGridFilled: %v", err)
 	}
@@ -234,12 +234,49 @@ func TestBuildEntriesSlotGridFilledTilesLeadingGap(t *testing.T) {
 	}
 }
 
+func TestBuildEntriesSlotGridFilledPlacesLeadingPrimaryWhenAllowed(t *testing.T) {
+	media := []db.Media{
+		mediaRow("short", "", 6*60*1000),
+		mediaRow("fit", "", 22*60*1000),
+		mediaRow("tooLong", "", 30*60*1000),
+	}
+	filler := []SlotFiller{{MediaID: "f1", DurationMs: 5 * 60 * 1000}}
+	slotMs := int64(30 * 60 * 1000)
+	startMs := int64(6 * 60 * 1000)
+
+	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, startMs, 2*60*60*1000, slotMs, true)
+	if err != nil {
+		t.Fatalf("BuildEntriesSlotGridFilled: %v", err)
+	}
+	assertContiguous(t, entries, startMs, 2*60*60*1000)
+	if entries[0].MediaID != "fit" || entries[0].StartMs != startMs {
+		t.Fatalf("entry 0 = %+v, want fit leading at %d", entries[0], startMs)
+	}
+	// Remainder of leading gap should be filled, then first boundary primary.
+	foundBoundaryPrimary := false
+	for _, e := range entries {
+		if e.Kind != "primary" {
+			continue
+		}
+		if e.StartMs == slotMs {
+			foundBoundaryPrimary = true
+			if e.MediaID != "tooLong" {
+				t.Fatalf("first boundary primary = %s, want tooLong resuming after fit", e.MediaID)
+			}
+			break
+		}
+	}
+	if !foundBoundaryPrimary {
+		t.Fatalf("no primary found at first slot boundary: %+v", entries)
+	}
+}
+
 func TestBuildEntriesSlotGridFilledNeverEmitsFillerOnlyWindow(t *testing.T) {
 	media := []db.Media{mediaRow("e1", "", 20*60*1000)}
 	filler := []SlotFiller{{MediaID: "f1", DurationMs: 60 * 1000}}
 
 	// No primary fits a 10-minute window on a 30-minute grid.
-	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 10*60*1000, 30*60*1000)
+	entries, err := BuildEntriesSlotGridFilled("ch", media, filler, 0, 10*60*1000, 30*60*1000, false)
 	if err != nil {
 		t.Fatalf("BuildEntriesSlotGridFilled: %v", err)
 	}
@@ -251,12 +288,56 @@ func TestBuildEntriesSlotGridFilledNeverEmitsFillerOnlyWindow(t *testing.T) {
 func TestBuildEntriesSlotGridFilledRejectsMisalignedFiller(t *testing.T) {
 	media := []db.Media{mediaRow("e1", "", 24*60*1000)}
 
-	_, err := BuildEntriesSlotGridFilled("ch", media, []SlotFiller{{MediaID: "f1", DurationMs: 5000}}, 0, 60*60*1000, 30*60*1000)
+	_, err := BuildEntriesSlotGridFilled("ch", media, []SlotFiller{{MediaID: "f1", DurationMs: 5000}}, 0, 60*60*1000, 30*60*1000, false)
 	if err == nil {
 		t.Fatal("expected misaligned filler duration error")
 	}
-	_, err = BuildEntriesSlotGridFilled("ch", media, []SlotFiller{{MediaID: "f1", DurationMs: 60 * 1000, CursorMs: 3000}}, 0, 60*60*1000, 30*60*1000)
+	_, err = BuildEntriesSlotGridFilled("ch", media, []SlotFiller{{MediaID: "f1", DurationMs: 60 * 1000, CursorMs: 3000}}, 0, 60*60*1000, 30*60*1000, false)
 	if err == nil {
 		t.Fatal("expected misaligned filler cursor error")
 	}
 }
+
+func TestBestFitLeadingPrimaryPicksLongestFittingEpisode(t *testing.T) {
+	media := []db.Media{
+		mediaRow("short", "", 6*60*1000),
+		mediaRow("fit", "", 22*60*1000),
+		mediaRow("tooLong", "", 30*60*1000),
+	}
+	startMs := int64(6 * 60 * 1000)
+	slotMs := int64(30 * 60 * 1000)
+
+	leading, resumeID := bestFitLeadingPrimary("ch", media, startMs, slotMs, 1234)
+	if leading == nil {
+		t.Fatal("expected a leading primary")
+	}
+	if leading.MediaID != "fit" {
+		t.Fatalf("leading media=%s, want fit", leading.MediaID)
+	}
+	if leading.StartMs != startMs {
+		t.Fatalf("leading start=%d, want %d", leading.StartMs, startMs)
+	}
+	if leading.DurationMs != 22*60*1000 {
+		t.Fatalf("leading duration=%d, want 22m", leading.DurationMs)
+	}
+	if leading.Kind != "primary" {
+		t.Fatalf("leading kind=%s, want primary", leading.Kind)
+	}
+	if resumeID != "fit" {
+		t.Fatalf("resumeID=%s, want fit", resumeID)
+	}
+}
+
+func TestBestFitLeadingPrimaryReturnsNoneWhenNothingFits(t *testing.T) {
+	media := []db.Media{
+		mediaRow("tooLong", "", 30*60*1000),
+	}
+	startMs := int64(6 * 60 * 1000)
+	slotMs := int64(30 * 60 * 1000)
+
+	leading, resumeID := bestFitLeadingPrimary("ch", media, startMs, slotMs, 1234)
+	if leading != nil || resumeID != "" {
+		t.Fatalf("expected no leading primary, got %+v / %s", leading, resumeID)
+	}
+}
+

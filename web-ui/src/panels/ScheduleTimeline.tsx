@@ -28,7 +28,7 @@ export type ScheduleTimelineProps = {
   // When provided, media dragged from a picker rail (carrying MEDIA_DRAG_MIME)
   // can be dropped onto the track to insert at the pointed-to position.
   onInsertMedia?: (mediaKey: string, index: number) => void;
-  // When provided, batch picker items (group/show/album/artist payloads carrying
+  // When provided, batch picker items (group/album/artist payloads carrying
   // SCHEDULE_BATCH_DRAG_MIME) can be dropped at the pointed-to position.
   onInsertBatch?: (payload: string, index: number) => void;
   disabled?: boolean;
@@ -242,7 +242,7 @@ export function ScheduleTimeline(props: ScheduleTimelineProps) {
                 {widthPx >= MIN_BLOCK_PX * 2 && (
                   <span className="schedule-timeline-entry-meta muted">
                     {formatMs(entry.durationMs)}
-                    {entry.schedulingGroup && ` · ${entry.schedulingGroup}`}
+                    {entry.collectionName && ` · ${entry.collectionName}`}
                   </span>
                 )}
               </button>

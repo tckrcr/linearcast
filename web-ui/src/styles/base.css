@@ -1,20 +1,25 @@
+@import url("https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700;800&display=swap");
+
 :root {
-  --bg: #0d0f12;
-  --bg-elev: #14171c;
-  --bg-elev-2: #1b1f26;
-  --border: #262b33;
-  --border-strong: #353c47;
-  --text: #e7eaef;
-  --text-muted: #8b94a3;
-  --text-dim: #5c6573;
-  --accent: #5aa9ff;
-  --accent-soft: rgba(90, 169, 255, 0.18);
-  --good: #6fe09a;
-  --good-bg: rgba(111, 224, 154, 0.12);
-  --warn: #ffb066;
-  --warn-bg: rgba(255, 176, 102, 0.14);
-  --danger: #ff7a8a;
-  --danger-bg: rgba(255, 122, 138, 0.14);
+  --bg: #101010;
+  --bg-elev: #171717;
+  --bg-elev-2: #202020;
+  --bg-tertiary: #292929;
+  --bg-secondary: #181818;
+  --border: #303030;
+  --border-strong: #474747;
+  --text: #f1f1f1;
+  --text-muted: #adadad;
+  --text-dim: #737373;
+  --accent: #d8d8d8;
+  --accent-soft: rgba(216, 216, 216, 0.14);
+  --accent-border: rgba(216, 216, 216, 0.36);
+  --good: #78d69a;
+  --good-bg: rgba(120, 214, 154, 0.12);
+  --warn: #e6bd72;
+  --warn-bg: rgba(230, 189, 114, 0.14);
+  --danger: #ef8585;
+  --danger-bg: rgba(239, 133, 133, 0.14);
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --drawer-width: 420px;
 }
@@ -33,7 +38,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Noto Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 14px;
   line-height: 1.45;
   overflow: hidden;
@@ -53,11 +58,11 @@ button {
   border: 1px solid var(--border-strong);
   border-radius: 6px;
   padding: 6px 12px;
-  transition: background 80ms ease, border-color 80ms ease;
+  transition: background 80ms ease, border-color 80ms ease, color 80ms ease;
 }
 
 button:hover:not(:disabled) {
-  background: var(--border);
+  background: var(--bg-tertiary);
   border-color: var(--accent);
 }
 
@@ -69,7 +74,7 @@ button:disabled {
 button.primary {
   background: var(--accent-soft);
   color: var(--accent);
-  border-color: rgba(90, 169, 255, 0.4);
+  border-color: var(--accent-border);
 }
 
 button.danger {
@@ -102,6 +107,10 @@ select:focus {
 
 .success {
   color: var(--good);
+}
+
+.warn {
+  color: var(--warn);
 }
 
 .ellipsis {

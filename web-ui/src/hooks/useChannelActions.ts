@@ -4,22 +4,15 @@ import {
   cloneChannel as apiCloneChannel,
   deleteChannel as apiDeleteChannel,
   extendChannel as apiExtendChannel,
+  patchChannel as apiPatchChannel,
   resetChannelArtwork as apiResetChannelArtwork,
-  getChannelPolicy,
-  getChannelProfileMigrationStatus,
-  queueChannelProfileMigration,
   restartChannelPlayback as apiRestartPlayback,
-  setChannelEnabled as apiSetChannelEnabled,
-  setChannelHiddenFromGuide as apiSetChannelHiddenFromGuide,
   updateChannelArtwork as apiUpdateChannelArtwork,
-  updateChannelPolicy,
+  updateChannelOnDemandProfile as apiUpdateChannelOnDemandProfile,
   updateChannelUpstreamHLS as apiUpdateChannelUpstreamHLS,
 } from "../api";
-import { ApiError } from "../api/client";
 import { formatBytes } from "../format";
-import type { PackageProfile, PolicyDraft, ProfileReadiness, RowBusy, RowStatus } from "../types";
-
-const DEFAULT_PREFILL_HOURS = "24";
+import type { PackageProfile, RowBusy, RowStatus } from "../types";
 
 type UseChannelActionsOptions = {
   allowedProfiles: string[];
@@ -38,8 +31,6 @@ export function useChannelActions({
 }: UseChannelActionsOptions) {
   const [rowBusy, setRowBusy] = useState<RowBusy>({});
   const [rowStatus, setRowStatus] = useState<RowStatus>({});
-  const [policyDraft, setPolicyDraft] = useState<Record<string, PolicyDraft>>({});
-  const [migrationReadiness, setMigrationReadiness] = useState<Record<string, ProfileReadiness | null>>({});
 
   function setBusy(id: string, v: boolean) {
     setRowBusy((prev) => ({ ...prev, [id]: v }));
@@ -47,26 +38,6 @@ export function useChannelActions({
 
   function setStatus(id: string, msg: string) {
     setRowStatus((prev) => ({ ...prev, [id]: msg }));
-  }
-
-  async function loadPolicy(channelID: string) {
-    setBusy(channelID, true);
-    try {
-      const policy = await getChannelPolicy(channelID);
-      setPolicyDraft((prev) => ({
-        ...prev,
-        [channelID]: {
-          profile: policy.requiredPackageProfile,
-          prefillHours: msToHoursInput(policy.packagePrefillMs),
-          mediaKind: normalizeChannelMediaKind(policy.mediaKind),
-          loaded: true,
-        },
-      }));
-    } catch (err) {
-      setStatus(channelID, err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(channelID, false);
-    }
   }
 
   async function extendSchedule(channelID: string, hours?: number) {
@@ -143,7 +114,7 @@ export function useChannelActions({
     setBusy(channelID, true);
     setStatus(channelID, enabled ? "enabling…" : "disabling…");
     try {
-      await apiSetChannelEnabled(channelID, enabled);
+      await apiPatchChannel(channelID, { enabled });
       setStatus(
         channelID,
         enabled ? "enabled — picks up on next refresh tick" : "disabled — drops on next refresh tick",
@@ -161,7 +132,7 @@ export function useChannelActions({
     setBusy(channelID, true);
     setStatus(channelID, hidden ? "hiding from guide..." : "showing in guide...");
     try {
-      await apiSetChannelHiddenFromGuide(channelID, hidden);
+      await apiPatchChannel(channelID, { hiddenFromGuide: hidden });
       setStatus(
         channelID,
         hidden
@@ -176,10 +147,18 @@ export function useChannelActions({
     }
   }
 
-  async function deleteChannel(channelID: string, displayName: string, reclaimEncodes: boolean) {
+  async function deleteChannel(
+    channelID: string,
+    displayName: string,
+    reclaimEncodes: boolean,
+    wasEnabled: boolean,
+  ) {
     setBusy(channelID, true);
     setStatus(channelID, reclaimEncodes ? "deleting + reclaiming…" : "deleting…");
     try {
+      // The server refuses to delete an enabled channel so a live row is never
+      // stranded. Disable it first so the user still gets one-step deletion.
+      if (wasEnabled) await apiPatchChannel(channelID, { enabled: false });
       const res = await apiDeleteChannel(channelID, { reclaimEncodes });
       setRowStatus((prev) => {
         const next = { ...prev };
@@ -251,6 +230,45 @@ export function useChannelActions({
     }
   }
 
+  async function changeOnDemandProfile(
+    channelID: string,
+    displayName: string,
+    currentProfile: string,
+    mediaKind: string,
+  ) {
+    const kindProfiles = profilesForMediaKind(allowedProfiles, profileDetails, mediaKind);
+    if (kindProfiles.length === 0) {
+      setStatus(channelID, "no package profiles are available for this channel");
+      return;
+    }
+    const next = window.prompt(
+      `Package profile for "${displayName || channelID}"\n\nAvailable profiles:\n${kindProfiles.join("\n")}`,
+      currentProfile,
+    );
+    if (next == null) return;
+    const profile = next.trim();
+    if (profile === currentProfile) return;
+    if (!profile) {
+      setStatus(channelID, "profile cannot be empty");
+      return;
+    }
+    if (!kindProfiles.includes(profile)) {
+      setStatus(channelID, `unknown ${normalizeChannelMediaKind(mediaKind)} profile "${profile}"`);
+      return;
+    }
+    setBusy(channelID, true);
+    setStatus(channelID, "saving profile...");
+    try {
+      const policy = await apiUpdateChannelOnDemandProfile(channelID, profile);
+      setStatus(channelID, `profile saved: ${policy.requiredPackageProfile}`);
+      refreshChannels();
+    } catch (err) {
+      setStatus(channelID, err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(channelID, false);
+    }
+  }
+
   async function resetArtwork(channelID: string, displayName: string) {
     if (!window.confirm(`Reset artwork for "${displayName || channelID}" to the built-in default?`)) return;
     setBusy(channelID, true);
@@ -266,86 +284,9 @@ export function useChannelActions({
     }
   }
 
-  async function doSavePolicy(channelID: string, force: boolean) {
-    const draft = policyDraft[channelID];
-    if (!draft) return;
-    const validation = validateChannelPolicy(draft, allowedProfiles, profileDetails);
-    if (!validation.valid) {
-      setStatus(channelID, validation.message);
-      return;
-    }
-    const policy = await updateChannelPolicy(channelID, {
-      requiredPackageProfile: validation.profile,
-      packagePrefillMs: validation.packagePrefillMs,
-      mediaKind: validation.mediaKind,
-      force,
-    });
-    setPolicyDraft((prev) => ({
-      ...prev,
-      [channelID]: {
-        profile: policy.requiredPackageProfile,
-        prefillHours: msToHoursInput(policy.packagePrefillMs),
-        mediaKind: normalizeChannelMediaKind(policy.mediaKind),
-        loaded: true,
-      },
-    }));
-    setMigrationReadiness((prev) => ({ ...prev, [channelID]: null }));
-    setStatus(channelID, "policy saved");
-    refreshChannels();
-  }
-
-  async function savePolicy(channelID: string) {
-    setBusy(channelID, true);
-    setStatus(channelID, "saving policy…");
-    try {
-      await doSavePolicy(channelID, false);
-    } catch (err) {
-      if (err instanceof ApiError && err.code === "profile_not_ready") {
-        if (window.confirm(`${err.message}\n\nForce switch anyway?`)) {
-          try {
-            await doSavePolicy(channelID, true);
-          } catch (err2) {
-            setStatus(channelID, err2 instanceof Error ? err2.message : String(err2));
-          }
-        } else {
-          setStatus(channelID, "save cancelled");
-        }
-      } else {
-        setStatus(channelID, err instanceof Error ? err.message : String(err));
-      }
-    } finally {
-      setBusy(channelID, false);
-    }
-  }
-
-  async function queueMigration(channelID: string, profile: string) {
-    setBusy(channelID, true);
-    setStatus(channelID, "queueing packaging…");
-    try {
-      const r = await queueChannelProfileMigration(channelID, profile);
-      setMigrationReadiness((prev) => ({ ...prev, [channelID]: r }));
-      setStatus(channelID, r.queued > 0 ? `queued ${r.queued} items` : "all items already queued or ready");
-    } catch (err) {
-      setStatus(channelID, err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(channelID, false);
-    }
-  }
-
-  async function refreshMigrationStatus(channelID: string, profile: string) {
-    try {
-      const r = await getChannelProfileMigrationStatus(channelID, profile);
-      setMigrationReadiness((prev) => ({ ...prev, [channelID]: r }));
-    } catch { /* ignore — status panel is best-effort */ }
-  }
-
   return {
     rowBusy,
     rowStatus,
-    policyDraft,
-    setPolicyDraft,
-    migrationReadiness,
-    loadPolicy,
     extendSchedule,
     clearSchedule,
     restartPlayback,
@@ -356,53 +297,7 @@ export function useChannelActions({
     updateArtwork,
     resetArtwork,
     updateUpstreamHLS,
-    savePolicy,
-    queueMigration,
-    refreshMigrationStatus,
-  };
-}
-
-export const blankPolicyDraft: PolicyDraft = {
-  profile: "",
-  prefillHours: DEFAULT_PREFILL_HOURS,
-  mediaKind: "video",
-  loaded: false,
-};
-
-export function validateChannelPolicy(
-  draft: PolicyDraft,
-  allowedProfiles: string[],
-  profileDetails: Record<string, PackageProfile>,
-):
-  | { valid: true; profile: string; packagePrefillMs: number; mediaKind: "video" | "music" }
-  | { valid: false; message: string } {
-  const profile = draft.profile.trim();
-  const prefillHours = Number(draft.prefillHours);
-  const mediaKind = normalizeChannelMediaKind(draft.mediaKind);
-  if (!profile) {
-    return { valid: false, message: "profile cannot be empty" };
-  }
-  if (!allowedProfiles.includes(profile)) {
-    return {
-      valid: false,
-      message: `unknown profile "${profile}" — must be one of: ${allowedProfiles.join(", ")}`,
-    };
-  }
-  const profileKind = normalizeChannelMediaKind(profileDetails[profile]?.mediaKind);
-  if (profileKind !== mediaKind) {
-    return {
-      valid: false,
-      message: `profile "${profile}" is for ${profileKind} channels`,
-    };
-  }
-  if (!Number.isFinite(prefillHours) || prefillHours <= 0) {
-    return { valid: false, message: "prefill hours must be positive" };
-  }
-  return {
-    valid: true,
-    profile,
-    mediaKind,
-    packagePrefillMs: Math.round(prefillHours * 3600 * 1000),
+    changeOnDemandProfile,
   };
 }
 
@@ -418,12 +313,6 @@ export function profilesForMediaKind(
   const kind = normalizeChannelMediaKind(mediaKind);
   return allowedProfiles.filter((profile) => {
     const detail = profileDetails[profile];
-    return normalizeChannelMediaKind(detail?.mediaKind) === kind && !(detail?.tags ?? []).includes("abr");
+    return normalizeChannelMediaKind(detail?.mediaKind) === kind;
   });
-}
-
-function msToHoursInput(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return DEFAULT_PREFILL_HOURS;
-  const hours = value / 3600000;
-  return Number.isInteger(hours) ? String(hours) : hours.toFixed(2);
 }

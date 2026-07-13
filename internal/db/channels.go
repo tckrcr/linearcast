@@ -44,6 +44,15 @@ func ChannelByID(ctx context.Context, conn Execer, id string) (*Channel, error) 
 	return scanChannel(conn.QueryRowContext(ctx, channelSelectSQL()+` WHERE id = ?`, id))
 }
 
+// ExternalChannel returns the single external/live channel — the one row whose
+// upstream_hls_url is set. Live channels are a singleton in this appliance (one
+// external HLS stream per account); if more than one ever exists, the lowest id
+// wins so callers get a deterministic target. Returns (nil, nil) when none is
+// configured.
+func ExternalChannel(ctx context.Context, conn Execer) (*Channel, error) {
+	return scanChannel(conn.QueryRowContext(ctx, channelSelectSQL()+` WHERE upstream_hls_url IS NOT NULL ORDER BY id LIMIT 1`))
+}
+
 // nullString maps a Go string to a nullable column value: empty becomes SQL
 // NULL, preserving the on-disk NULL/” distinction the de-leaked Channel fields
 // no longer carry in the struct.
@@ -100,13 +109,6 @@ func normalizeChannelWrite(c ChannelWrite) ChannelWrite {
 		// no packaged media. Keep these eager so they never enter demand tracking.
 		c.PrefillMode = "eager"
 	}
-	if c.PlaybackMode == PlaybackModePlexRelay {
-		c.SourceDirectory = ""
-		c.RequiredPackageProfile = ""
-		c.ABRLadder = nil
-		c.PackagePrefillMs = nil
-		c.PrefillMode = "eager"
-	}
 	if c.PlaybackMode == PlaybackModePackaged && strings.TrimSpace(c.RequiredPackageProfile) == "" {
 		if c.UpstreamHLSURL == nil {
 			c.RequiredPackageProfile = DefaultPackageProfileForMediaKind(c.MediaKind)
@@ -128,9 +130,9 @@ func InsertChannel(ctx context.Context, conn *sql.DB, c ChannelWrite) error {
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile, abr_ladder_json, package_prefill_ms, media_kind, schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
+			hidden_from_guide, playback_mode, required_package_profile, abr_ladder_json, package_prefill_ms, media_kind, schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
 		)
-		VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, 1, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.DisplayName, c.SourceDirectory, c.Ordering, c.CreatedAtMs,
 		string(c.PlaybackMode), nullString(c.RequiredPackageProfile), abrLadderValue(c.RequiredPackageProfile, c.ABRLadder), c.PackagePrefillMs, string(c.MediaKind), c.ScheduleMode, c.SlotDurationMs, c.UpstreamHLSURL, c.PrefillMode)
 	return err
@@ -344,6 +346,33 @@ func UpdateChannelPlaybackPolicy(ctx context.Context, conn *sql.DB, id string, m
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// UpdateOnDemandChannelPackageProfile changes only the package profile for an
+// on-demand packaged channel. It deliberately leaves schedule rows and package
+// request state untouched; the on-demand playback path starts encoding the new
+// profile on the next runtime refresh/viewer request.
+func UpdateOnDemandChannelPackageProfile(ctx context.Context, conn *sql.DB, id, profile string) (bool, error) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		return false, fmt.Errorf("profile is required")
+	}
+	res, err := conn.ExecContext(ctx, `
+		UPDATE channels
+		SET required_package_profile = ?, abr_ladder_json = NULL
+		WHERE id = ?
+		  AND playback_mode = 'packaged'
+		  AND upstream_hls_url IS NULL
+		  AND prefill_mode = 'on_demand'`,
+		profile, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
 		return false, err
 	}
 	return n > 0, nil
