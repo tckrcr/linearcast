@@ -43,8 +43,8 @@ func newEncoderHandlerEnv(t *testing.T) *encoderHandlerEnv {
 		VALUES ('m1', ?, ?, 12000, 'mkv', 'h264', 1080, 'aac', 1, 0)`, mediaPath, filepath.Dir(mediaPath)); err != nil {
 		t.Fatalf("insert media: %v", err)
 	}
-	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode, required_package_profile)
-		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, required_package_profile)
+		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -363,8 +363,8 @@ func TestEncoderComplete_FinalizesUploadedPackage(t *testing.T) {
 		VALUES ('m1', ?, ?, 2000, 'mp4', 'h264', 72, 'aac', 1, 0)`, mediaPath, filepath.Dir(mediaPath)); err != nil {
 		t.Fatalf("insert media: %v", err)
 	}
-	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode, required_package_profile)
-		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, required_package_profile)
+		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -550,8 +550,8 @@ func TestEncoderComplete_CompleteFailureCleansUploadedFilesAndSegments(t *testin
 		VALUES ('m1', ?, ?, 2000, 'mp4', 'h264', 72, 'aac', 1, 0)`, mediaPath, filepath.Dir(mediaPath)); err != nil {
 		t.Fatalf("insert media: %v", err)
 	}
-	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode, required_package_profile)
-		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, required_package_profile)
+		VALUES ('ch1', 'Test', '/tmp', 'linear', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -625,8 +625,8 @@ func TestEncoderComplete_ReadOnlyDBFailureCleansUploadedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open rw: %v", err)
 	}
-	if err := db.ApplySchema(ctx, rw); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(ctx, rw); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	cacheDir := t.TempDir()
 	packageRoot := layout.NewCache(cacheDir).PackagesDir()

@@ -27,8 +27,8 @@ func scheduleCheckFixture(t *testing.T, app *App, channelID, mediaID string, fro
 		}
 	}
 	mustExecSchedule(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled,
-		created_at_ms, playback_mode, required_package_profile, hidden_from_guide)
-		VALUES (?, ?, '/tmp', 'alphabetical', ?, 0, 'packaged', 'h264-1080p-8mbps', 0)`,
+		created_at_ms, required_package_profile, hidden_from_guide)
+		VALUES (?, ?, '/tmp', 'alphabetical', ?, 0, 'h264-1080p-8mbps', 0)`,
 		channelID, channelID, enabledInt)
 	mustExecSchedule(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
@@ -97,8 +97,8 @@ func TestScheduleCheckGapDetected(t *testing.T) {
 func TestScheduleCheckNoScheduleOnEnabledChannel(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering,
-		enabled, created_at_ms, playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('empty-ch', 'Empty', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`); err != nil {
+		enabled, created_at_ms, required_package_profile, hidden_from_guide)
+		VALUES ('empty-ch', 'Empty', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 0)`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 
@@ -117,11 +117,11 @@ func TestScheduleCheckNoScheduleOnEnabledChannel(t *testing.T) {
 	}
 }
 
-// scheduleCheckNoPackageFixture inserts a channel (with the given playback and
-// prefill modes) plus a media row and an aligned schedule entry, but no ready
+// scheduleCheckNoPackageFixture inserts a channel with the given prefill mode,
+// plus a media row and an aligned schedule entry, but no ready
 // package. It is used to verify that the package-not-ready check is gated on the
 // channel actually requiring ready packages.
-func scheduleCheckNoPackageFixture(t *testing.T, app *App, channelID, playbackMode, prefillMode, requiredProfile string) {
+func scheduleCheckNoPackageFixture(t *testing.T, app *App, channelID, prefillMode, requiredProfile string) {
 	t.Helper()
 	conn := app.dbConn
 	mustExec := func(q string, args ...any) {
@@ -131,9 +131,9 @@ func scheduleCheckNoPackageFixture(t *testing.T, app *App, channelID, playbackMo
 		}
 	}
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled,
-		created_at_ms, playback_mode, required_package_profile, hidden_from_guide, prefill_mode)
-		VALUES (?, ?, '/tmp', 'alphabetical', 1, 0, ?, ?, 0, ?)`,
-		channelID, channelID, playbackMode, requiredProfile, prefillMode)
+		created_at_ms, required_package_profile, hidden_from_guide, prefill_mode)
+		VALUES (?, ?, '/tmp', 'alphabetical', 1, 0, ?, 0, ?)`,
+		channelID, channelID, requiredProfile, prefillMode)
 	mediaID := channelID + "-m1"
 	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
@@ -158,8 +158,8 @@ func hasPackageNotReady(issues []schedcheck.Issue, channelID string) bool {
 // channel in the same window still gets flagged.
 func TestScheduleCheckPackageNotReadyGatedByChannelMode(t *testing.T) {
 	app, _ := testAdminApp(t)
-	scheduleCheckNoPackageFixture(t, app, "ondemand-ch", "packaged", "on_demand", "h264-1080p-8mbps")
-	scheduleCheckNoPackageFixture(t, app, "eager-ch", "packaged", "eager", "h264-1080p-8mbps")
+	scheduleCheckNoPackageFixture(t, app, "ondemand-ch", "on_demand", "h264-1080p-8mbps")
+	scheduleCheckNoPackageFixture(t, app, "eager-ch", "eager", "h264-1080p-8mbps")
 
 	code, resp := doScheduleCheck(t, app, "?from=1970-01-01T00:00:00Z&hours=1")
 	if code != http.StatusOK {

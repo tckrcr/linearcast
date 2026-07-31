@@ -1,5 +1,5 @@
 import { ChannelArtwork } from "./ChannelArtwork";
-import { formatClock, formatMs, mediaTitle, sourceNowSubtitle } from "./format";
+import { formatClock, formatMs, mediaTitle } from "./format";
 import type { LiveSlot } from "./playbackClock";
 import type { PlayableSource } from "./types";
 
@@ -11,7 +11,7 @@ type Props = {
 
 export function ChannelBanner({ channel, slot, visible }: Props) {
   if (!channel) return null;
-  const nowTitle = channel.nowPlaying?.title ?? mediaTitle(slot.now);
+  const nowTitle = mediaTitle(slot.now);
   return (
     <div className={`tv-banner${visible ? " is-visible" : ""}`} aria-hidden={!visible}>
       <div className="tv-banner-channel">
@@ -30,9 +30,6 @@ export function ChannelBanner({ channel, slot, visible }: Props) {
       <div className="tv-banner-slot">
         <span className="label">now</span>
         <span className="tv-banner-title">{nowTitle}</span>
-        {sourceNowSubtitle(channel) && (
-          <span className="muted">{sourceNowSubtitle(channel)}</span>
-        )}
         {slot.remainingMs != null && (
           <span className="muted">{formatMs(slot.remainingMs)} left</span>
         )}

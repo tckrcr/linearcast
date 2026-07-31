@@ -97,6 +97,8 @@ Thumbs.db
 coverage.out
 coverage/
 *.coverprofile
+/web-ui/playwright-report/
+/web-ui/test-results/
 
 # -----------------------------
 # Misc

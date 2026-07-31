@@ -60,9 +60,6 @@ func runLocal(ctx context.Context, subcmd string, getenv func(string) string, ou
 		return fmt.Errorf("open db: %w", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(ctx, conn); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
 	if err := db.VerifySchema(ctx, conn); err != nil {
 		return fmt.Errorf("verify schema: %w", err)
 	}

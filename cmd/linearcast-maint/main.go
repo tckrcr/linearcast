@@ -30,16 +30,21 @@ func main() {
 		log.Fatal("LINEARCAST_DB is required")
 	}
 
-	// backup and restore manage their own database access: backup snapshots the
-	// live database read-only (and must not apply schema/seed to it), and
-	// restore swaps files while services are stopped and must not open the
-	// target read-write first.
+	// Migration, backup, and restore manage their own database access. In
+	// particular, migrate must inspect and snapshot an old schema before opening
+	// it read-write; no command may migrate schema as a side effect of startup.
 	switch sub {
+	case "migrate":
+		cmdMigrate(dbPath)
+		return
 	case "backup":
 		cmdBackup(dbPath, os.Args[2:])
 		return
 	case "restore":
 		cmdRestore(dbPath, os.Args[2:])
+		return
+	case "delete-encode", "audit-duration", "backfill-package-bytes":
+		runPackageMaint(os.Args[1:])
 		return
 	}
 
@@ -49,9 +54,6 @@ func main() {
 	}
 	defer conn.Close()
 
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		log.Fatalf("apply schema: %v", err)
-	}
 	if err := db.VerifySchema(context.Background(), conn); err != nil {
 		log.Fatalf("verify schema: %v", err)
 	}
@@ -61,8 +63,6 @@ func main() {
 		cmdCheck(conn, os.Args[2:])
 	case "validate-segments":
 		cmdValidateSegments(conn, os.Args[2:])
-	case "migrate":
-		cmdMigrate(conn)
 	case "set-group":
 		cmdSetGroup(conn, os.Args[2:])
 	default:
@@ -78,6 +78,9 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  set-group <media-path> <group | ->")
 	fmt.Fprintln(os.Stderr, "  backup [--dir <dir>] [--keep N]")
 	fmt.Fprintln(os.Stderr, "  restore [--confirm] <snapshot.db>")
+	fmt.Fprintln(os.Stderr, "  delete-encode <mediaID> [--profile <profile>] [--force]")
+	fmt.Fprintln(os.Stderr, "  audit-duration [--fix]")
+	fmt.Fprintln(os.Stderr, "  backfill-package-bytes [--dry-run]")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Operator channel/playlist/Plex writes were removed; use the admin API/UI.")
 	fmt.Fprintln(os.Stderr, "Env: LINEARCAST_DB")
@@ -96,12 +99,60 @@ func splitArgs(args []string) (positional, flagArgs []string) {
 	return positional, args[i:]
 }
 
-func cmdMigrate(conn *sql.DB) {
-	n, err := db.NormalizeChannelsToPackaged(context.Background(), conn, db.DefaultPackageProfile)
+func cmdMigrate(dbPath string) {
+	ctx := context.Background()
+	plan, err := db.PlanMigrations(ctx, dbPath)
 	if err != nil {
-		log.Fatalf("normalize playback policy: %v", err)
+		log.Fatalf("plan migrations: %v", err)
 	}
-	fmt.Printf("schema ok; normalized_channels=%d\n", n)
+
+	var snapshot string
+	if plan.NeedsMigration() {
+		snapshot, err = createMigrationSnapshot(ctx, dbPath, plan, time.Now())
+		if err != nil {
+			log.Fatalf("migration snapshot: %v", err)
+		}
+		log.Printf("migration snapshot: wrote and verified %s (schema v%d)", snapshot, plan.CurrentVersion)
+	}
+
+	conn, err := db.OpenReadWrite(dbPath)
+	if err != nil {
+		log.Fatalf("open db for migration: %v", err)
+	}
+	defer conn.Close()
+	if err := db.Migrate(ctx, conn); err != nil {
+		log.Fatalf("migrate: %v", err)
+	}
+
+	if snapshot != "" {
+		if _, err := db.PruneBackups(filepath.Dir(snapshot), 14); err != nil {
+			log.Printf("migration snapshot: prune: %v", err)
+		}
+	}
+	fmt.Printf("schema ok; version=%d", db.SchemaVersion)
+	if snapshot != "" {
+		fmt.Printf("; snapshot=%s", snapshot)
+	}
+	fmt.Println()
+}
+
+func createMigrationSnapshot(ctx context.Context, dbPath string, plan db.MigrationPlan, now time.Time) (string, error) {
+	if !plan.NeedsMigration() {
+		return "", nil
+	}
+	backupDir := defaultBackupDir(dbPath)
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		return "", fmt.Errorf("create dir %s: %w", backupDir, err)
+	}
+	snapshot := filepath.Join(backupDir, db.BackupFileName(now))
+	if err := db.Backup(ctx, dbPath, snapshot); err != nil {
+		return "", err
+	}
+	if err := db.VerifyBackupVersion(ctx, snapshot, plan.CurrentVersion); err != nil {
+		_ = os.Remove(snapshot)
+		return "", fmt.Errorf("verify %s: %w", snapshot, err)
+	}
+	return snapshot, nil
 }
 
 // cmdSetGroup overrides the collection on a single media row. Pass "-" (or

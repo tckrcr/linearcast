@@ -14,7 +14,7 @@
   width: 100%;
   table-layout: fixed;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .write-log-table th,
@@ -29,7 +29,7 @@
 .write-log-table th {
   font-weight: 600;
   color: var(--text-dim);
-  font-size: 12px;
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }

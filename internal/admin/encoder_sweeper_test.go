@@ -32,8 +32,8 @@ func newSweeperEnv(t *testing.T) *sweeperEnv {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,

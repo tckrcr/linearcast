@@ -10,16 +10,17 @@ import (
 
 	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/layout"
+	"github.com/tckrcr/linearcast/internal/playback"
 )
 
 // App is the admin HTTP application.
 type App struct {
 	dbConn             *sql.DB
 	dbPath             string
-	upstreamURL        string
 	httpClient         *http.Client
-	upstreamCache      *upstreamStatusCache
-	externalHeartbeat  *externalHeartbeatCache
+	playbackStatus     playback.StatusProvider
+	playbackControl    playback.Controller
+	degradedReader     playback.DegradedReader
 	now                func() time.Time
 	cache              layout.Cache
 	mediaRoot          string
@@ -42,9 +43,11 @@ type Config struct {
 	// DBPath is the filesystem path to the SQLite database file. Required for
 	// maintenance operations (VACUUM, size reporting); other endpoints work
 	// without it.
-	DBPath      string
-	UpstreamURL string
-	HTTPClient  *http.Client
+	DBPath          string
+	HTTPClient      *http.Client
+	PlaybackStatus  playback.StatusProvider
+	PlaybackControl playback.Controller
+	DegradedReader  playback.DegradedReader
 	// Now returns the current time. Defaults to time.Now.
 	Now func() time.Time
 	// CacheDir is the value of CACHE_DIR used by cache summary handlers.
@@ -104,10 +107,10 @@ func New(cfg Config) *App {
 	return &App{
 		dbConn:             cfg.DB,
 		dbPath:             cfg.DBPath,
-		upstreamURL:        cfg.UpstreamURL,
 		httpClient:         client,
-		upstreamCache:      newUpstreamStatusCache(),
-		externalHeartbeat:  newExternalHeartbeatCache(),
+		playbackStatus:     cfg.PlaybackStatus,
+		playbackControl:    cfg.PlaybackControl,
+		degradedReader:     cfg.DegradedReader,
 		now:                now,
 		cache:              layout.NewCache(cfg.CacheDir),
 		mediaRoot:          cfg.MediaRoot,

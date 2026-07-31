@@ -7,18 +7,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-)
 
-const (
-	clockCheckStrict   = "strict"
-	clockCheckDisabled = "disabled"
+	"github.com/tckrcr/linearcast/internal/playback"
 )
 
 type startupConfig struct {
-	dbPath         string
-	addr           string
-	encodingDir    string
-	clockCheckMode string
+	dbPath      string
+	addr        string
+	encodingDir string
 	// cacheDir is the package cache root (CACHE_DIR). Optional: when set, the
 	// playback process samples <cacheDir>/packages into the package-cache-bytes
 	// gauge. Blank disables that sampler.
@@ -33,6 +29,10 @@ type startupConfig struct {
 	// onDemandWarmupMs is the head-start buffer between the encoder seek point
 	// and the served media position.
 	onDemandWarmupMs int64
+	// Admin HTTP is composed into the same listener. These flags control only
+	// the protected admin module, not a separate service.
+	adminAllowNoAuth  bool
+	adminCookieSecure bool
 }
 
 // defaultOnDemandMaxConcurrent matches ondemand.NewManager's built-in default;
@@ -42,11 +42,27 @@ const defaultOnDemandMaxConcurrent = 4
 
 func loadStartupConfig(getenv func(string) string) (startupConfig, error) {
 	cfg := startupConfig{
-		dbPath:         getenv("LINEARCAST_DB"),
-		addr:           getenv("LINEARCAST_ADDR"),
-		encodingDir:    getenv("LINEARCAST_ENCODING_DIR"),
-		clockCheckMode: strings.ToLower(strings.TrimSpace(getenv("LINEARCAST_CLOCK_CHECK"))),
-		cacheDir:       strings.TrimSpace(getenv("CACHE_DIR")),
+		dbPath:      getenv("LINEARCAST_DB"),
+		addr:        getenv("LINEARCAST_ADDR"),
+		encodingDir: getenv("LINEARCAST_ENCODING_DIR"),
+		cacheDir:    strings.TrimSpace(getenv("CACHE_DIR")),
+	}
+	for _, item := range []struct {
+		name string
+		dst  *bool
+	}{
+		{name: "LINEARCAST_ADMIN_ALLOW_NO_AUTH", dst: &cfg.adminAllowNoAuth},
+		{name: "LINEARCAST_ADMIN_COOKIE_SECURE", dst: &cfg.adminCookieSecure},
+	} {
+		raw := strings.TrimSpace(getenv(item.name))
+		if raw == "" {
+			continue
+		}
+		value, err := parseConfigBool(raw)
+		if err != nil {
+			return startupConfig{}, fmt.Errorf("%s: %w", item.name, err)
+		}
+		*item.dst = value
 	}
 	cfg.onDemandMaxConcurrent = defaultOnDemandMaxConcurrent
 	if raw := strings.TrimSpace(getenv("LINEARCAST_ON_DEMAND_MAX_CONCURRENT")); raw != "" {
@@ -59,7 +75,7 @@ func loadStartupConfig(getenv func(string) string) (startupConfig, error) {
 	var err error
 	cfg.onDemandPlaybackLagMs, err = parseOptionalPositiveInt64(
 		getenv("LINEARCAST_ON_DEMAND_PLAYBACK_LAG_MS"),
-		defaultOnDemandPlaybackLagMs,
+		playback.DefaultOnDemandPlaybackLagMs,
 		"LINEARCAST_ON_DEMAND_PLAYBACK_LAG_MS",
 	)
 	if err != nil {
@@ -67,7 +83,7 @@ func loadStartupConfig(getenv func(string) string) (startupConfig, error) {
 	}
 	cfg.onDemandWarmupMs, err = parseOptionalPositiveInt64(
 		getenv("LINEARCAST_ON_DEMAND_WARMUP_MS"),
-		defaultOnDemandWarmupMs,
+		playback.DefaultOnDemandWarmupMs,
 		"LINEARCAST_ON_DEMAND_WARMUP_MS",
 	)
 	if err != nil {
@@ -84,14 +100,6 @@ func loadStartupConfig(getenv func(string) string) (startupConfig, error) {
 	}
 	if cfg.encodingDir == "" {
 		cfg.encodingDir = filepath.Join(os.TempDir(), "linearcast-encodings")
-	}
-	if cfg.clockCheckMode == "" {
-		cfg.clockCheckMode = clockCheckStrict
-	}
-	switch cfg.clockCheckMode {
-	case clockCheckStrict, clockCheckDisabled:
-	default:
-		return startupConfig{}, fmt.Errorf("LINEARCAST_CLOCK_CHECK must be %q or %q", clockCheckStrict, clockCheckDisabled)
 	}
 	return cfg, nil
 }

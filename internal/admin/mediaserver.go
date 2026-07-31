@@ -485,6 +485,7 @@ func mediaSourceMetadataForItem(source, path string, it mediasource.Item) db.Med
 		Description:    it.Description,
 		ThumbPath:      it.ThumbnailPath,
 		ContentRating:  it.ContentRating,
+		Rating:         it.Rating,
 		Genres:         it.Genres,
 	}
 }

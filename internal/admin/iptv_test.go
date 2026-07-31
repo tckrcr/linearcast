@@ -14,24 +14,15 @@ import (
 func TestHandleM3U(t *testing.T) {
 	app, conn := testAdminApp(t)
 
-	// A packaged VOD channel (with artwork), an external/live channel, and a
-	// hidden channel that must not appear in the playlist.
+	// A visible channel with artwork and a hidden channel that must not appear.
 	if _, err := conn.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, hidden_from_guide, artwork_url
+			hidden_from_guide, artwork_url
 		)
-		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 'packaged', 0, 'https://img.example.com/vod.png'),
-		       ('hidden',  'Hidden',  '/tmp', 'alphabetical', 1, 0, 'packaged', 1, NULL)`); err != nil {
+		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 0, 'https://img.example.com/vod.png'),
+		       ('hidden',  'Hidden',  '/tmp', 'alphabetical', 1, 0, 1, NULL)`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
-	if _, err := conn.Exec(`INSERT INTO channels (
-			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, media_kind, upstream_hls_url
-		)
-		VALUES ('spotify', 'Spotify', '', 'alphabetical', 1, 0, 'packaged', 'music', 'https://up.example.com/x.m3u8')`); err != nil {
-		t.Fatalf("insert external channel: %v", err)
-	}
-
 	req := httptest.NewRequest(http.MethodGet, "/api/m3u", nil)
 	req.Header.Set("X-Forwarded-Proto", "https") // mimic nginx so URLs come out absolute https
 	res := httptest.NewRecorder()
@@ -55,8 +46,6 @@ func TestHandleM3U(t *testing.T) {
 		`group-title="linearcast"`,
 		// Absolute URLs derived from X-Forwarded-Proto + Host, with the id path-escaped.
 		"https://example.com/hls/channels/vod%20one/stream.m3u8",
-		// External channels point at the external manifest path.
-		"https://example.com/hls/external/spotify/stream.m3u8",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body missing %q:\n%s", want, body)
@@ -74,8 +63,8 @@ func TestHandleXMLTV(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(t.Context(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(t.Context(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	if _, err := conn.Exec(`INSERT INTO collections (id, name, kind, source, genres_json, created_at_ms, updated_at_ms)
@@ -93,9 +82,9 @@ func TestHandleXMLTV(t *testing.T) {
 	}
 	if _, err := conn.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, hidden_from_guide, artwork_url
+			hidden_from_guide, artwork_url
 		)
-		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 'packaged', 0, 'https://img.example.com/vod.png')`); err != nil {
+		VALUES ('vod one', 'VOD One', '/tmp', 'alphabetical', 1, 0, 0, 'https://img.example.com/vod.png')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, created_at_ms)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -392,36 +391,15 @@ func (a *App) handleEncoderList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// handleChannelStopEncoder proxies a kill request to the linearcast playback
-// server, which tears down the channel's active on-demand encoding and blocks
-// re-admission for 15 minutes. Returns 503 if the playback server is
-// unreachable (the kill cannot be confirmed).
+// handleChannelStopEncoder asks the in-process playback controller to tear down
+// the channel's active on-demand encoding and block re-admission for 15 minutes.
 func (a *App) handleChannelStopEncoder(w http.ResponseWriter, r *http.Request) {
 	channelID := r.PathValue("channelID")
-	if a.upstreamURL == "" {
-		writeError(w, http.StatusServiceUnavailable, "no_upstream", "upstream linearcast URL not configured")
+	if a.playbackControl == nil {
+		writeError(w, http.StatusServiceUnavailable, "playback_unavailable", "playback control is not configured")
 		return
 	}
-	url := a.upstreamURL + "/channels/" + channelID + "/ondemand/restart"
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "request_build", err.Error())
-		return
-	}
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "upstream_unreachable", err.Error())
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		writeError(w, http.StatusNotFound, "not_found", "channel not found or has no active encoding")
-		return
-	}
-	if resp.StatusCode != http.StatusNoContent {
-		writeError(w, http.StatusBadGateway, "upstream_error", fmt.Sprintf("upstream returned %d", resp.StatusCode))
-		return
-	}
+	a.playbackControl.StopOnDemandEncoding(channelID)
 	writeJSON(w, map[string]any{
 		"channelID": channelID,
 		"note":      "encoder stopped; channel is gated for 15 minutes before it can re-encode",

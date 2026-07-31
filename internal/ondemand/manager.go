@@ -967,8 +967,9 @@ func (m *Manager) ExtraDiscontinuities(channelID string) int64 {
 	return m.extraDisc[channelID]
 }
 
-// EncodingID returns the live encoding ID for an active or recently-retained
-// schedule entry.
+// EncodingID returns the live encoding ID for a running, completed, or
+// recently-retained schedule entry. Completed encodings remain directly
+// servable until the sweeper moves their artifacts into retained storage.
 func (m *Manager) EncodingID(channelID, entryID string) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -976,7 +977,7 @@ func (m *Manager) EncodingID(channelID, entryID string) (string, bool) {
 		return "", false
 	}
 	if s := m.encodings[channelID][entryID]; s != nil {
-		if s.state == stateFailed || s.state == stateStopping || s.state == stateEnded {
+		if s.state == stateFailed || s.state == stateStopping {
 			return "", false
 		}
 		return s.id, true
@@ -1222,6 +1223,24 @@ func (m *Manager) runningLocked() int {
 		}
 	}
 	return n
+}
+
+// ActiveCount returns the number of on-demand channel encodings currently
+// competing for the MaxConcurrent budget (starting or serving with a running
+// process). It is the realtime capacity-load figure a scrape collector reads at
+// scrape time, so capacity utilization is always current rather than the value
+// at the last state-transition write.
+func (m *Manager) ActiveCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runningLocked()
+}
+
+// MaxConcurrent returns the configured on-demand encoding concurrency budget.
+func (m *Manager) MaxConcurrent() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxConcurrent
 }
 
 // markFailed records a startup-time failure (channel-encoding dir create or ffmpeg

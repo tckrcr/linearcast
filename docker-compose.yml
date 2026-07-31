@@ -1,8 +1,7 @@
 services:
   linearcast:
-    image: ghcr.io/tckrcr/linearcast:latest
+    build: .
     container_name: linearcast
-    pull_policy: always
     command: ["serve"]
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:

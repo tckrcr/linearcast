@@ -1,4 +1,4 @@
-import type { MediaWindow, PlayableSource } from "./types";
+import type { MediaWindow } from "./types";
 
 export function formatMs(value: number | null | undefined): string {
   if (value == null || Number.isNaN(value)) return "-";
@@ -44,18 +44,6 @@ export function formatBytes(value: number | null | undefined): string {
 export function mediaTitle(media: MediaWindow | null | undefined): string {
   if (!media) return "-";
   return media.title || media.mediaID;
-}
-
-export function sourceNowTitle(source: PlayableSource | null | undefined): string {
-  if (!source) return "-";
-  if (source.nowPlaying?.title) return source.nowPlaying.title;
-  return mediaTitle(source.current);
-}
-
-export function sourceNowSubtitle(source: PlayableSource | null | undefined): string {
-  if (!source?.nowPlaying) return "";
-  const parts = [source.nowPlaying.artist, source.nowPlaying.album].filter(Boolean);
-  return parts.join(" · ");
 }
 
 export function formatDateTime(ms: number): string {

@@ -143,13 +143,23 @@ export function MediaPickerRail(props: MediaPickerRailProps) {
             <li
               key={item.key}
               className={`${mpStyles["mp-rail-row"]}${rowDraggable ? " is-draggable" : ""}`}
-              draggable={rowDraggable}
-              onDragStart={rowDraggable ? (e) => {
-                e.dataTransfer.effectAllowed = "copy";
-                e.dataTransfer.setData(MEDIA_DRAG_MIME, item.key);
-                e.dataTransfer.setData("text/plain", item.title);
-              } : undefined}
             >
+              {rowDraggable && (
+                <span
+                  className={mpStyles["mp-rail-row-grip"]}
+                  draggable
+                  title="Drag onto the timeline"
+                  onDragStart={(e) => {
+                    e.dataTransfer.effectAllowed = "copy";
+                    e.dataTransfer.setData(MEDIA_DRAG_MIME, item.key);
+                    e.dataTransfer.setData("text/plain", item.title);
+                    const row = e.currentTarget.closest("li");
+                    if (row) e.dataTransfer.setDragImage(row, 16, 16);
+                  }}
+                >
+                  ⠿
+                </span>
+              )}
               <div className={mpStyles["mp-rail-row-main"]}>
                 <span className={mpStyles["mp-rail-row-title"]}>{item.title}</span>
                 {item.meta != null && (

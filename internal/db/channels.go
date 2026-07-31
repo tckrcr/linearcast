@@ -44,15 +44,6 @@ func ChannelByID(ctx context.Context, conn Execer, id string) (*Channel, error) 
 	return scanChannel(conn.QueryRowContext(ctx, channelSelectSQL()+` WHERE id = ?`, id))
 }
 
-// ExternalChannel returns the single external/live channel — the one row whose
-// upstream_hls_url is set. Live channels are a singleton in this appliance (one
-// external HLS stream per account); if more than one ever exists, the lowest id
-// wins so callers get a deterministic target. Returns (nil, nil) when none is
-// configured.
-func ExternalChannel(ctx context.Context, conn Execer) (*Channel, error) {
-	return scanChannel(conn.QueryRowContext(ctx, channelSelectSQL()+` WHERE upstream_hls_url IS NOT NULL ORDER BY id LIMIT 1`))
-}
-
 // nullString maps a Go string to a nullable column value: empty becomes SQL
 // NULL, preserving the on-disk NULL/” distinction the de-leaked Channel fields
 // no longer carry in the struct.
@@ -97,44 +88,27 @@ func normalizeChannelWrite(c ChannelWrite) ChannelWrite {
 		v := int64(30 * 60 * 1000)
 		c.SlotDurationMs = &v
 	}
-	if c.PlaybackMode == "" || c.PlaybackMode == PlaybackModeGenerated {
-		c.PlaybackMode = PlaybackModePackaged
+	if strings.TrimSpace(c.RequiredPackageProfile) == "" {
+		c.RequiredPackageProfile = DefaultPackageProfileForMediaKind(c.MediaKind)
 	}
-	if c.UpstreamHLSURL != nil {
-		c.SourceDirectory = ""
-		c.RequiredPackageProfile = ""
-		c.ABRLadder = nil
-		c.PackagePrefillMs = nil
-		// On-demand packaging is meaningless for an external HLS proxy — it owns
-		// no packaged media. Keep these eager so they never enter demand tracking.
-		c.PrefillMode = "eager"
-	}
-	if c.PlaybackMode == PlaybackModePackaged && strings.TrimSpace(c.RequiredPackageProfile) == "" {
-		if c.UpstreamHLSURL == nil {
-			c.RequiredPackageProfile = DefaultPackageProfileForMediaKind(c.MediaKind)
-		}
-	}
-	if c.PlaybackMode == PlaybackModePackaged && c.UpstreamHLSURL == nil {
-		c.ABRLadder = NormalizeABRLadder(c.RequiredPackageProfile, mustMarshalStringSlice(c.ABRLadder))
-	}
+	c.ABRLadder = NormalizeABRLadder(c.RequiredPackageProfile, mustMarshalStringSlice(c.ABRLadder))
 	if c.CreatedAtMs == 0 {
 		c.CreatedAtMs = time.Now().UTC().UnixMilli()
 	}
 	return c
 }
 
-// InsertChannel creates an enabled packaged-playback channel. Generated mode is
-// no longer a supported write policy; legacy values are normalized to packaged.
+// InsertChannel creates an enabled scheduled channel.
 func InsertChannel(ctx context.Context, conn *sql.DB, c ChannelWrite) error {
 	c = normalizeChannelWrite(c)
 	_, err := conn.ExecContext(ctx, `
 		INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			hidden_from_guide, playback_mode, required_package_profile, abr_ladder_json, package_prefill_ms, media_kind, schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
+			hidden_from_guide, required_package_profile, abr_ladder_json, package_prefill_ms, media_kind, schedule_mode, slot_duration_ms, prefill_mode
 		)
-		VALUES (?, ?, ?, ?, 1, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, 1, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.DisplayName, c.SourceDirectory, c.Ordering, c.CreatedAtMs,
-		string(c.PlaybackMode), nullString(c.RequiredPackageProfile), abrLadderValue(c.RequiredPackageProfile, c.ABRLadder), c.PackagePrefillMs, string(c.MediaKind), c.ScheduleMode, c.SlotDurationMs, c.UpstreamHLSURL, c.PrefillMode)
+		nullString(c.RequiredPackageProfile), abrLadderValue(c.RequiredPackageProfile, c.ABRLadder), c.PackagePrefillMs, string(c.MediaKind), c.ScheduleMode, c.SlotDurationMs, c.PrefillMode)
 	return err
 }
 
@@ -173,13 +147,13 @@ func CloneChannel(ctx context.Context, conn *sql.DB, id string, createdAtMs int6
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			description, hidden_from_guide, artwork_url, playback_mode, required_package_profile, abr_ladder_json, package_prefill_ms,
-			media_kind, schedule_mode, slot_duration_ms, upstream_hls_url, prefill_mode
+			description, hidden_from_guide, artwork_url, required_package_profile, abr_ladder_json, package_prefill_ms,
+			media_kind, schedule_mode, slot_duration_ms, prefill_mode
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cloneID, cloneName, src.SourceDirectory, src.Ordering, 0, createdAtMs,
-		nullString(src.Description), src.HiddenFromGuide, nullString(src.ArtworkURL), string(src.PlaybackMode), nullString(src.RequiredPackageProfile), abrLadderValue(src.RequiredPackageProfile, src.ABRLadder), src.PackagePrefillMs,
-		string(src.MediaKind), src.ScheduleMode, src.SlotDurationMs, src.UpstreamHLSURL, src.PrefillMode); err != nil {
+		nullString(src.Description), src.HiddenFromGuide, nullString(src.ArtworkURL), nullString(src.RequiredPackageProfile), abrLadderValue(src.RequiredPackageProfile, src.ABRLadder), src.PackagePrefillMs,
+		string(src.MediaKind), src.ScheduleMode, src.SlotDurationMs, src.PrefillMode); err != nil {
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -256,34 +230,8 @@ func nextCloneID(id string, existing map[string]bool) string {
 	}
 }
 
-// OverwriteChannelWithPolicy clears schedule rows and replaces channel metadata
-// plus playback policy. This is used by import flows that intentionally replace
-// a channel definition.
-func OverwriteChannelWithPolicy(ctx context.Context, conn *sql.DB, c ChannelWrite) error {
-	c = normalizeChannelWrite(c)
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM schedule_entries WHERE channel_id = ?`, c.ID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE channels
-		SET display_name = ?, source_directory = ?, ordering = ?, enabled = 1,
-		    playback_mode = ?, required_package_profile = ?, abr_ladder_json = ?, package_prefill_ms = ?, media_kind = ?
-		WHERE id = ?`,
-		c.DisplayName, c.SourceDirectory, c.Ordering, string(c.PlaybackMode),
-		nullString(c.RequiredPackageProfile), abrLadderValue(c.RequiredPackageProfile, c.ABRLadder), c.PackagePrefillMs, string(c.MediaKind), c.ID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 // OverwriteChannelMetadata clears schedule rows and replaces channel metadata
-// while preserving playback policy. Plex import uses this because the import
-// path does not carry playback-mode fields.
+// while preserving its encoding and scheduling policy.
 func OverwriteChannelMetadata(ctx context.Context, conn *sql.DB, id, displayName, sourceDir, ordering string) error {
 	return WithTx(ctx, conn, func(tx Execer) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM schedule_entries WHERE channel_id = ?`, id); err != nil {
@@ -305,10 +253,7 @@ func DeleteChannel(ctx context.Context, conn *sql.DB, id string) (int64, error) 
 	return res.RowsAffected()
 }
 
-func UpdateChannelPlaybackPolicy(ctx context.Context, conn *sql.DB, id string, mode PlaybackMode, profile string, abrLadder []string, prefillMs *int64, mediaKind MediaKind) (bool, error) {
-	if mode != PlaybackModePackaged {
-		return false, fmt.Errorf("unsupported playback mode %q: only packaged playback is supported", mode)
-	}
+func UpdateChannelPolicy(ctx context.Context, conn *sql.DB, id string, profile string, abrLadder []string, prefillMs *int64, mediaKind MediaKind) (bool, error) {
 	mediaKind = NormalizeMediaKind(mediaKind)
 	if strings.TrimSpace(profile) == "" {
 		profile = DefaultPackageProfileForMediaKind(mediaKind)
@@ -335,9 +280,9 @@ func UpdateChannelPlaybackPolicy(ctx context.Context, conn *sql.DB, id string, m
 	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE channels
-		SET playback_mode = ?, required_package_profile = ?, abr_ladder_json = ?, package_prefill_ms = ?, media_kind = ?
+		SET required_package_profile = ?, abr_ladder_json = ?, package_prefill_ms = ?, media_kind = ?
 		WHERE id = ?`,
-		string(mode), nullString(profile), abrLadderValue(profile, abrLadder), prefillMs, string(mediaKind), id)
+		nullString(profile), abrLadderValue(profile, abrLadder), prefillMs, string(mediaKind), id)
 	if err != nil {
 		return false, err
 	}
@@ -363,10 +308,7 @@ func UpdateOnDemandChannelPackageProfile(ctx context.Context, conn *sql.DB, id, 
 	res, err := conn.ExecContext(ctx, `
 		UPDATE channels
 		SET required_package_profile = ?, abr_ladder_json = NULL
-		WHERE id = ?
-		  AND playback_mode = 'packaged'
-		  AND upstream_hls_url IS NULL
-		  AND prefill_mode = 'on_demand'`,
+		WHERE id = ? AND prefill_mode = 'on_demand'`,
 		profile, id)
 	if err != nil {
 		return false, err
@@ -376,27 +318,6 @@ func UpdateOnDemandChannelPackageProfile(ctx context.Context, conn *sql.DB, id, 
 		return false, err
 	}
 	return n > 0, nil
-}
-
-func NormalizeChannelsToPackaged(ctx context.Context, conn *sql.DB, profile string) (int64, error) {
-	profile = strings.TrimSpace(profile)
-	if profile == "" {
-		profile = DefaultPackageProfile
-	}
-	res, err := conn.ExecContext(ctx, `
-		UPDATE channels
-		SET playback_mode = 'packaged',
-		    required_package_profile = COALESCE(NULLIF(TRIM(required_package_profile), ''), ?)
-		WHERE playback_mode IS NULL
-		   OR TRIM(playback_mode) = ''
-		   OR playback_mode = 'generated'
-		   OR (playback_mode = 'packaged' AND (
-		       required_package_profile IS NULL OR TRIM(required_package_profile) = ''
-		   ))`, profile)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
 }
 
 // SetChannelEnabled is the shared transition for enabling/disabling a channel.
@@ -439,19 +360,7 @@ func SetChannelHiddenFromGuide(ctx context.Context, conn *sql.DB, id string, hid
 }
 
 // SetChannelArtworkURL stores an optional operator-managed artwork URL for a
-// channel. Passing an invalid NullString clears the artwork override.
-func SetChannelUpstreamHLSURL(ctx context.Context, conn *sql.DB, id string, rawURL string) (bool, error) {
-	res, err := conn.ExecContext(ctx, `UPDATE channels SET upstream_hls_url = ? WHERE id = ? AND upstream_hls_url IS NOT NULL`, rawURL, id)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
-}
-
+// channel. Passing an empty string clears the artwork override.
 func SetChannelArtworkURL(ctx context.Context, conn *sql.DB, id string, artworkURL string) (bool, error) {
 	res, err := conn.ExecContext(ctx, `UPDATE channels SET artwork_url = ? WHERE id = ?`, nullString(strings.TrimSpace(artworkURL)), id)
 	if err != nil {

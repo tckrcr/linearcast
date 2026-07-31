@@ -78,7 +78,7 @@ func OptionsForChannel(ch db.Channel, fallback Options) Options {
 }
 
 // ExtendChannelTail extends a channel from its current schedule tail.
-// Callers that need channel loading, low-water checks, or playback-mode policy
+// Callers that need channel loading, low-water checks, or packaging policy
 // should use the service entrypoints in service.go instead.
 //
 // Returns (inserted, lastEnd, err) where lastEnd is the new end_ms of
@@ -104,26 +104,6 @@ func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering 
 		return 0, existingEnd, nil
 	}
 
-	var media []db.Media
-	if opts.RequireReadyPackages {
-		if opts.RenditionProfile == "" {
-			return 0, existingEnd, fmt.Errorf("rendition profile is required when RequireReadyPackages is true")
-		}
-		media, err = db.EligibleReadyPackagedChannelMedia(ctx, conn, channelID, opts.RenditionProfile)
-	} else {
-		media, err = db.EligibleChannelMedia(ctx, conn, channelID)
-	}
-	if err != nil {
-		return 0, 0, fmt.Errorf("eligible channel_media: %w", err)
-	}
-	if len(media) == 0 {
-		if opts.RequireReadyPackages {
-			return 0, existingEnd, fmt.Errorf("%w for channel %s profile %s", ErrNoReadyPackages, channelID, opts.RenditionProfile)
-		}
-		return 0, existingEnd, fmt.Errorf("no eligible media for channel %s — populate channel_media", channelID)
-	}
-
-	var entries []db.ScheduleEntry
 	lastMediaID := opts.ResumeAfterMediaID
 	if lastMediaID == "" {
 		var tail *db.ScheduleEntry
@@ -143,6 +123,65 @@ func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering 
 			lastMediaID = tail.MediaID
 		}
 	}
+
+	var media []db.Media
+	if opts.RequireReadyPackages {
+		if opts.RenditionProfile == "" {
+			return 0, existingEnd, fmt.Errorf("rendition profile is required when RequireReadyPackages is true")
+		}
+		allMedia, allErr := db.EligibleChannelMedia(ctx, conn, channelID)
+		if allErr != nil {
+			return 0, 0, fmt.Errorf("eligible channel_media: %w", allErr)
+		}
+		if len(allMedia) == 0 {
+			return 0, existingEnd, fmt.Errorf("no eligible media for channel %s — populate channel_media", channelID)
+		}
+		readyMedia, readyErr := db.EligibleReadyPackagedChannelMedia(ctx, conn, channelID, opts.RenditionProfile)
+		if readyErr != nil {
+			return 0, 0, fmt.Errorf("ready channel_media: %w", readyErr)
+		}
+		if len(readyMedia) == 0 {
+			return 0, existingEnd, fmt.Errorf("%w for channel %s profile %s", ErrNoReadyPackages, channelID, opts.RenditionProfile)
+		}
+		if len(readyMedia) == len(allMedia) {
+			media = readyMedia
+		} else {
+			// While eager packaging is incomplete, the default back-to-back
+			// scheduler may expose the next contiguous ready run, but it must
+			// stop at the first unready playlist item. Filtering that item out
+			// and filling the horizon would repeat or reorder a tiny ready
+			// subset for hours. Specialist block and slot-grid policies retain
+			// their all-ready bootstrap because their next-item/gap decisions
+			// are not the channel_media chain itself.
+			if ordering == "block" || opts.ScheduleMode == "slot_grid" {
+				return 0, existingEnd, nil
+			}
+			media = contiguousReadyMedia(allMedia, readyMedia, lastMediaID)
+			if len(media) == 0 {
+				return 0, existingEnd, nil
+			}
+			readyEndMs := startMs + readyMediaDuration(media)
+			if readyEndMs < wantEndMs {
+				wantEndMs = readyEndMs
+			}
+			// The partial slice is already rotated to begin immediately after
+			// the persisted tail. Do not ask BuildEntries to reposition it.
+			lastMediaID = ""
+		}
+	} else {
+		media, err = db.EligibleChannelMedia(ctx, conn, channelID)
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("eligible channel_media: %w", err)
+	}
+	if len(media) == 0 {
+		if opts.RequireReadyPackages {
+			return 0, existingEnd, fmt.Errorf("%w for channel %s profile %s", ErrNoReadyPackages, channelID, opts.RenditionProfile)
+		}
+		return 0, existingEnd, fmt.Errorf("no eligible media for channel %s — populate channel_media", channelID)
+	}
+
+	var entries []db.ScheduleEntry
 
 	if opts.ScheduleMode == "slot_grid" {
 		slotMs := opts.SlotDurationMs
@@ -197,6 +236,48 @@ func extendChannelTail(ctx context.Context, conn db.Execer, channelID, ordering 
 	}
 	last := entries[len(entries)-1]
 	return n, last.StartMs + last.DurationMs, nil
+}
+
+// contiguousReadyMedia returns the ready playlist run immediately after
+// resumeAfterMediaID, stopping before the first unready item. ready contains
+// packaged durations while allMedia owns the durable channel order.
+func contiguousReadyMedia(allMedia, ready []db.Media, resumeAfterMediaID string) []db.Media {
+	if len(allMedia) == 0 || len(ready) == 0 {
+		return nil
+	}
+	readyByID := make(map[string]db.Media, len(ready))
+	for _, media := range ready {
+		readyByID[media.ID] = media
+	}
+
+	start := 0
+	if resumeAfterMediaID != "" {
+		for i, media := range allMedia {
+			if media.ID == resumeAfterMediaID {
+				start = (i + 1) % len(allMedia)
+				break
+			}
+		}
+	}
+
+	out := make([]db.Media, 0, len(ready))
+	for visited := 0; visited < len(allMedia); visited++ {
+		mediaID := allMedia[(start+visited)%len(allMedia)].ID
+		packaged, ok := readyByID[mediaID]
+		if !ok {
+			break
+		}
+		out = append(out, packaged)
+	}
+	return out
+}
+
+func readyMediaDuration(media []db.Media) int64 {
+	var total int64
+	for _, item := range media {
+		total += ClipToGrid(item.DurationMs)
+	}
+	return total
 }
 
 // loadSlotGridFiller assembles the filler set for slot-grid gap tiling:

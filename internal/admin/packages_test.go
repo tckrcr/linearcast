@@ -195,6 +195,31 @@ func TestHandleMediaPackageCandidatesListsAccurateStatus(t *testing.T) {
 	}
 }
 
+func TestHandleMediaPackageCandidatesIgnoresInventoryOnlyFilters(t *testing.T) {
+	app, conn := testAdminApp(t)
+	insertMedia(t, conn, "candidate", 12000)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/media/package-candidates?minRating=not-a-number&episodesOnly=1", nil)
+	res := httptest.NewRecorder()
+
+	app.handleMediaPackageCandidates(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	var body struct {
+		Media []struct {
+			MediaID string `json:"mediaId"`
+		} `json:"media"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.Media) != 1 || body.Media[0].MediaID != "candidate" {
+		t.Fatalf("unexpected response: %+v", body)
+	}
+}
+
 func TestHandleMediaPackageCandidatesListsAllProfilesReadOnly(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertMedia(t, conn, "ready-main", 12000)

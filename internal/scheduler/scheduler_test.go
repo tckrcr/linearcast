@@ -79,8 +79,8 @@ func TestExtendChannelContinuesFromExistingSchedule(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
 		ID:              "ch",
@@ -152,8 +152,8 @@ func TestExtendChannelSkipsDeletedTailMedia(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
 		ID:              "ch",
@@ -235,8 +235,8 @@ func TestExtendAllEnabledContinuesAfterChannelError(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	for _, id := range []string{"bad", "ok"} {
 		if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
@@ -281,8 +281,8 @@ func TestExtendChannelUsesChannelSlotGridMode(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	slotMs := int64(30 * 60 * 1000)
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
@@ -340,8 +340,8 @@ func TestExtendChannelSlotGridLeadingPrimaryOnCreate(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	slotMs := int64(30 * 60 * 1000)
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
@@ -435,8 +435,8 @@ func TestExtendChannelSlotGridBackfillsLeadingGap(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	slotMs := int64(30 * 60 * 1000)
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
@@ -553,8 +553,8 @@ func TestExtendChannelRequiresReadyPackagedMedia(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
 		ID:              "ch",
@@ -580,15 +580,15 @@ func TestExtendChannelRequiresReadyPackagedMedia(t *testing.T) {
 	}
 }
 
-func TestExtendChannelBootstrapRequiresAllReadyPackages(t *testing.T) {
+func TestExtendChannelEagerStopsAtFirstUnreadyMedia(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "linearcast.db")
 	conn, err := db.OpenReadWrite(path)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
 		ID:              "ch",
@@ -602,46 +602,101 @@ func TestExtendChannelBootstrapRequiresAllReadyPackages(t *testing.T) {
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES
-		('m1', '/tmp/m1.mkv', '/tmp', 600000, 'mkv', 'h264', 1080, 'aac', 1, 0),
-		('m2', '/tmp/m2.mkv', '/tmp', 600000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		('m1', '/tmp/m1.mkv', '/tmp', 1200000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		('m2', '/tmp/m2.mkv', '/tmp', 1200000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		('m3', '/tmp/m3.mkv', '/tmp', 1200000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
 		t.Fatalf("insert media: %v", err)
 	}
-	if _, err := db.AddChannelMedia(context.Background(), conn, "ch", "m1", 0); err != nil {
-		t.Fatalf("add channel media m1: %v", err)
+	for _, id := range []string{"m1", "m2", "m3"} {
+		if _, err := db.AddChannelMedia(context.Background(), conn, "ch", id, 0); err != nil {
+			t.Fatalf("add channel media %s: %v", id, err)
+		}
 	}
-	if _, err := db.AddChannelMedia(context.Background(), conn, "ch", "m2", 0); err != nil {
-		t.Fatalf("add channel media m2: %v", err)
-	}
-	seedReadyPackage(t, conn, "m1")
+	seedReadyPackageDuration(t, conn, "m1", 1200000)
+	seedReadyPackageDuration(t, conn, "m2", 1200000)
 
+	nowMs := int64(60 * 60 * 1000)
 	res, err := ExtendChannel(context.Background(), conn, "ch", ServiceOptions{
-		HorizonHours:             1,
-		BootstrapRequireAllReady: true,
+		HorizonHours: 2,
+		NowMs:        nowMs,
 	})
 	if err != nil {
 		t.Fatalf("extend: %v", err)
 	}
-	if !res.BootstrapDelayed || res.BootstrapReady != 1 || res.BootstrapTotal != 2 {
-		t.Fatalf("result=%+v, want delayed with 1/2 ready", res)
+	if !res.ReadinessLimited || res.ReadyMedia != 2 || res.TotalMedia != 3 {
+		t.Fatalf("result=%+v, want readiness-limited with 2/3 ready", res)
 	}
-	count, err := db.CountScheduleEntries(context.Background(), conn, "ch")
+	if res.Inserted != 2 || res.LastEndMs != nowMs+40*60*1000 {
+		t.Fatalf("result=%+v, want two 20-minute entries", res)
+	}
+	entries, err := db.ScheduleEntriesOrdered(context.Background(), conn, "ch")
 	if err != nil {
-		t.Fatalf("count schedule: %v", err)
+		t.Fatalf("schedule entries: %v", err)
 	}
-	if count != 0 {
-		t.Fatalf("schedule entries=%d, want 0 while bootstrap is delayed", count)
+	if len(entries) != 2 || entries[0].MediaID != "m1" || entries[1].MediaID != "m2" {
+		t.Fatalf("entries=%+v, want one ready prefix m1,m2", entries)
 	}
 
-	seedReadyPackage(t, conn, "m2")
+	// Re-running before m3 is ready must stop at the same boundary instead of
+	// wrapping the two ready programs across the horizon.
 	res, err = ExtendChannel(context.Background(), conn, "ch", ServiceOptions{
-		HorizonHours:             1,
-		BootstrapRequireAllReady: true,
+		HorizonHours: 2,
+		NowMs:        nowMs,
 	})
 	if err != nil {
-		t.Fatalf("extend after ready: %v", err)
+		t.Fatalf("second extend: %v", err)
 	}
-	if res.BootstrapDelayed || res.Inserted == 0 {
-		t.Fatalf("result=%+v, want schedule inserted after all packages are ready", res)
+	if res.Inserted != 0 || !res.ReadinessLimited {
+		t.Fatalf("second result=%+v, want no inserts at the m3 readiness boundary", res)
+	}
+
+	// Once m3 is ready, normal horizon filling resumes from the existing tail:
+	// m3 is the first new row, followed by complete-playlist repetition.
+	seedReadyPackageDuration(t, conn, "m3", 1200000)
+	res, err = ExtendChannel(context.Background(), conn, "ch", ServiceOptions{
+		HorizonHours: 2,
+		NowMs:        nowMs,
+	})
+	if err != nil {
+		t.Fatalf("extend after all ready: %v", err)
+	}
+	if res.ReadinessLimited || res.Inserted != 4 || res.LastEndMs != nowMs+2*60*60*1000 {
+		t.Fatalf("result=%+v, want complete horizon after all packages are ready", res)
+	}
+	entries, err = db.ScheduleEntriesOrdered(context.Background(), conn, "ch")
+	if err != nil {
+		t.Fatalf("schedule entries after all ready: %v", err)
+	}
+	wantMedia := []string{"m1", "m2", "m3", "m1", "m2", "m3"}
+	if len(entries) != len(wantMedia) {
+		t.Fatalf("entries=%+v, want %d entries after full-horizon extension", entries, len(wantMedia))
+	}
+	for i, want := range wantMedia {
+		if entries[i].MediaID != want {
+			t.Fatalf("entries[%d].MediaID=%q, want %q (entries=%+v)", i, entries[i].MediaID, want, entries)
+		}
+	}
+}
+
+func TestContiguousReadyMediaStopsAtOutOfOrderGap(t *testing.T) {
+	all := []db.Media{
+		{ID: "m1", DurationMs: 12000},
+		{ID: "m2", DurationMs: 12000},
+		{ID: "m3", DurationMs: 12000},
+	}
+	ready := []db.Media{
+		{ID: "m1", DurationMs: 12000},
+		{ID: "m3", DurationMs: 12000},
+	}
+
+	got := contiguousReadyMedia(all, ready, "")
+	if len(got) != 1 || got[0].ID != "m1" {
+		t.Fatalf("contiguousReadyMedia=%+v, want only m1 before the m2 gap", got)
+	}
+
+	got = contiguousReadyMedia(all, ready, "m2")
+	if len(got) != 2 || got[0].ID != "m3" || got[1].ID != "m1" {
+		t.Fatalf("contiguousReadyMedia after m2=%+v, want wrapped ready run m3,m1", got)
 	}
 }
 
@@ -652,8 +707,8 @@ func TestPreviewChannelDoesNotWriteScheduleEntries(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
 		ID:              "ch",
@@ -705,8 +760,8 @@ func TestPreviewChannelWarnsWhenPackagesAreMissing(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{
 		ID:              "ch",
@@ -748,8 +803,8 @@ func TestExtendChannelSlotGridTilesFillerAndContinuesAcrossExtends(t *testing.T)
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	slotMs := int64(30 * 60 * 1000)
 	if err := db.InsertChannel(context.Background(), conn, db.ChannelWrite{

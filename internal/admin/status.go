@@ -17,31 +17,28 @@ type statusResponse struct {
 }
 
 type channelNow struct {
-	ID                    string              `json:"id"`
-	DisplayName           string              `json:"displayName"`
-	Enabled               bool                `json:"enabled"`
-	HiddenFromGuide       bool                `json:"hiddenFromGuide"`
-	ArtworkURL            string              `json:"artworkUrl,omitempty"`
-	Ordering              string              `json:"ordering"`
-	MediaKind             string              `json:"mediaKind"`
-	ScheduleMode          string              `json:"scheduleMode"`
-	SlotDurationMs        *int64              `json:"slotDurationMs,omitempty"`
-	PrefillMode string `json:"prefillMode,omitempty"`
-	Status                string              `json:"status"`
-	Current               *mediaWindow        `json:"current"`
-	Next                  *mediaWindow        `json:"next"`
-	ScheduleCoverageMs    int64               `json:"scheduleCoverageMs"`
-	ScheduleCoverageHours float64             `json:"scheduleCoverageHours"`
-	ScheduleEndMs         *int64              `json:"scheduleEndMs,omitempty"`
-	PackageCoverageMs     int64               `json:"packageCoverageMs"`
-	PackageCoverageHours  float64             `json:"packageCoverageHours"`
-	PackageReadyCount     int                 `json:"packageReadyCount"`
-	PackageProfile        string              `json:"packageProfile"`
-	AdaptiveBitrate       bool                `json:"adaptiveBitrate"`
-	IsExternal            bool                `json:"isExternal,omitempty"`
-	UpstreamHLSURL        string              `json:"upstreamHlsUrl,omitempty"`
-	NowPlaying            *externalNowPlaying `json:"nowPlaying,omitempty"`
-	Cache                 *cacheStatus        `json:"cache,omitempty"`
+	ID                    string       `json:"id"`
+	DisplayName           string       `json:"displayName"`
+	Enabled               bool         `json:"enabled"`
+	HiddenFromGuide       bool         `json:"hiddenFromGuide"`
+	ArtworkURL            string       `json:"artworkUrl,omitempty"`
+	Ordering              string       `json:"ordering"`
+	MediaKind             string       `json:"mediaKind"`
+	ScheduleMode          string       `json:"scheduleMode"`
+	SlotDurationMs        *int64       `json:"slotDurationMs,omitempty"`
+	PrefillMode           string       `json:"prefillMode,omitempty"`
+	Status                string       `json:"status"`
+	Current               *mediaWindow `json:"current"`
+	Next                  *mediaWindow `json:"next"`
+	ScheduleCoverageMs    int64        `json:"scheduleCoverageMs"`
+	ScheduleCoverageHours float64      `json:"scheduleCoverageHours"`
+	ScheduleEndMs         *int64       `json:"scheduleEndMs,omitempty"`
+	PackageCoverageMs     int64        `json:"packageCoverageMs"`
+	PackageCoverageHours  float64      `json:"packageCoverageHours"`
+	PackageReadyCount     int          `json:"packageReadyCount"`
+	PackageProfile        string       `json:"packageProfile"`
+	AdaptiveBitrate       bool         `json:"adaptiveBitrate"`
+	Cache                 *cacheStatus `json:"cache,omitempty"`
 }
 
 type mediaWindow struct {
@@ -98,6 +95,29 @@ type channelQueueDepth struct {
 func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+func (a *App) handleDegraded(w http.ResponseWriter, r *http.Request) {
+	if a.degradedReader == nil {
+		writeJSON(w, map[string]any{"signals": []any{}, "degraded": false})
+		return
+	}
+	signals, err := a.degradedReader.DegradedSignals(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
+		return
+	}
+	anyDegraded := false
+	for _, s := range signals {
+		if s.Degraded {
+			anyDegraded = true
+			break
+		}
+	}
+	writeJSON(w, map[string]any{
+		"signals":  signals,
+		"degraded": anyDegraded,
+	})
 }
 
 func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -245,23 +265,12 @@ func (a *App) channelNowForRow(ctx context.Context, nowMs int64, ch db.Channel, 
 		MediaKind:       string(db.NormalizeMediaKind(ch.MediaKind)),
 		ScheduleMode:    ch.ScheduleMode,
 		SlotDurationMs:  ch.SlotDurationMs,
-		PrefillMode: ch.PrefillMode,
+		PrefillMode:     ch.PrefillMode,
 		Status:          "unknown",
 	}
 	if cache.Format != "" || cache.CacheSize > 0 || cache.LookaheadDepthSegments != nil {
 		c := cache
 		resp.Cache = &c
-	}
-	if ch.UpstreamHLSURL != nil {
-		nowPlaying, err := a.fetchExternalNowPlaying(ctx, ch)
-		if err == nil {
-			resp.NowPlaying = nowPlaying
-			resp.ArtworkURL = artworkForExternalChannel(ch, nowPlaying)
-		}
-		resp.IsExternal = true
-		resp.UpstreamHLSURL = *ch.UpstreamHLSURL
-		resp.Status = a.externalChannelStatus(ctx, ch)
-		return resp, nil
 	}
 	profile := ch.RequiredPackageProfile
 	if profile == "" {

@@ -9,12 +9,15 @@ How to run linearcast on a server, plus the runtime configuration reference.
 
 ## Run
 
-The public `docker-compose.yml` pulls `ghcr.io/tckrcr/linearcast:latest` and
-runs the single-container stack:
+The `docker-compose.yml` builds the image from this repository and runs the
+single-container stack:
 
 ```sh
 docker compose up -d
 ```
+
+The first run builds the image, which takes a few minutes. Later runs reuse it;
+rebuild after pulling changes with `docker compose up -d --build`.
 
 Open `http://localhost:8080/admin`, sign in with the first-run password
 `linearcast`, then choose a new password when prompted. The password is stored

@@ -17,13 +17,24 @@ import {
   updateLocalWorker,
 } from "../api";
 import { Dialog } from "../Dialog";
+import {
+  ENCODER_PLATFORM_OPTIONS,
+  PRIMARY_ENCODER_DOWNLOADS,
+  defaultPrimaryPlatform,
+  detectOS,
+  findDownload,
+  platformLabel,
+  renderSetupPlan,
+} from "../encoderSetup";
+import type { EncoderPlatform, SetupPlan } from "../encoderSetup";
 import { formatBytes, formatMs } from "../format";
 import { usePolling } from "../hooks/usePolling";
+import { StatusBadge } from "../ui/StatusBadge";
+import type { StatusTone } from "../ui/StatusBadge";
 import type {
   EncoderDownloadsResponse,
   EncoderListItem,
   EncoderRegisterResponse,
-  EncoderDownloadEntry,
   LocalWorkerItem,
   MediaPackageCandidateList,
   MediaPackageRequestResult,
@@ -34,22 +45,6 @@ import type {
 import styles from "./EncodingPanel.module.css";
 
 const ALL_PROFILES = "all";
-
-type EncoderPlatform = "darwin-arm64" | "darwin-amd64" | "windows-amd64" | "linux-amd64" | "linux-arm64";
-
-const ENCODER_PLATFORM_OPTIONS: Array<{ platform: EncoderPlatform; label: string }> = [
-  { platform: "darwin-arm64", label: "macOS (Apple Silicon)" },
-  { platform: "darwin-amd64", label: "macOS (Intel)" },
-  { platform: "windows-amd64", label: "Windows" },
-  { platform: "linux-amd64", label: "Linux (x86_64)" },
-  { platform: "linux-arm64", label: "Linux (ARM64)" },
-];
-
-const PRIMARY_ENCODER_DOWNLOADS: Array<{ platform: EncoderPlatform; label: string }> = [
-  { platform: "darwin-arm64", label: "macOS" },
-  { platform: "windows-amd64", label: "Windows" },
-  { platform: "linux-amd64", label: "Linux x86" },
-];
 
 function isRemoteEncoder(e: EncoderListItem | LocalWorkerItem): e is EncoderListItem {
   return e.id !== "local";
@@ -541,9 +536,9 @@ export function EncodingPanel() {
                     {!isLocal && <span className={`muted ${styles["encoder-id"]}`}>{encoder.id}</span>}
                   </td>
                   <td>
-                    <span className={`episode-pkg ${encoderBadgeClass(encoder, now)}`}>
+                    <StatusBadge tone={encoderBadgeTone(encoder, now)}>
                       {encoderBadgeLabel(encoder, now)}
-                    </span>
+                    </StatusBadge>
                   </td>
                   <td>
                     <ConcurrencyCell
@@ -655,9 +650,9 @@ export function EncodingPanel() {
                         <span className={`muted ${styles["encoder-id"]}`}>{encoding.encodingId}</span>
                       </td>
                       <td>
-                        <span className={`episode-pkg ${encoding.processRunning ? "episode-pkg-ready" : "episode-pkg-missing"}`}>
+                        <StatusBadge tone={encoding.processRunning ? "good" : "neutral"}>
                           {encoding.state}
-                        </span>
+                        </StatusBadge>
                       </td>
                       <td>{channel}</td>
                       <td className={styles["encoder-detail-cell"]} title={title}>{title}</td>
@@ -867,12 +862,9 @@ export function EncodingPanel() {
                   {media.packageError && <span className="danger encoding-media-error">{media.packageError}</span>}
                 </div>
                 <div className={styles["encoding-media-meta"]}>
-                  <span
-                    className={`episode-pkg ${packageStatusClass(media.packageStatus)}`}
-                    title={statusLabel.title}
-                  >
+                  <StatusBadge tone={packageStatusTone(media.packageStatus)} title={statusLabel.title}>
                     {statusLabel.text}
-                  </span>
+                  </StatusBadge>
                   <span>{formatMs(media.durationMs)}</span>
                   {sizeLabel && (
                     <span className="muted" title={sizeLabel.title}>{sizeLabel.text}</span>
@@ -1021,11 +1013,11 @@ function StatusMetric({
   );
 }
 
-function packageStatusClass(status: string): string {
-  if (status === "ready") return "episode-pkg-ready";
-  if (status === "failed") return "episode-pkg-failed";
-  if (status === "missing") return "episode-pkg-missing";
-  return "episode-pkg-pending";
+function packageStatusTone(status: string): StatusTone {
+  if (status === "ready") return "good";
+  if (status === "failed") return "danger";
+  if (status === "missing") return "neutral";
+  return "warn";
 }
 
 // Encoders idle-poll /ping every 30s ([cmd/linearcast-encoder/main.go]
@@ -1050,14 +1042,14 @@ function encoderBadgeLabel(encoder: EncoderListItem | LocalWorkerItem, nowMs: nu
   return isEncoderLive(encoder, nowMs) ? "online" : "offline";
 }
 
-function encoderBadgeClass(encoder: EncoderListItem | LocalWorkerItem, nowMs: number): string {
+function encoderBadgeTone(encoder: EncoderListItem | LocalWorkerItem, nowMs: number): StatusTone {
   if (!isRemoteEncoder(encoder)) {
-    if (!encoder.enabled) return "episode-pkg-failed";
-    return (encoder.jobs?.length ?? 0) > 0 ? "episode-pkg-ready" : "episode-pkg-missing";
+    if (!encoder.enabled) return "danger";
+    return (encoder.jobs?.length ?? 0) > 0 ? "good" : "neutral";
   }
-  if (encoder.revokedAtMs) return "episode-pkg-failed";
-  if (encoder.status === "pending") return "episode-pkg-missing";
-  return isEncoderLive(encoder, nowMs) ? "episode-pkg-ready" : "episode-pkg-pending";
+  if (encoder.revokedAtMs) return "danger";
+  if (encoder.status === "pending") return "neutral";
+  return isEncoderLive(encoder, nowMs) ? "good" : "warn";
 }
 
 function formatTimestamp(ms?: number): string {
@@ -1298,7 +1290,7 @@ function EncoderRegisteredDialog({
           {downloads && !downloads.distConfigured && (
             <p className="muted">
               The server has no encoder dist directory configured. Set <code>LINEARCAST_ENCODER_DIST_DIR</code> on the
-              linearcast-admin process, or rebuild the Docker image to populate <code>/opt/linearcast/encoder-dist</code>.
+              linearcast process, or rebuild the Docker image to populate <code>/opt/linearcast/encoder-dist</code>.
             </p>
           )}
           {downloads && downloads.distConfigured && available.length === 0 && (
@@ -1363,193 +1355,6 @@ function EncoderSetupSections({ plan }: { plan: SetupPlan }) {
   );
 }
 
-type SetupPlan = {
-  // Optional unit/plist file the operator installs into a service manager.
-  // When set, the dialog offers a download button and shows the file body.
-  unitFile?: { filename: string; mimeType: string; body: string };
-  // The shell snippet the operator runs to install and start the encoder.
-  install: string;
-  // Optional follow-up commands (status/logs/uninstall) shown collapsed.
-  manage?: string;
-};
-
-function renderSetupPlan(platform: string, apiKey: string, adminUrl: string): SetupPlan {
-  if (platform === "windows-amd64") {
-    const binary = `linearcast-encoder-windows-amd64.exe`;
-    const install = [
-      `:: Run from the folder where you saved the .exe (e.g. %USERPROFILE%\\linearcast-encoder).`,
-      `set LINEARCAST_ADMIN_URL=${adminUrl}`,
-      `set LINEARCAST_ENCODER_API_KEY=${apiKey}`,
-      `set LINEARCAST_ENCODER_WORK_DIR=%USERPROFILE%\\linearcast-encoder-work`,
-      `${binary} check`,
-      `${binary} install`,
-    ].join("\n");
-    const manage = [
-      `:: Start now (also runs at next logon)`,
-      `"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\linearcast-encoder.bat"`,
-      ``,
-      `:: Stop`,
-      `taskkill /IM linearcast-encoder-windows-amd64.exe /F`,
-      ``,
-      `:: Uninstall (removes the Startup script)`,
-      `${binary} uninstall`,
-    ].join("\n");
-    return { install, manage };
-  }
-  const binary = `linearcast-encoder-${platform}`;
-  if (platform.startsWith("darwin")) {
-    return {
-      unitFile: {
-        filename: "com.linearcast.encoder.plist",
-        mimeType: "application/xml",
-        body: launchdPlist({ binary, apiKey, adminUrl, ffmpegDir: defaultMacFFmpegDir(platform) }),
-      },
-      install: macInstallScript(binary),
-      manage: macManageScript(),
-    };
-  }
-  // linux-amd64 / linux-arm64
-  return {
-    unitFile: {
-      filename: "linearcast-encoder.service",
-      mimeType: "text/plain",
-      body: systemdUnit({ binary, apiKey, adminUrl }),
-    },
-    install: linuxInstallScript(binary),
-    manage: linuxManageScript(),
-  };
-}
-
-function systemdUnit({ binary, apiKey, adminUrl }: { binary: string; apiKey: string; adminUrl: string }): string {
-  // %h is the systemd specifier for the user's home directory, expanded at
-  // runtime by systemd itself — so the same unit file works for any user.
-  return [
-    `[Unit]`,
-    `Description=Linearcast remote encoder`,
-    `After=network-online.target`,
-    `Wants=network-online.target`,
-    ``,
-    `[Service]`,
-    `Type=simple`,
-    `Environment=LINEARCAST_ADMIN_URL=${adminUrl}`,
-    `Environment=LINEARCAST_ENCODER_API_KEY=${apiKey}`,
-    `Environment=LINEARCAST_ENCODER_WORK_DIR=%h/.linearcast-encoder/work`,
-    `ExecStart=%h/.linearcast-encoder/${binary} run`,
-    `Restart=on-failure`,
-    `RestartSec=10`,
-    ``,
-    `[Install]`,
-    `WantedBy=default.target`,
-    ``,
-  ].join("\n");
-}
-
-function launchdPlist({
-  binary,
-  apiKey,
-  adminUrl,
-  ffmpegDir,
-}: {
-  binary: string;
-  apiKey: string;
-  adminUrl: string;
-  ffmpegDir: string;
-}): string {
-  // launchd doesn't expand ~ or $HOME inside the plist, so we use the literal
-  // placeholder __HOME__ and have the install snippet substitute it for $HOME
-  // at install time.
-  return [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
-    `<plist version="1.0">`,
-    `<dict>`,
-    `  <key>Label</key><string>com.linearcast.encoder</string>`,
-    `  <key>ProgramArguments</key>`,
-    `  <array>`,
-    `    <string>__HOME__/.linearcast-encoder/${binary}</string>`,
-    `    <string>run</string>`,
-    `  </array>`,
-    `  <key>EnvironmentVariables</key>`,
-    `  <dict>`,
-    `    <key>LINEARCAST_ADMIN_URL</key><string>${adminUrl}</string>`,
-    `    <key>LINEARCAST_ENCODER_API_KEY</key><string>${apiKey}</string>`,
-    `    <key>LINEARCAST_ENCODER_WORK_DIR</key><string>__HOME__/.linearcast-encoder/work</string>`,
-    `    <key>LINEARCAST_FFMPEG_DIR</key><string>${ffmpegDir}</string>`,
-    `  </dict>`,
-    `  <key>KeepAlive</key><true/>`,
-    `  <key>RunAtLoad</key><true/>`,
-    `  <key>ThrottleInterval</key><integer>30</integer>`,
-    `  <key>StandardOutPath</key><string>__HOME__/.linearcast-encoder/encoder.log</string>`,
-    `  <key>StandardErrorPath</key><string>__HOME__/.linearcast-encoder/encoder.log</string>`,
-    `</dict>`,
-    `</plist>`,
-    ``,
-  ].join("\n");
-}
-
-function defaultMacFFmpegDir(platform: string): string {
-  return platform === "darwin-amd64" ? "/usr/local/bin" : "/opt/homebrew/bin";
-}
-
-function macInstallScript(binary: string): string {
-  return [
-    `mkdir -p ~/.linearcast-encoder/work`,
-    `mv ~/Downloads/${binary} ~/.linearcast-encoder/${binary}`,
-    `chmod +x ~/.linearcast-encoder/${binary}`,
-    `xattr -d com.apple.quarantine ~/.linearcast-encoder/${binary} 2>/dev/null || true`,
-    ``,
-    `mv ~/Downloads/com.linearcast.encoder.plist ~/Library/LaunchAgents/`,
-    `sed -i '' "s|__HOME__|$HOME|g" ~/Library/LaunchAgents/com.linearcast.encoder.plist`,
-    `launchctl load ~/Library/LaunchAgents/com.linearcast.encoder.plist`,
-  ].join("\n");
-}
-
-function macManageScript(): string {
-  return [
-    `# Status`,
-    `launchctl list | grep linearcast`,
-    ``,
-    `# Logs`,
-    `tail -f ~/.linearcast-encoder/encoder.log`,
-    ``,
-    `# Stop / uninstall`,
-    `launchctl unload ~/Library/LaunchAgents/com.linearcast.encoder.plist`,
-    `rm ~/Library/LaunchAgents/com.linearcast.encoder.plist`,
-    `rm -rf ~/.linearcast-encoder`,
-  ].join("\n");
-}
-
-function linuxInstallScript(binary: string): string {
-  return [
-    `mkdir -p ~/.linearcast-encoder/work`,
-    `mv ~/Downloads/${binary} ~/.linearcast-encoder/${binary}`,
-    `chmod +x ~/.linearcast-encoder/${binary}`,
-    ``,
-    `mkdir -p ~/.config/systemd/user`,
-    `mv ~/Downloads/linearcast-encoder.service ~/.config/systemd/user/`,
-    `systemctl --user daemon-reload`,
-    `systemctl --user enable --now linearcast-encoder`,
-    ``,
-    `# Optional: keep running after you log out`,
-    `loginctl enable-linger $USER`,
-  ].join("\n");
-}
-
-function linuxManageScript(): string {
-  return [
-    `# Status`,
-    `systemctl --user status linearcast-encoder`,
-    ``,
-    `# Logs`,
-    `journalctl --user -u linearcast-encoder -f`,
-    ``,
-    `# Stop / uninstall`,
-    `systemctl --user disable --now linearcast-encoder`,
-    `rm ~/.config/systemd/user/linearcast-encoder.service`,
-    `rm -rf ~/.linearcast-encoder`,
-  ].join("\n");
-}
-
 function downloadBlob(filename: string, mimeType: string, body: string) {
   const blob = new Blob([body], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -1561,53 +1366,6 @@ function downloadBlob(filename: string, mimeType: string, body: string) {
   document.body.removeChild(a);
   // Revoke after a short delay so the click has time to settle in Firefox.
   setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-function findDownload(entries: EncoderDownloadEntry[], platform: EncoderPlatform): EncoderDownloadEntry | null {
-  return entries.find((entry) => entry.platform === platform) ?? null;
-}
-
-function defaultPrimaryPlatform(): EncoderPlatform {
-  const platform = detectOS();
-  if (platform === "windows-amd64") return "windows-amd64";
-  if (platform === "darwin-arm64" || platform === "darwin-amd64") return "darwin-arm64";
-  return "linux-amd64";
-}
-
-function detectOS(): EncoderPlatform {
-  const platform = detectPlatform();
-  if (platform === "darwin-arm64" || platform === "darwin-amd64") return platform;
-  if (platform === "windows-amd64") return platform;
-  if (platform === "linux-arm64" || platform === "linux-amd64") return platform;
-  return "linux-amd64";
-}
-
-function platformLabel(platform: string): string {
-  switch (platform) {
-    case "darwin-arm64": return "macOS (Apple Silicon)";
-    case "darwin-amd64": return "macOS (Intel)";
-    case "windows-amd64": return "Windows";
-    case "linux-amd64": return "Linux (x86_64)";
-    case "linux-arm64": return "Linux (ARM64)";
-    default: return platform;
-  }
-}
-
-function detectPlatform(): string {
-  if (typeof navigator === "undefined") return "";
-  const ua = navigator.userAgent.toLowerCase();
-  const platform = (navigator.platform || "").toLowerCase();
-  if (ua.includes("windows") || platform.includes("win")) return "windows-amd64";
-  if (ua.includes("mac") || platform.includes("mac")) {
-    // Apple Silicon is the common case on modern Macs. Browsers don't reliably
-    // expose arch, so we default to arm64 and let the user pick Intel if needed.
-    return "darwin-arm64";
-  }
-  if (ua.includes("linux") || platform.includes("linux")) {
-    if (ua.includes("aarch64") || ua.includes("arm64")) return "linux-arm64";
-    return "linux-amd64";
-  }
-  return "";
 }
 
 function candidateCountLabel(status: string): string {

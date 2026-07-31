@@ -1,4 +1,5 @@
-// linearcast is the multi-channel HLS endpoint.
+// linearcast is the composed HTTP runtime for playback, public viewer metadata,
+// protected admin controls, remote encoder transport, and service health.
 //
 // Its schedule lives in SQLite (see docs/database.md). linearcast opens
 // the database and serves per-channel HLS at:
@@ -23,25 +24,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/layout"
 	"github.com/tckrcr/linearcast/internal/linearcastlog"
-	"github.com/tckrcr/linearcast/internal/liveproxy"
 	"github.com/tckrcr/linearcast/internal/ondemand"
 	"github.com/tckrcr/linearcast/internal/packager"
+	"github.com/tckrcr/linearcast/internal/playback"
 )
 
-const (
-	lookaheadMs            int64 = 3 * 60 * 1000
-	manifestAheadMs        int64 = 72 * 1000
-	packagedManifestLimit        = 24
-	defaultAddr                  = ":8888"
-	streamPath                   = "streams"
-	encodingPath                 = "encoding"
-	onDemandSubtitlePath         = "subs-channel-encoding"
-	defaultPackagedProfile       = db.DefaultPackageProfile
-	channelRefreshPeriod         = 60 * time.Second
-)
+const defaultAddr = ":8888"
 
 func main() {
 	linearcastlog.SetupJSON()
@@ -67,16 +60,8 @@ func main() {
 		os.Exit(1)
 	}
 	if packagedProfile == "" {
-		packagedProfile = defaultPackagedProfile
+		packagedProfile = db.DefaultPackageProfile
 	}
-	ctxStartup, cancelStartup := context.WithTimeout(context.Background(), 5*time.Second)
-	err = runStartupClockCheck(ctxStartup, cfg.clockCheckMode)
-	cancelStartup()
-	if err != nil {
-		slog.Error("ntp clock check", "err", err)
-		os.Exit(1)
-	}
-
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
@@ -90,7 +75,7 @@ func main() {
 		Root:                   cfg.encodingDir,
 		BurstSec:               burstSec,
 		MaxConcurrent:          cfg.onDemandMaxConcurrent,
-		MinArtifactRetentionMs: cfg.onDemandPlaybackLagMs + cfg.onDemandWarmupMs + onDemandReadyCoverageMs + 10_000,
+		MinArtifactRetentionMs: cfg.onDemandPlaybackLagMs + cfg.onDemandWarmupMs + playback.OnDemandReadyCoverageMs + 10_000,
 		DB:                     conn,
 	})
 	if err != nil {
@@ -99,41 +84,55 @@ func main() {
 	}
 	defer encodings.Shutdown()
 
-	a := &app{
-		dbConn:                conn,
-		addr:                  cfg.addr,
-		httpClient:            &http.Client{Timeout: 15 * time.Second},
-		externalHLSClient:     liveproxy.NewGuardedClient(externalHLSTimeout, liveproxy.AllowAllAddresses),
-		encodings:             encodings,
-		packagedProfile:       packagedProfile,
-		onDemandPlaybackLagMs: cfg.onDemandPlaybackLagMs,
-		onDemandWarmupMs:      cfg.onDemandWarmupMs,
-		cache:                 layout.NewCache(cfg.cacheDir),
-		startedAt:             time.Now().UTC(),
-		channels:              map[string]*channelRuntime{},
-	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if err := a.refreshChannels(ctx); err != nil {
-		slog.Error("load channels", "err", err)
+	playbackRuntime, err := playback.NewRuntime(ctx, playback.Config{
+		DB:                    conn,
+		Encodings:             encodings,
+		PackagedProfile:       packagedProfile,
+		OnDemandPlaybackLagMs: cfg.onDemandPlaybackLagMs,
+		OnDemandWarmupMs:      cfg.onDemandWarmupMs,
+		Cache:                 layout.NewCache(cfg.cacheDir),
+		StartedAt:             time.Now().UTC(),
+	})
+	if err != nil {
+		slog.Error("init playback runtime", "err", err)
+		os.Exit(1)
+	}
+	adminApp, sweeper, err := newAdminRuntime(ctx, cfg, conn, playbackRuntime, playbackRuntime, playbackRuntime)
+	if err != nil {
+		slog.Error("init admin runtime", "err", err)
 		os.Exit(1)
 	}
 
-	go a.channelRefreshLoop(ctx)
-	go a.metricsRefreshLoop(ctx)
+	prometheus.MustRegister(newScrapeOwner(conn, encodings, cfg.cacheDir, playbackRuntime.ChannelSnapshots))
+
+	go playbackRuntime.Run(ctx)
 	go sampleCacheMetricsLoop(ctx, layout.NewCache(cfg.cacheDir))
 	go encodings.Run(ctx)
+	go func() {
+		if err := sweeper.Run(ctx); err != nil && err != context.Canceled {
+			slog.Warn("encoder sweeper exited", "err", err)
+		}
+	}()
 
 	slog.Info("linearcast listening",
 		"addr", cfg.addr,
 		"db", cfg.dbPath,
 		"packaged_profile", packagedProfile,
-		"channels", len(a.snapshotChannels()),
+		"channels", len(playbackRuntime.ChannelSnapshots()),
 		"on_demand_playback_lag_ms", cfg.onDemandPlaybackLagMs,
 		"on_demand_warmup_ms", cfg.onDemandWarmupMs,
 	)
-	srv := &http.Server{Addr: cfg.addr, Handler: a.routes()}
+	srv := &http.Server{
+		Addr: cfg.addr,
+		Handler: composeRoutes(
+			playbackRuntime.Handler(),
+			adminApp.Handler(),
+			playbackRuntime,
+			playbackRuntime,
+		),
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -9,30 +9,36 @@ import (
 )
 
 type MediaInventoryFilter struct {
-	Search        string
-	Title         string
-	Episode       string
-	PathRoot      string
-	ReleaseGroup  string
-	Media         string
-	Source        string
-	MediaKind     string
-	Collection    string
-	PackageStatus string
-	CodecStatus   string
-	SortBy        string
-	SortDir       string
-	Limit         int
-	Offset        int
+	Search               string
+	Title                string
+	Episode              string
+	PathRoot             string
+	ReleaseGroup         string
+	Media                string
+	Source               string
+	MediaKind            string
+	Collection           string
+	PackageStatus        string
+	CodecStatus          string
+	Profile              string // optional; when set, each row carries per-profile package status
+	ProfilePackageStatus string // optional; filters on per-profile status — requires Profile to be set
+	MinRating            float64
+	EpisodesOnly         bool
+	SortBy               string
+	SortDir              string
+	Limit                int
+	Offset               int
 }
 
 type MediaInventoryRow struct {
 	Media
-	ReadyPackages      int64
-	PendingPackages    int64
-	ProcessingPackages int64
-	FailedPackages     int64
-	PackageProfiles    string
+	ReadyPackages        int64
+	PendingPackages      int64
+	ProcessingPackages   int64
+	FailedPackages       int64
+	PackageProfiles      string
+	ProfilePackageStatus string // per-profile status when Filter.Profile is set; "" when unset
+	PackagedDurationMs   *int64 // per-profile packaged duration when Filter.Profile is set; nil when unset or no package
 }
 
 type MediaCollectionBulkScope struct {
@@ -63,6 +69,7 @@ type MediaSourceMetadata struct {
 	Description    string
 	ThumbPath      string
 	ContentRating  string
+	Rating         float64
 	Genres         []string
 }
 
@@ -111,7 +118,8 @@ func UpdateMediaSourceMetadata(ctx context.Context, conn *sql.DB, md MediaSource
 			    collection_id = COALESCE(?, collection_id),
 			    description = ?,
 			    thumb_path = ?,
-			    content_rating = ?
+			    content_rating = ?,
+			    rating = ?
 			WHERE path = ?`,
 			metadataNullString(md.SourceRef),
 			metadataNullString(md.Title),
@@ -119,6 +127,7 @@ func UpdateMediaSourceMetadata(ctx context.Context, conn *sql.DB, md MediaSource
 			metadataNullString(md.Description),
 			metadataNullString(md.ThumbPath),
 			metadataNullString(md.ContentRating),
+			metadataNullRating(md.Rating),
 			md.Path)
 		return err
 	})
@@ -130,6 +139,13 @@ func metadataNullString(s string) any {
 		return nil
 	}
 	return s
+}
+
+func metadataNullRating(r float64) any {
+	if r <= 0 {
+		return nil
+	}
+	return r
 }
 
 // DistinctSchedulingGroups returns all non-empty collection labels, sorted.
@@ -146,6 +162,33 @@ type SchedulingGroupStats struct {
 	Group        string
 	EpisodeCount int
 	DurationMs   int64
+}
+
+// ShowCollectionSeasonStats is one season rollup within a show collection.
+// SeasonNumber is nil for collection members without stored season metadata.
+type ShowCollectionSeasonStats struct {
+	CollectionID   string
+	CollectionName string
+	SeasonNumber   *int64
+	EpisodeCount   int64
+	DurationMs     int64
+}
+
+// ShowCollectionSeasonRollup returns codec-compatible, non-filler video
+// programming grouped by show collection and stored season number.
+func ShowCollectionSeasonRollup(ctx context.Context, conn *sql.DB) ([]ShowCollectionSeasonStats, error) {
+	return queryRows(ctx, conn, scanShowCollectionSeasonStats, `
+		SELECT c.id, c.name, m.season_number, COUNT(*), COALESCE(SUM(m.duration_ms), 0)
+		FROM media m
+		JOIN collections c ON c.id = m.collection_id
+		WHERE c.kind = 'show'
+		  AND COALESCE(m.media_kind, 'video') = 'video'
+		  AND m.codec_check_passed = 1
+		  AND m.id NOT IN (SELECT media_id FROM filler_assets)
+		GROUP BY c.id, c.name, m.season_number
+		ORDER BY LOWER(c.name),
+		         CASE WHEN m.season_number IS NULL THEN 1 ELSE 0 END,
+		         m.season_number`)
 }
 
 // MovieGroupRollup returns per-group item counts and total duration for movie
@@ -178,10 +221,10 @@ func AllMediaIDPathTitle(ctx context.Context, conn *sql.DB) ([]MediaIDPathTitle,
 }
 
 // DeleteMediaByIDs removes media rows and their dependents in a single
-// transaction. The media table has ON DELETE RESTRICT foreign keys from
-// schedule_entries and play_history, so those are cleared first. Cascade
-// foreign keys handle channel_media, media_packages, packaged_segments,
-// package_tracks, and filler_assets.
+// transaction. The media table has an ON DELETE RESTRICT foreign key from
+// schedule_entries, so those are cleared first. Cascade foreign keys handle
+// channel_media, media_packages, packaged_segments, package_tracks, and
+// filler_assets.
 //
 // Callers are responsible for removing any on-disk package roots before
 // invoking this; this function only touches the DB.
@@ -223,9 +266,6 @@ func DeleteMediaByIDs(ctx context.Context, conn *sql.DB, ids []string) (int64, e
 		if _, err := tx.ExecContext(ctx, `DELETE FROM schedule_entries WHERE media_id IN `+inClause, args...); err != nil {
 			return 0, fmt.Errorf("delete schedule_entries: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM play_history WHERE media_id IN `+inClause, args...); err != nil {
-			return 0, fmt.Errorf("delete play_history: %w", err)
-		}
 		res, err := tx.ExecContext(ctx, `DELETE FROM media WHERE id IN `+inClause, args...)
 		if err != nil {
 			return 0, fmt.Errorf("delete media: %w", err)
@@ -244,8 +284,7 @@ func DeleteMediaByIDs(ctx context.Context, conn *sql.DB, ids []string) (int64, e
 }
 
 // DeleteMediaMetadataByID removes one media row and dependent metadata without
-// pruning schedule_entries or channel membership first. play_history is cleared
-// explicitly because it has ON DELETE RESTRICT; other dependent rows fall away
+// pruning schedule_entries or channel membership first. Dependent rows fall away
 // through foreign-key cascades. If any remaining references still point at the
 // media row, the delete fails.
 func DeleteMediaMetadataByID(ctx context.Context, conn *sql.DB, id string) (bool, error) {
@@ -255,9 +294,6 @@ func DeleteMediaMetadataByID(ctx context.Context, conn *sql.DB, id string) (bool
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM play_history WHERE media_id = ?`, id); err != nil {
-		return false, fmt.Errorf("delete play_history: %w", err)
-	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM media WHERE id = ?`, id)
 	if err != nil {
 		return false, fmt.Errorf("delete media: %w", err)
@@ -292,9 +328,17 @@ func MediaInventory(ctx context.Context, conn *sql.DB, f MediaInventoryFilter) (
 		return nil, 0, err
 	}
 
-	args = append(args, f.Limit, f.Offset)
+	profile := strings.TrimSpace(f.Profile)
+	mainArgs := append([]any{profile, profile, profile, profile}, args...)
+	mainArgs = append(mainArgs, f.Limit, f.Offset)
 	rows, err := queryRows(ctx, conn, scanMediaInventoryRow, `
 		SELECT `+mediaColumnsWithCollection("m.", "c.")+`,
+		       CASE WHEN ? = '' THEN NULL
+		            ELSE COALESCE((SELECT p2.status FROM media_packages p2 WHERE p2.media_id = m.id AND p2.rendition_profile = ?), 'missing')
+		       END AS profile_package_status,
+		       CASE WHEN ? = '' THEN NULL
+		            ELSE (SELECT p2.packaged_duration_ms FROM media_packages p2 WHERE p2.media_id = m.id AND p2.rendition_profile = ?)
+		       END AS packaged_duration_ms,
 		       COALESCE(SUM(CASE WHEN p.status = 'ready' THEN 1 ELSE 0 END), 0) AS ready_packages,
 		       COALESCE(SUM(CASE WHEN p.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_packages,
 		       COALESCE(SUM(CASE WHEN p.status = 'processing' THEN 1 ELSE 0 END), 0) AS processing_packages,
@@ -305,7 +349,7 @@ func MediaInventory(ctx context.Context, conn *sql.DB, f MediaInventoryFilter) (
 		LEFT JOIN media_packages p ON p.media_id = m.id`+where+`
 		GROUP BY m.id
 		ORDER BY `+mediaInventoryOrderBy(f)+`
-		LIMIT ? OFFSET ?`, args...)
+		LIMIT ? OFFSET ?`, mainArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -355,6 +399,11 @@ func mediaInventoryWhere(f MediaInventoryFilter) (string, []any) {
 	switch strings.TrimSpace(f.MediaKind) {
 	case "video":
 		clauses = append(clauses, `COALESCE(m.media_kind, 'video') = 'video'`)
+	case "programs":
+		// Primary video programming (shows + movies): everything a schedule
+		// slot can carry, i.e. video that isn't a registered filler asset.
+		clauses = append(clauses, `COALESCE(m.media_kind, 'video') = 'video'`)
+		clauses = append(clauses, `m.id NOT IN (SELECT media_id FROM filler_assets)`)
 	case "movies":
 		clauses = append(clauses, `COALESCE(m.media_kind, 'video') = 'video'`)
 		clauses = append(clauses, `(c.kind = 'movie' OR m.scheduling_group LIKE 'movie:%')`)
@@ -387,6 +436,21 @@ func mediaInventoryWhere(f MediaInventoryFilter) (string, []any) {
 		args = append(args, strings.TrimSpace(f.PackageStatus))
 	case "missing":
 		clauses = append(clauses, `NOT EXISTS (SELECT 1 FROM media_packages p2 WHERE p2.media_id = m.id)`)
+	}
+	switch strings.TrimSpace(f.ProfilePackageStatus) {
+	case "ready", "pending", "processing", "failed":
+		clauses = append(clauses, `EXISTS (SELECT 1 FROM media_packages p3 WHERE p3.media_id = m.id AND p3.rendition_profile = ? AND p3.status = ?)`)
+		args = append(args, strings.TrimSpace(f.Profile), strings.TrimSpace(f.ProfilePackageStatus))
+	case "missing":
+		clauses = append(clauses, `NOT EXISTS (SELECT 1 FROM media_packages p3 WHERE p3.media_id = m.id AND p3.rendition_profile = ?)`)
+		args = append(args, strings.TrimSpace(f.Profile))
+	}
+	if f.MinRating > 0 {
+		clauses = append(clauses, `m.rating IS NOT NULL AND m.rating >= ?`)
+		args = append(args, f.MinRating)
+	}
+	if f.EpisodesOnly {
+		clauses = append(clauses, `m.season_number IS NOT NULL`)
 	}
 	if len(clauses) == 0 {
 		return "", args
@@ -819,6 +883,25 @@ func scanSchedulingGroupStats(row scanner) (SchedulingGroupStats, error) {
 	return s, err
 }
 
+func scanShowCollectionSeasonStats(row scanner) (ShowCollectionSeasonStats, error) {
+	var stats ShowCollectionSeasonStats
+	var seasonNumber sql.NullInt64
+	if err := row.Scan(
+		&stats.CollectionID,
+		&stats.CollectionName,
+		&seasonNumber,
+		&stats.EpisodeCount,
+		&stats.DurationMs,
+	); err != nil {
+		return ShowCollectionSeasonStats{}, err
+	}
+	if seasonNumber.Valid {
+		value := seasonNumber.Int64
+		stats.SeasonNumber = &value
+	}
+	return stats, nil
+}
+
 func scanMediaIDPathTitle(row scanner) (MediaIDPathTitle, error) {
 	var r MediaIDPathTitle
 	var title sql.NullString
@@ -835,11 +918,16 @@ func scanMediaInventoryRow(row scanner) (MediaInventoryRow, error) {
 	var title, group, colorTransfer, colorPrimaries, codecReason, mediaKind, sourceRef, description, thumbPath, contentRating, genresJSON, codecTag sql.NullString
 	var collectionID sql.NullString
 	var seasonNumber, episodeNumber, userPref, videoWidth sql.NullInt64
+	var rating sql.NullFloat64
+	var profilePkgStatus sql.NullString
+	var packagedDurationMs sql.NullInt64
 	if err := row.Scan(&out.ID, &out.Path, &out.Directory, &title, &group, &collectionID,
 		&seasonNumber, &episodeNumber, &userPref, &out.DurationMs, &out.Container, &out.VideoCodec, &videoWidth,
 		&out.VideoHeight, &out.VideoBitrateBps, &colorTransfer, &colorPrimaries,
 		&out.AudioCodec, &passed, &codecReason, &out.IngestedAtMs, &mediaKind, &sourceRef,
-		&description, &thumbPath, &contentRating, &genresJSON, &codecTag,
+		&description, &thumbPath, &contentRating, &rating, &genresJSON, &codecTag,
+		&profilePkgStatus,
+		&packagedDurationMs,
 		&out.ReadyPackages,
 		&out.PendingPackages,
 		&out.ProcessingPackages,
@@ -861,6 +949,14 @@ func scanMediaInventoryRow(row scanner) (MediaInventoryRow, error) {
 	out.Description = description.String
 	out.ThumbPath = thumbPath.String
 	out.ContentRating = contentRating.String
+	out.Rating = rating.Float64
+	if profilePkgStatus.Valid {
+		out.ProfilePackageStatus = profilePkgStatus.String
+	}
+	if packagedDurationMs.Valid {
+		v := packagedDurationMs.Int64
+		out.PackagedDurationMs = &v
+	}
 	if genresJSON.Valid && genresJSON.String != "" {
 		_ = json.Unmarshal([]byte(genresJSON.String), &out.Genres)
 	}

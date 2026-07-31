@@ -56,6 +56,7 @@ type rawItem struct {
 	ParentIndexNumber int           `json:"ParentIndexNumber"`
 	IndexNumber       int           `json:"IndexNumber"`
 	ProductionYear    int           `json:"ProductionYear"`
+	CommunityRating   float64       `json:"CommunityRating"`
 	MediaSources      []mediaSource `json:"MediaSources"`
 }
 
@@ -148,7 +149,7 @@ func (c *Client) Items(ctx context.Context, libraryID string, opts mediasource.S
 	q := "ParentId=" + libraryID +
 		"&Recursive=true" +
 		"&IncludeItemTypes=Movie%2CEpisode" +
-		"&Fields=Path%2CMediaSources%2CParentIndexNumber%2CIndexNumber%2CProductionYear"
+		"&Fields=Path%2CMediaSources%2CParentIndexNumber%2CIndexNumber%2CProductionYear%2CCommunityRating"
 	var resp itemsResponse
 	if err := c.getJSON(ctx, "/Items?"+q, &resp); err != nil {
 		return nil, err
@@ -183,6 +184,7 @@ func (c *Client) Items(ctx context.Context, libraryID string, opts mediasource.S
 			SeasonNumber:   r.ParentIndexNumber,
 			EpisodeNumber:  r.IndexNumber,
 			Year:           r.ProductionYear,
+			Rating:         r.CommunityRating,
 			Path:           path,
 			Resolution:     "",
 			Height:         height,

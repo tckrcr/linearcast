@@ -21,15 +21,13 @@ type guideEntry struct {
 }
 
 type guideChannel struct {
-	ID             string              `json:"id"`
-	DisplayName    string              `json:"displayName"`
-	ArtworkURL     string              `json:"artworkUrl,omitempty"`
-	Status         string              `json:"status"`
-	IsExternal     bool                `json:"isExternal,omitempty"`
-	PrefillMode    string              `json:"prefillMode,omitempty"`
-	ScheduleMode   string              `json:"scheduleMode,omitempty"`
-	SlotDurationMs *int64              `json:"slotDurationMs,omitempty"`
-	NowPlaying     *externalNowPlaying `json:"nowPlaying,omitempty"`
+	ID             string `json:"id"`
+	DisplayName    string `json:"displayName"`
+	ArtworkURL     string `json:"artworkUrl,omitempty"`
+	Status         string `json:"status"`
+	PrefillMode    string `json:"prefillMode,omitempty"`
+	ScheduleMode   string `json:"scheduleMode,omitempty"`
+	SlotDurationMs *int64 `json:"slotDurationMs,omitempty"`
 	// ScheduleEndMs is the end of the channel's last scheduled entry. The guide
 	// uses it to stop paging past where a schedule has actually been built (so
 	// "next" doesn't advance into expected, not-yet-generated gaps).
@@ -80,23 +78,6 @@ func (a *App) handleGuide(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]guideChannel, 0, len(channels))
 	for _, ch := range channels {
-		if ch.UpstreamHLSURL != nil {
-			nowPlaying, err := a.fetchExternalNowPlaying(r.Context(), ch)
-			if err != nil {
-				nowPlaying = nil
-			}
-			out = append(out, guideChannel{
-				ID:          ch.ID,
-				DisplayName: ch.DisplayName,
-				ArtworkURL:  artworkForExternalChannel(ch, nowPlaying),
-				Status:      a.externalChannelStatus(r.Context(), ch),
-				IsExternal:  true,
-				NowPlaying:  nowPlaying,
-				Entries:     []guideEntry{},
-			})
-			continue
-		}
-
 		now, err := a.channelNowForRow(r.Context(), nowMs, ch, cacheStatus{})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "db_error", err.Error())

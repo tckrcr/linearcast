@@ -9,7 +9,6 @@ import {
   getChannelSchedule,
   getChannelSchedulePreview,
   getMediaPackageCandidates,
-  getScheduleBuilderCandidates,
   getScheduleBuilderFillerCandidates,
   insertScheduleEntryAfter as apiInsertScheduleEntryAfter,
   insertScheduleEntryBefore as apiInsertScheduleEntryBefore,
@@ -297,7 +296,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
     try {
       if (isDraftMode) {
         const profile = draftConfig!.packageProfile;
-        const candidates = await getScheduleBuilderCandidates(profile, undefined, "all");
+        const candidates = await getMediaPackageCandidates(profile, undefined, "all");
         const byId = new Map<string, ScheduleInsertItem>();
         for (const media of candidates.media) {
           const ready = media.packageStatus === "ready" && media.packagedDurationMs != null;
@@ -969,7 +968,7 @@ export function useScheduleEditor(channel: ChannelNow | null, draftConfig?: Draf
 
   async function importDraftChannel(explicit?: { entries: ScheduleBuilderEntryInput[]; fillerMediaIds: string[] }) {
     if (!isDraftMode || !draftConfig || scheduleDraft.length === 0 || saveBusy) return;
-    const { packageProfile, displayName, playbackMode, scheduleMode, slotDurationMs, prefillMode, adaptiveBitrate, onImported } = draftConfig;
+    const { packageProfile, displayName, scheduleMode, slotDurationMs, prefillMode, adaptiveBitrate, onImported } = draftConfig;
     if (!displayName.trim()) {
       setScheduleError("display name is required");
       setScheduleNotice("");

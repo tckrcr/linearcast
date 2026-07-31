@@ -42,12 +42,8 @@ func requestBaseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-// channelManifestPath returns the channel's HLS manifest path, branching on the
-// external/VOD split the same way playable-sources does.
+// channelManifestPath returns the channel's HLS manifest path.
 func channelManifestPath(ch db.Channel) string {
-	if ch.UpstreamHLSURL != nil {
-		return routes.ExternalHLSManifest(ch.ID)
-	}
 	return routes.HLSManifest(ch.ID)
 }
 
@@ -141,8 +137,7 @@ type xmltvEpisodeID struct {
 
 // handleXMLTV emits an XMLTV guide: a <channel> per enabled channel followed by
 // a <programme> per scheduled entry within the window. ?hours=N (default and
-// max guideMaxHours) bounds the horizon, mirroring handleGuide. External
-// channels appear as <channel> only — they have no built linearcast schedule.
+// max guideMaxHours) bounds the horizon, mirroring handleGuide.
 func (a *App) handleXMLTV(w http.ResponseWriter, r *http.Request) {
 	fromMs := a.now().UTC().UnixMilli()
 	horizonHours := guideMaxHours
@@ -177,9 +172,6 @@ func (a *App) handleXMLTV(w http.ResponseWriter, r *http.Request) {
 		doc.Channels = append(doc.Channels, entry)
 	}
 	for _, ch := range channels {
-		if ch.UpstreamHLSURL != nil {
-			continue
-		}
 		raw, err := db.ScheduleWindowEnriched(r.Context(), a.dbConn, ch.ID, fromMs, toMs)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "db_error", err.Error())

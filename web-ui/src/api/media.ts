@@ -1,12 +1,19 @@
 import type {
   LocalMediaSource,
   MediaPackageCancelResult,
-  MediaPackageCandidateList,
   MediaPackageRequestResult,
   MediaUpdateResponse,
   PackageProfile,
 } from "../types";
 import { ApiError, apiFetch } from "./client";
+import type {
+  MediaAlbumsResponseDTO,
+  MediaMoviesResponseDTO,
+  MediaPackageCandidateListDTO,
+  MediaSearchResultDTO,
+  MediaShowsResponseDTO,
+  PackageProfileListResponseDTO,
+} from "./dto";
 
 export async function updateMediaFields(
   mediaId: string,
@@ -39,6 +46,7 @@ export type MediaInventoryItem = {
   episodeCode?: string;
   seasonNumber?: number;
   episodeNumber?: number;
+  rating?: number;
   collection: string;
   sourceRef?: string;
   source: string;
@@ -48,9 +56,12 @@ export type MediaInventoryItem = {
   videoCodec: string;
   videoWidth?: number;
   videoHeight?: number;
+  videoBitrateBps?: number;
   audioCodec: string;
   codecCheckPassed: boolean;
   codecCheckReason?: string;
+  profilePackageStatus?: string;
+  packagedDurationMs?: number;
   readyPackages: number;
   pendingPackages: number;
   processingPackages: number;
@@ -77,6 +88,10 @@ export type MediaInventoryFilters = {
   collection?: string;
   packageStatus?: string;
   codecStatus?: string;
+  profile?: string;
+  profilePackageStatus?: string;
+  minRating?: number;
+  episodesOnly?: boolean;
   sortBy?: string;
   sortDir?: "asc" | "desc";
   limit?: number;
@@ -118,12 +133,31 @@ export async function getMediaInventory(filters: MediaInventoryFilters = {}): Pr
       collection: filters.collection,
       packageStatus: filters.packageStatus,
       codecStatus: filters.codecStatus,
+      profile: filters.profile,
+      profilePackageStatus: filters.profilePackageStatus,
+      minRating: filters.minRating != null ? String(filters.minRating) : undefined,
+      episodesOnly: filters.episodesOnly ? "1" : undefined,
       sortBy: filters.sortBy,
       sortDir: filters.sortDir,
       limit: filters.limit != null ? String(filters.limit) : undefined,
       offset: filters.offset != null ? String(filters.offset) : undefined,
     },
   });
+}
+
+// getAllMediaInventory pages through the endpoint's 100-row default for
+// workflows that must match against the complete library.
+export async function getAllMediaInventory(
+  filters: Omit<MediaInventoryFilters, "limit" | "offset"> = {},
+): Promise<MediaInventoryItem[]> {
+  const pageSize = 100;
+  const all: MediaInventoryItem[] = [];
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await getMediaInventory({ ...filters, limit: pageSize, offset });
+    all.push(...page.media);
+    if (page.media.length < pageSize || all.length >= page.count) break;
+  }
+  return all;
 }
 
 export async function deleteMedia(mediaId: string) {
@@ -235,22 +269,28 @@ export type MediaMovie = {
   durationMs: number;
 };
 
-export async function getMediaMovies(): Promise<MediaMovie[]> {
-  const body = await apiFetch<{ movies: MediaMovie[] } | null>("/api/media/movies", { cache: "no-store" });
-  return body?.movies ?? [];
+export type MediaShow = MediaShowsResponseDTO["shows"][number];
+
+export async function getMediaMovies(): Promise<MediaMoviesResponseDTO["movies"]> {
+  const body = await apiFetch<MediaMoviesResponseDTO>("/api/media/movies", { cache: "no-store" });
+  return body.movies;
 }
 
-export async function getMediaAlbums(): Promise<MusicArtist[]> {
-  const body = await apiFetch<{ artists: MusicArtist[] } | null>("/api/media/albums", { cache: "no-store" });
-  return body?.artists ?? [];
+export async function getMediaShows(): Promise<MediaShowsResponseDTO["shows"]> {
+  const body = await apiFetch<MediaShowsResponseDTO>("/api/media/shows", { cache: "no-store" });
+  return body.shows;
 }
 
-export async function getMediaByGroup(group: string): Promise<MediaSearchResult[]> {
-  const body = await apiFetch<MediaSearchResult[] | null>("/api/media/by-group", {
+export async function getMediaAlbums(): Promise<MediaAlbumsResponseDTO["artists"]> {
+  const body = await apiFetch<MediaAlbumsResponseDTO>("/api/media/albums", { cache: "no-store" });
+  return body.artists;
+}
+
+export async function getMediaByGroup(group: string): Promise<MediaSearchResultDTO[]> {
+  return apiFetch<MediaSearchResultDTO[]>("/api/media/by-group", {
     cache: "no-store",
     query: { group },
   });
-  return body ?? [];
 }
 
 export async function searchMedia(q: string, channelId?: string): Promise<MediaSearchResult[]> {
@@ -267,33 +307,41 @@ export async function getMediaPackageCandidates(
   status?: string,
   offset?: number,
   signal?: AbortSignal,
-): Promise<MediaPackageCandidateList> {
-  return apiFetch<MediaPackageCandidateList>("/api/media/package-candidates", {
+): Promise<MediaPackageCandidateListDTO> {
+  return apiFetch<MediaPackageCandidateListDTO>("/api/media/package-candidates", {
     cache: "no-store",
     signal,
-    query: { profile, search, status, offset: offset != null && offset > 0 ? String(offset) : undefined },
+    query: {
+      profile,
+      search,
+      status,
+      offset: offset != null && offset > 0 ? String(offset) : undefined,
+    },
   });
+}
+
+// Cross-profile package status counts, for callers that want the encode backlog
+// without any of the rows. `profile=all` is what keeps this cheap: it skips the
+// per-profile size estimate, whose empirical bitrate measurement walks the
+// package directory. `limit=1` keeps the media array the endpoint also returns
+// off the wire.
+export async function getPackageStatusCounts(
+  signal?: AbortSignal,
+): Promise<Record<string, number>> {
+  const body = await apiFetch<MediaPackageCandidateListDTO>("/api/media/package-candidates", {
+    cache: "no-store",
+    signal,
+    query: { profile: "all", limit: "1" },
+  });
+  return Object.fromEntries((body.statusCounts ?? []).map((row) => [row.status, row.count]));
 }
 
 export async function getMediaPackageProfiles(): Promise<string[]> {
   return (await getMediaPackageProfileList()).profiles;
 }
 
-export async function getMediaPackageProfileList(): Promise<{
-  profiles: string[];
-  profileDetails: PackageProfile[];
-  defaultProfile: string;
-}> {
-  const body = await apiFetch<{
-    profiles?: string[];
-    profileDetails?: PackageProfile[];
-    defaultProfile?: string;
-  } | null>("/api/media/package-profiles", { cache: "no-store" });
-  return {
-    profiles: body?.profiles ?? [],
-    profileDetails: body?.profileDetails ?? [],
-    defaultProfile: body?.defaultProfile ?? body?.profiles?.[0] ?? "",
-  };
+export function getMediaPackageProfileList(): Promise<PackageProfileListResponseDTO> {
+  return apiFetch<PackageProfileListResponseDTO>("/api/media/package-profiles", { cache: "no-store" });
 }
 
 export async function requestMediaPackages(

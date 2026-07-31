@@ -85,8 +85,8 @@ func TestHandleChannelDeleteReclaimEncodes(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	makeDir := func(rel string) string {
@@ -111,9 +111,9 @@ func TestHandleChannelDeleteReclaimEncodes(t *testing.T) {
 	// 'ch' is the disabled channel being deleted; 'keep' survives and also pools
 	// 'shared', so 'shared' must be skipped while 'solo' (only on 'ch') is reclaimed.
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-1080p-8mbps', 0),
-		       ('keep', 'Keep', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
+		required_package_profile, hidden_from_guide)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 0, 0, 'h264-1080p-8mbps', 0),
+		       ('keep', 'Keep', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('shared', '/tmp/shared.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
@@ -222,33 +222,6 @@ func TestHandleChannelCloneMissing(t *testing.T) {
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("status=%d body=%s, want not found", res.Code, res.Body.String())
 	}
-}
-
-func TestHandleCreateChannelWithUpstreamHLSURL(t *testing.T) {
-	app, conn := testAdminApp(t)
-	req := httptest.NewRequest(http.MethodPost, "/api/channels", bytes.NewBufferString(`{
-		"displayName":"Spotify",
-		"upstreamHlsUrl":"http://stream.example.test/hls/stream.m3u8"
-	}`))
-	res := httptest.NewRecorder()
-
-	app.handleCreateChannel(res, req)
-
-	if res.Code != http.StatusCreated {
-		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
-	}
-	ch, err := db.ChannelByID(context.Background(), conn, "spotify")
-	if err != nil {
-		t.Fatalf("lookup channel: %v", err)
-	}
-	if ch == nil || ch.UpstreamHLSURL == nil || *ch.UpstreamHLSURL != "http://stream.example.test/hls/stream.m3u8" {
-		t.Fatalf("channel upstream hls mismatch: %+v", ch)
-	}
-	if ch.RequiredPackageProfile != "" || ch.SourceDirectory != "" || ch.MediaKind != db.MediaKindMusic {
-		t.Fatalf("external channel packaged fields not cleared: %+v", ch)
-	}
-	assertCount(t, conn, `SELECT COUNT(*) FROM channel_media WHERE channel_id = 'spotify'`, 0)
-	assertCount(t, conn, `SELECT COUNT(*) FROM schedule_entries WHERE channel_id = 'spotify'`, 0)
 }
 
 func TestHandleChannelPatchHiddenFromGuideToggle(t *testing.T) {

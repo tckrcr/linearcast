@@ -48,9 +48,9 @@ func insertFillerGapFixture(t *testing.T, conn *sql.DB) {
 	t.Helper()
 	if _, err := conn.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile
+			required_package_profile
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	entries := make([]db.ScheduleEntry, 0, 4)
@@ -131,9 +131,9 @@ func insertSlotGridRecomposeFixture(t *testing.T, conn *sql.DB) int64 {
 	slotMs := int64(30 * 60 * 1000)
 	if _, err := conn.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile, schedule_mode, slot_duration_ms
+			required_package_profile, schedule_mode, slot_duration_ms
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 'slot_grid', ?)`, slotMs); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 'slot_grid', ?)`, slotMs); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	for _, id := range []string{"e1", "e2"} {

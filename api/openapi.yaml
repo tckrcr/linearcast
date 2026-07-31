@@ -1,0 +1,1231 @@
+openapi: 3.0.3
+info:
+  title: Linearcast UI API
+  version: 1.0.0
+  description: >-
+    Checked contract for the browser-facing subset of the Linearcast API. The
+    complete maintenance and encoder surfaces are intentionally outside this
+    document.
+servers:
+  - url: /
+paths:
+  /api/auth/status:
+    get:
+      operationId: getAdminAuthStatus
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminAuthStatus"
+  /api/auth/login:
+    post:
+      operationId: loginAdmin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminLoginRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminAuthStatus"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+  /api/auth/logout:
+    post:
+      operationId: logoutAdmin
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminLogoutResponse"
+  /api/auth/change-password:
+    post:
+      operationId: changeAdminPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminPasswordChangeRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminAuthStatus"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/playable-sources:
+    get:
+      operationId: getPlayableSources
+      responses:
+        "200":
+          description: Viewer-safe playable sources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlayableSourcesResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/guide:
+    get:
+      operationId: getGuide
+      parameters:
+        - $ref: "#/components/parameters/FromMs"
+        - $ref: "#/components/parameters/Hours"
+      responses:
+        "200":
+          description: Viewer-safe guide window
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuideResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/subtitle-settings:
+    get:
+      operationId: getSubtitleSettings
+      responses:
+        "200":
+          description: Viewer subtitle preferences
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubtitleSettings"
+        "500":
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: updateSubtitleSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubtitleSettings"
+      responses:
+        "200":
+          description: Updated subtitle preferences
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubtitleSettings"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/now:
+    get:
+      operationId: getAdminNow
+      responses:
+        "200":
+          description: Current admin channel state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminNow"
+        "401":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/channels:
+    get:
+      operationId: getChannels
+      responses:
+        "200":
+          description: Configured channels
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChannelListResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+    post:
+      operationId: createChannel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateChannelRequest"
+      responses:
+        "201":
+          description: Channel created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateChannelResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/admin/media-sources/status:
+    get:
+      operationId: getMediaSourceStatus
+      responses:
+        "200":
+          description: Configured media-source summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaSourceStatus"
+        "401":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/media/package-profiles:
+    get:
+      operationId: getMediaPackageProfiles
+      responses:
+        "200":
+          description: Available package profiles
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageProfileListResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/media/package-candidates:
+    get:
+      operationId: getMediaPackageCandidates
+      parameters:
+        - in: query
+          name: profile
+          schema:
+            type: string
+        - in: query
+          name: search
+          schema:
+            type: string
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Profile-scoped package candidates
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaPackageCandidateList"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+  /api/media/movies:
+    get:
+      operationId: getMediaMovies
+      responses:
+        "200":
+          description: Movie scheduling groups
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaMoviesResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/media/shows:
+    get:
+      operationId: getMediaShows
+      responses:
+        "200":
+          description: Show collections with season summaries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaShowsResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/media/albums:
+    get:
+      operationId: getMediaAlbums
+      responses:
+        "200":
+          description: Music scheduling groups
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaAlbumsResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/media/by-group:
+    get:
+      operationId: getMediaByGroup
+      parameters:
+        - in: query
+          name: group
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Media in one scheduling group
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MediaSearchResult"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/filler-assets/candidates:
+    get:
+      operationId: getFillerAssetCandidates
+      parameters:
+        - in: query
+          name: profile
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Filler available to the schedule builder
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FillerAssetCandidateList"
+        "401":
+          $ref: "#/components/responses/Error"
+        "500":
+          $ref: "#/components/responses/Error"
+components:
+  parameters:
+    FromMs:
+      in: query
+      name: from
+      schema:
+        type: integer
+        format: int64
+    Hours:
+      in: query
+      name: hours
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 48
+  responses:
+    AdminAuthStatus:
+      description: Current authentication state
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAuthStatus"
+    Error:
+      description: Structured API error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error, message]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+        hint:
+          type: string
+    AdminLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+    AdminPasswordChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+        newPassword:
+          type: string
+          minLength: 8
+    AdminAuthStatus:
+      type: object
+      additionalProperties: false
+      required: [enabled, authenticated, mustChange]
+      properties:
+        enabled:
+          type: boolean
+        authenticated:
+          type: boolean
+        mustChange:
+          type: boolean
+    AdminLogoutResponse:
+      type: object
+      additionalProperties: false
+      required: [authenticated]
+      properties:
+        authenticated:
+          type: boolean
+          enum: [false]
+    MediaWindow:
+      type: object
+      additionalProperties: false
+      required: [mediaID, startMs, endMs, durationMs]
+      properties:
+        mediaID:
+          type: string
+        title:
+          type: string
+        path:
+          type: string
+        collectionName:
+          type: string
+        packageStatus:
+          type: string
+        packageError:
+          type: string
+        startMs:
+          type: integer
+          format: int64
+        endMs:
+          type: integer
+          format: int64
+        durationMs:
+          type: integer
+          format: int64
+        elapsedMs:
+          type: integer
+          format: int64
+        remainingMs:
+          type: integer
+          format: int64
+    CacheStatus:
+      type: object
+      additionalProperties: false
+      required: [hasSchedule, cacheSize]
+      properties:
+        format:
+          type: string
+        hasSchedule:
+          type: boolean
+        cacheSize:
+          type: integer
+        cacheMinIndex:
+          type: integer
+          format: int64
+        cacheMaxIndex:
+          type: integer
+          format: int64
+        lookaheadDepthSegments:
+          type: integer
+          format: int64
+        lookaheadDepthSeconds:
+          type: integer
+          format: int64
+        latestGeneratedIndex:
+          type: integer
+          format: int64
+        latestGeneratedSeconds:
+          type: number
+        latestGeneratedAt:
+          type: string
+    ChannelNow:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - displayName
+        - enabled
+        - hiddenFromGuide
+        - ordering
+        - mediaKind
+        - scheduleMode
+        - status
+        - current
+        - next
+        - scheduleCoverageMs
+        - scheduleCoverageHours
+        - packageCoverageMs
+        - packageCoverageHours
+        - packageReadyCount
+        - packageProfile
+        - adaptiveBitrate
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        artworkUrl:
+          type: string
+        enabled:
+          type: boolean
+        hiddenFromGuide:
+          type: boolean
+        ordering:
+          type: string
+        mediaKind:
+          type: string
+        scheduleMode:
+          type: string
+        slotDurationMs:
+          type: integer
+          format: int64
+        prefillMode:
+          type: string
+        status:
+          type: string
+        current:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/MediaWindow"
+        next:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/MediaWindow"
+        scheduleCoverageMs:
+          type: integer
+          format: int64
+        scheduleCoverageHours:
+          type: number
+        scheduleEndMs:
+          type: integer
+          format: int64
+        packageCoverageMs:
+          type: integer
+          format: int64
+        packageCoverageHours:
+          type: number
+        packageReadyCount:
+          type: integer
+        packageProfile:
+          type: string
+        adaptiveBitrate:
+          type: boolean
+        cache:
+          $ref: "#/components/schemas/CacheStatus"
+    AdminNow:
+      type: object
+      additionalProperties: false
+      required: [nowMs, channels]
+      properties:
+        nowMs:
+          type: integer
+          format: int64
+        channels:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChannelNow"
+    PlayableSource:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - displayName
+        - kind
+        - playbackType
+        - status
+        - manifestUrl
+        - enabled
+        - adaptiveBitrate
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        artworkUrl:
+          type: string
+        kind:
+          type: string
+        playbackType:
+          type: string
+        status:
+          type: string
+        manifestUrl:
+          type: string
+        enabled:
+          type: boolean
+        current:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/MediaWindow"
+        next:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/MediaWindow"
+        scheduleCoverageMs:
+          type: integer
+          format: int64
+        scheduleCoverageHours:
+          type: number
+        packageCoverageMs:
+          type: integer
+          format: int64
+        packageCoverageHours:
+          type: number
+        packageProfile:
+          type: string
+        adaptiveBitrate:
+          type: boolean
+        prefillMode:
+          type: string
+    PlayableSourcesResponse:
+      type: object
+      additionalProperties: false
+      required: [nowMs, sources, generatedAt]
+      properties:
+        nowMs:
+          type: integer
+          format: int64
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlayableSource"
+        generatedAt:
+          type: string
+          format: date-time
+    GuideEntry:
+      type: object
+      additionalProperties: false
+      required: [entryId, mediaId, startMs, endMs, durationMs]
+      properties:
+        entryId:
+          type: string
+        mediaId:
+          type: string
+        title:
+          type: string
+        startMs:
+          type: integer
+          format: int64
+        endMs:
+          type: integer
+          format: int64
+        durationMs:
+          type: integer
+          format: int64
+    GuideChannel:
+      type: object
+      additionalProperties: false
+      required: [id, displayName, status, entries]
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        artworkUrl:
+          type: string
+        status:
+          type: string
+        prefillMode:
+          type: string
+        scheduleMode:
+          type: string
+        slotDurationMs:
+          type: integer
+          format: int64
+        scheduleEndMs:
+          type: integer
+          format: int64
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/GuideEntry"
+    GuideResponse:
+      type: object
+      additionalProperties: false
+      required: [nowMs, fromMs, toMs, channels]
+      properties:
+        nowMs:
+          type: integer
+          format: int64
+        fromMs:
+          type: integer
+          format: int64
+        toMs:
+          type: integer
+          format: int64
+        channels:
+          type: array
+          items:
+            $ref: "#/components/schemas/GuideChannel"
+    SubtitleSettings:
+      type: object
+      additionalProperties: false
+      required: [subtitleAutoEnable, subtitleLanguagePreference]
+      properties:
+        subtitleAutoEnable:
+          type: boolean
+        subtitleLanguagePreference:
+          type: array
+          items:
+            type: string
+    ChannelSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - displayName
+        - enabled
+        - ordering
+        - scheduleMode
+        - hiddenFromGuide
+        - mediaKind
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        enabled:
+          type: boolean
+        ordering:
+          type: string
+        scheduleMode:
+          type: string
+        slotDurationMs:
+          type: integer
+          format: int64
+        hiddenFromGuide:
+          type: boolean
+        artworkUrl:
+          type: string
+        mediaKind:
+          type: string
+    ChannelListResponse:
+      type: object
+      additionalProperties: false
+      required: [channels]
+      properties:
+        channels:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChannelSummary"
+    ScheduleBuilderEntryInput:
+      type: object
+      additionalProperties: false
+      required: [mediaId, offsetMs, durationMs]
+      properties:
+        mediaId:
+          type: string
+        offsetMs:
+          type: integer
+          format: int64
+          minimum: 0
+        durationMs:
+          type: integer
+          format: int64
+          minimum: 1
+    CreateChannelRequest:
+      type: object
+      additionalProperties: false
+      required: [displayName, packageProfile, mediaIds]
+      properties:
+        displayName:
+          type: string
+        packageProfile:
+          type: string
+        mediaIds:
+          type: array
+          items:
+            type: string
+        ordering:
+          type: string
+        scheduleMode:
+          type: string
+        slotDurationMs:
+          type: integer
+          format: int64
+        prefillMode:
+          type: string
+          enum: [eager, on_demand]
+        adaptiveBitrate:
+          type: string
+          enum: [cpu, hdr]
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScheduleBuilderEntryInput"
+        fillerMediaIds:
+          type: array
+          items:
+            type: string
+    MediaPackageFailure:
+      type: object
+      additionalProperties: false
+      required: [mediaId, code, message]
+      properties:
+        mediaId:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+    CreateChannelResponse:
+      type: object
+      additionalProperties: false
+      required: [channelID, displayName, created, syncedMedia, scheduleEntries]
+      properties:
+        channelID:
+          type: string
+        displayName:
+          type: string
+        created:
+          type: boolean
+        syncedMedia:
+          type: integer
+        scheduleEntries:
+          type: integer
+        profile:
+          type: string
+        queued:
+          type: array
+          items:
+            type: string
+        alreadyPending:
+          type: array
+          items:
+            type: string
+        alreadyReady:
+          type: array
+          items:
+            type: string
+        failed:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaPackageFailure"
+    MediaSourceStatus:
+      type: object
+      additionalProperties: false
+      required: [hasMediaSource, plexConfigured, jellyfinConfigured, localSourceCount]
+      properties:
+        hasMediaSource:
+          type: boolean
+        plexConfigured:
+          type: boolean
+        jellyfinConfigured:
+          type: boolean
+        localSourceCount:
+          type: integer
+    PackageProfileReferences:
+      type: object
+      additionalProperties: false
+      required: [mediaPackages, channels, scheduleEntries]
+      properties:
+        mediaPackages:
+          type: integer
+        channels:
+          type: integer
+        scheduleEntries:
+          type: integer
+    PackageVideoSettings:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          type: string
+        codec:
+          type: string
+        codecRequired:
+          type: string
+        profile:
+          type: string
+        level:
+          type: string
+        preset:
+          type: string
+        crf:
+          type: integer
+        scaleHeight:
+          type: integer
+          format: int64
+        pixelFormat:
+          type: string
+        videoBitrate:
+          type: string
+        videoMaxBitrate:
+          type: string
+        videoQuality:
+          type: integer
+    PackageAudioSettings:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          type: string
+        codec:
+          type: string
+        bitrate:
+          type: string
+        channels:
+          type: integer
+        sampleHz:
+          type: integer
+    PackageSubtitleSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        mode:
+          type: string
+        language:
+          type: string
+        fallback:
+          type: string
+    PackageProfile:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - label
+        - description
+        - mediaKind
+        - video
+        - audio
+        - isBuiltin
+        - disabled
+        - references
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        mediaKind:
+          type: string
+        video:
+          $ref: "#/components/schemas/PackageVideoSettings"
+        audio:
+          $ref: "#/components/schemas/PackageAudioSettings"
+        subtitles:
+          $ref: "#/components/schemas/PackageSubtitleSettings"
+        isBuiltin:
+          type: boolean
+        disabled:
+          type: boolean
+        references:
+          $ref: "#/components/schemas/PackageProfileReferences"
+    PackageProfileListResponse:
+      type: object
+      additionalProperties: false
+      required: [profiles, profileDetails, defaultProfile]
+      properties:
+        profiles:
+          type: array
+          items:
+            type: string
+        profileDetails:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageProfile"
+        defaultProfile:
+          type: string
+    StatusCount:
+      type: object
+      additionalProperties: false
+      required: [status, count]
+      properties:
+        status:
+          type: string
+        count:
+          type: integer
+          format: int64
+    SubtitleWarning:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        language:
+          type: string
+        title:
+          type: string
+        streamIndex:
+          type: integer
+    SizeEstimate:
+      type: object
+      additionalProperties: false
+      required: [mode, expectedBytes, expectedKnown, maxBytes]
+      properties:
+        mode:
+          type: string
+          enum: [copy, crf, capped-crf, target, cbr, unknown]
+        expectedBytes:
+          type: integer
+          format: int64
+        expectedKnown:
+          type: boolean
+        maxBytes:
+          type: integer
+          format: int64
+    MediaPackageCandidate:
+      type: object
+      additionalProperties: false
+      required:
+        - mediaId
+        - title
+        - path
+        - collectionName
+        - durationMs
+        - packageStatus
+        - packageProfile
+        - selectable
+      properties:
+        mediaId:
+          type: string
+        title:
+          type: string
+        path:
+          type: string
+        collectionName:
+          type: string
+        sourceRef:
+          type: string
+        durationMs:
+          type: integer
+          format: int64
+        videoBitrateBps:
+          type: integer
+          format: int64
+        packageId:
+          type: string
+        packageStatus:
+          type: string
+        packageProfile:
+          type: string
+        packageError:
+          type: string
+        packagedDurationMs:
+          type: integer
+          format: int64
+        packageBytes:
+          type: integer
+          format: int64
+        updatedAtMs:
+          type: integer
+          format: int64
+        selectable:
+          type: boolean
+        subtitleWarnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubtitleWarning"
+        sizeEstimate:
+          $ref: "#/components/schemas/SizeEstimate"
+    MediaPackageCandidateList:
+      type: object
+      additionalProperties: false
+      required: [profile, count, estimateSamples, statusCounts, media]
+      properties:
+        profile:
+          type: string
+        count:
+          type: integer
+          format: int64
+        estimateSamples:
+          type: integer
+        statusCounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/StatusCount"
+        media:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaPackageCandidate"
+    MediaMovie:
+      type: object
+      additionalProperties: false
+      required: [title, group, itemCount, durationMs]
+      properties:
+        title:
+          type: string
+        group:
+          type: string
+        itemCount:
+          type: integer
+        durationMs:
+          type: integer
+          format: int64
+    MediaMoviesResponse:
+      type: object
+      additionalProperties: false
+      required: [movies]
+      properties:
+        movies:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaMovie"
+    MediaShowSeason:
+      type: object
+      additionalProperties: false
+      required: [seasonNumber, episodeCount, durationMs]
+      properties:
+        seasonNumber:
+          type: integer
+          format: int64
+          nullable: true
+        episodeCount:
+          type: integer
+          format: int64
+        durationMs:
+          type: integer
+          format: int64
+    MediaShow:
+      type: object
+      additionalProperties: false
+      required: [collectionId, name, episodeCount, durationMs, seasonCount, seasons]
+      properties:
+        collectionId:
+          type: string
+        name:
+          type: string
+        episodeCount:
+          type: integer
+          format: int64
+        durationMs:
+          type: integer
+          format: int64
+        seasonCount:
+          type: integer
+        seasons:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaShowSeason"
+    MediaShowsResponse:
+      type: object
+      additionalProperties: false
+      required: [shows]
+      properties:
+        shows:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaShow"
+    MusicAlbum:
+      type: object
+      additionalProperties: false
+      required: [albumName, group, trackCount, durationMs]
+      properties:
+        albumName:
+          type: string
+        group:
+          type: string
+        trackCount:
+          type: integer
+        durationMs:
+          type: integer
+          format: int64
+    MusicArtist:
+      type: object
+      additionalProperties: false
+      required: [artistName, albumCount, trackCount, durationMs, albums]
+      properties:
+        artistName:
+          type: string
+        albumCount:
+          type: integer
+        trackCount:
+          type: integer
+        durationMs:
+          type: integer
+          format: int64
+        albums:
+          type: array
+          items:
+            $ref: "#/components/schemas/MusicAlbum"
+    MediaAlbumsResponse:
+      type: object
+      additionalProperties: false
+      required: [artists]
+      properties:
+        artists:
+          type: array
+          items:
+            $ref: "#/components/schemas/MusicArtist"
+    MediaSearchResult:
+      type: object
+      additionalProperties: false
+      required: [mediaId, title, path, collectionName, durationMs]
+      properties:
+        mediaId:
+          type: string
+        title:
+          type: string
+        path:
+          type: string
+        collectionName:
+          type: string
+        sourceRef:
+          type: string
+        durationMs:
+          type: integer
+          format: int64
+    FillerAssetCandidate:
+      type: object
+      additionalProperties: false
+      required: [id, mediaId, label, kind, durationMs, packageStatus, packageReady]
+      properties:
+        id:
+          type: string
+        mediaId:
+          type: string
+        label:
+          type: string
+        kind:
+          type: string
+        durationMs:
+          type: integer
+          format: int64
+        packageId:
+          type: string
+        packageStatus:
+          type: string
+        packageReady:
+          type: boolean
+        packagedDurationMs:
+          type: integer
+          format: int64
+    FillerAssetCandidateList:
+      type: object
+      additionalProperties: false
+      required: [profile, count, assets]
+      properties:
+        profile:
+          type: string
+        count:
+          type: integer
+        assets:
+          type: array
+          items:
+            $ref: "#/components/schemas/FillerAssetCandidate"

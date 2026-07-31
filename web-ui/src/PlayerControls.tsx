@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type Hls from "hls.js";
 import type { Events, MediaPlaylist } from "hls.js";
+import { apiFetch } from "./api/client";
+import { getSubtitleSettings } from "./api/settings";
 import type { SubtitleSettings } from "./types";
 
 type SubTrack = { index: number; label: string; language: string; source: "hls" | "native" };
@@ -195,8 +197,7 @@ export function PlayerControls({
   }, [subMenuOpen]);
 
   useEffect(() => {
-    fetch("/api/subtitle-settings")
-      .then(r => r.ok ? r.json() : null)
+    getSubtitleSettings()
       .then((s: SubtitleSettings | null) => { if (s) setSubSettings(s); })
       .catch(() => {});
   }, []);
@@ -208,8 +209,7 @@ export function PlayerControls({
       return;
     }
     const ac = new AbortController();
-    fetch(`/hls/channels/${encodeURIComponent(channelID)}/subtitles`, { cache: "no-store", signal: ac.signal })
-      .then(r => r.ok ? r.json() : null)
+    apiFetch<BurnTrackResponse>(`/hls/channels/${encodeURIComponent(channelID)}/subtitles`, { cache: "no-store", signal: ac.signal })
       .then((data: BurnTrackResponse | null) => {
         setBurnTracks(data?.tracks ?? []);
         setActiveBurnLang(data?.activeLanguage ?? "");
@@ -246,11 +246,10 @@ export function PlayerControls({
   const setBurnSubtitle = useCallback((language: string) => {
     if (!channelID) return;
     onBurnSubtitleSwitch(() =>
-      fetch(`/hls/channels/${encodeURIComponent(channelID)}/subtitles`, {
+      apiFetch<BurnTrackResponse>(`/hls/channels/${encodeURIComponent(channelID)}/subtitles`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ language }),
-      }).then(r => r.ok ? r.json() : Promise.reject(new Error("subtitle update failed")))
+        json: { language },
+      })
     )
       .then((data: BurnTrackResponse) => {
         setActiveBurnLang(data.activeLanguage ?? language);

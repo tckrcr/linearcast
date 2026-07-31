@@ -49,7 +49,6 @@ type channelListRow struct {
 
 type channelPolicyResponse struct {
 	ChannelID              string `json:"channelId"`
-	PlaybackMode           string `json:"playbackMode"`
 	RequiredPackageProfile string `json:"requiredPackageProfile"`
 	AdaptiveBitrate        bool   `json:"adaptiveBitrate"`
 	PackagePrefillMs       *int64 `json:"packagePrefillMs"`
@@ -80,13 +79,11 @@ type channelCloneResponse struct {
 
 type createChannelRequest struct {
 	DisplayName    string   `json:"displayName"`
-	PlaybackMode   string   `json:"playbackMode,omitempty"` // "packaged" (default)
 	PackageProfile string   `json:"packageProfile"`
 	MediaIDs       []string `json:"mediaIds"`
 	Ordering       string   `json:"ordering,omitempty"`
 	ScheduleMode   string   `json:"scheduleMode,omitempty"`
 	SlotDurationMs *int64   `json:"slotDurationMs,omitempty"`
-	UpstreamHLSURL string   `json:"upstreamHlsUrl,omitempty"`
 	// PrefillMode is "eager" (default) or "on_demand". On-demand defers durable
 	// package work; the schedule still builds ahead.
 	PrefillMode string `json:"prefillMode,omitempty"`
@@ -265,7 +262,6 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 	req.PackageProfile = strings.TrimSpace(req.PackageProfile)
 	req.Ordering = strings.TrimSpace(req.Ordering)
 	req.ScheduleMode = strings.TrimSpace(req.ScheduleMode)
-	req.UpstreamHLSURL = strings.TrimSpace(req.UpstreamHLSURL)
 	req.PrefillMode = strings.TrimSpace(req.PrefillMode)
 
 	if req.DisplayName == "" {
@@ -306,24 +302,6 @@ func (a *App) createChannel(ctx context.Context, req createChannelRequest) (crea
 			channelID = candidate
 			break
 		}
-	}
-
-	if req.UpstreamHLSURL != "" {
-		if !validUpstreamHLSURL(req.UpstreamHLSURL) {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusBadRequest, Code: "invalid_upstream_hls_url", Message: "upstreamHlsUrl must be an http or https URL"}
-		}
-		if err := db.InsertChannel(ctx, a.dbConn, db.ChannelWrite{
-			ID:             channelID,
-			DisplayName:    req.DisplayName,
-			Ordering:       req.Ordering,
-			MediaKind:      db.MediaKindMusic,
-			ScheduleMode:   req.ScheduleMode,
-			SlotDurationMs: req.SlotDurationMs,
-			UpstreamHLSURL: &req.UpstreamHLSURL,
-		}); err != nil {
-			return createChannelResponse{}, &adminHTTPError{Status: http.StatusInternalServerError, Code: "db_error", Message: fmt.Sprintf("create channel: %v", err)}
-		}
-		return createChannelResponse{ChannelID: channelID, DisplayName: req.DisplayName, Created: true}, nil
 	}
 
 	if req.PackageProfile == "" {
@@ -877,14 +855,8 @@ func channelPolicyWire(ch db.Channel) channelPolicyResponse {
 
 	prefillMs := ch.PackagePrefillMs
 
-	playbackMode := string(ch.PlaybackMode)
-	if playbackMode == "" {
-		playbackMode = "packaged"
-	}
-
 	return channelPolicyResponse{
 		ChannelID:              ch.ID,
-		PlaybackMode:           playbackMode,
 		RequiredPackageProfile: profile,
 		AdaptiveBitrate:        db.ABRLadderEnabled(profile, ch.ABRLadder),
 		PackagePrefillMs:       prefillMs,
@@ -905,8 +877,8 @@ func (a *App) handleChannelOnDemandProfileUpdate(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusNotFound, "not_found", "channel not found")
 		return
 	}
-	if existing.PlaybackMode != db.PlaybackModePackaged || existing.PrefillMode != "on_demand" || existing.UpstreamHLSURL != nil {
-		writeError(w, http.StatusConflict, "unsupported_channel_type", "package profile changes are only supported for on-demand packaged channels")
+	if existing.PrefillMode != "on_demand" {
+		writeError(w, http.StatusConflict, "unsupported_channel_type", "package profile changes are only supported for on-demand channels")
 		return
 	}
 
@@ -962,7 +934,7 @@ func (a *App) handleChannelOnDemandProfileUpdate(w http.ResponseWriter, r *http.
 			return
 		}
 		if !updated {
-			writeError(w, http.StatusConflict, "unsupported_channel_type", "package profile changes are only supported for on-demand packaged channels")
+			writeError(w, http.StatusConflict, "unsupported_channel_type", "package profile changes are only supported for on-demand channels")
 			return
 		}
 	}
@@ -1055,7 +1027,7 @@ func (a *App) handleChannelPolicyUpdate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	updated, err := db.UpdateChannelPlaybackPolicy(r.Context(), a.dbConn, channelID, db.PlaybackModePackaged, profile, existing.ABRLadder, prefillMs, mediaKind)
+	updated, err := db.UpdateChannelPolicy(r.Context(), a.dbConn, channelID, profile, existing.ABRLadder, prefillMs, mediaKind)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
 		return
@@ -1077,7 +1049,6 @@ func (a *App) handleChannelPolicyUpdate(w http.ResponseWriter, r *http.Request) 
 
 	writeJSON(w, channelPolicyResponse{
 		ChannelID:              channelID,
-		PlaybackMode:           "packaged",
 		RequiredPackageProfile: respProfile,
 		AdaptiveBitrate:        db.ABRLadderEnabled(respProfile, ch.ABRLadder),
 		PackagePrefillMs:       respPrefill,

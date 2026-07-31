@@ -1,7 +1,7 @@
--- linearcast schema v1 (end-state baseline; the historical migration chain was
--- collapsed into this file — see plan.md). Databases predating the collapse are
--- dropped and recreated from this schema, never migrated across it.
--- See docs/database.md.
+-- linearcast's current fresh-database schema. schema_version must match
+-- SchemaVersion in schema.go. Existing supported databases advance through the
+-- immutable numbered transitions registered there; pre-v1 databases are not
+-- inferred or repaired. See docs/database.md.
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
+INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4');
 
 -- ordering values are validated in Go (alphabetical, block). No CHECK here
 -- so v3-introduced values can land without a table rebuild.
@@ -25,7 +25,6 @@ CREATE TABLE IF NOT EXISTS channels (
     description      TEXT,
     hidden_from_guide INTEGER NOT NULL DEFAULT 0,
     artwork_url      TEXT,
-    playback_mode    TEXT NOT NULL DEFAULT 'packaged',
     required_package_profile TEXT,
     abr_ladder_json TEXT,
     package_prefill_ms INTEGER,
@@ -33,21 +32,15 @@ CREATE TABLE IF NOT EXISTS channels (
     media_kind TEXT NOT NULL DEFAULT 'video',
     schedule_mode TEXT NOT NULL DEFAULT 'back_to_back',
     slot_duration_ms INTEGER,
-    upstream_hls_url TEXT,
     prefill_mode TEXT NOT NULL DEFAULT 'eager',
     CHECK (enabled IN (0, 1)),
     CHECK (hidden_from_guide IN (0, 1)),
-    CHECK (playback_mode IN ('generated', 'packaged')),
     CHECK (package_prefill_ms IS NULL OR package_prefill_ms > 0),
     CHECK (encoder_policy IS NULL OR encoder_policy IN ('any', 'remote_only', 'remote_preferred', 'local_only')),
     CHECK (media_kind IN ('video', 'music')),
     CHECK (schedule_mode IN ('back_to_back', 'slot_grid')),
     CHECK (slot_duration_ms IS NULL OR (slot_duration_ms > 0 AND slot_duration_ms % 6000 = 0)),
-    -- 'buffered' is a removed prefill mode. It stays in this CHECK on purpose: the
-    -- app no longer creates buffered channels (admin validation + normalizeChannelWrite
-    -- block it), and dropping it from the constraint would force a full table-rebuild
-    -- migration for zero gain. Left as a harmless backstop for existing rows.
-    CHECK (prefill_mode IN ('eager', 'on_demand', 'buffered'))
+    CHECK (prefill_mode IN ('eager', 'on_demand'))
 );
 
 -- user_preference is reserved for future continuity-ordering work
@@ -89,6 +82,7 @@ CREATE TABLE IF NOT EXISTS media (
     description         TEXT,
     thumb_path          TEXT,
     content_rating      TEXT,
+    rating              REAL,
     video_width         INTEGER,
     color_transfer      TEXT,
     color_primaries     TEXT,
@@ -277,25 +271,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_package_tracks_external
     WHERE source NOT IN ('embedded_text', 'embedded_bitmap') AND kind = 'subtitle';
 
 CREATE INDEX IF NOT EXISTS idx_package_tracks_package ON package_tracks(package_id, kind);
-
--- play_history: one durable row per schedule entry observed by the playback
--- runtime. Future scheduling/guide features use this as the "has aired" log.
-CREATE TABLE IF NOT EXISTS play_history (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id        TEXT NOT NULL,
-    schedule_entry_id TEXT NOT NULL,
-    media_id          TEXT NOT NULL,
-    started_at        INTEGER NOT NULL,
-    ended_at          INTEGER NOT NULL,
-    duration_ms       INTEGER NOT NULL,
-    UNIQUE (channel_id, schedule_entry_id),
-    FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
-    FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE RESTRICT,
-    CHECK (ended_at >= started_at),
-    CHECK (duration_ms >= 0)
-);
-
-CREATE INDEX IF NOT EXISTS idx_play_history_channel_started ON play_history(channel_id, started_at DESC);
 
 -- package_profiles: stored profile definitions. Built-ins are seeded on first
 -- migration; custom profiles are inserted via the admin API.

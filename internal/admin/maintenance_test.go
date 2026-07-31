@@ -22,8 +22,8 @@ func TestHandleMaintenanceMissingMedia(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	presentPath := filepath.Join(dir, "present.mkv")
@@ -40,8 +40,8 @@ func TestHandleMaintenanceMissingMedia(t *testing.T) {
 	}
 
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
+		required_package_profile, hidden_from_guide)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, title, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('present', ?, ?, 'Present', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0)`,
@@ -54,8 +54,6 @@ func TestHandleMaintenanceMissingMedia(t *testing.T) {
 		VALUES ('ch', 'gone', NULL, 0)`)
 	mustExec(`INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, created_at_ms)
 		VALUES ('sched-1', 'ch', 0, 'gone', 0, 18000, 0)`)
-	mustExec(`INSERT INTO play_history (channel_id, schedule_entry_id, media_id, started_at, ended_at, duration_ms)
-		VALUES ('ch', 'sched-1', 'gone', 0, 18000, 18000)`)
 	mustExec(`INSERT INTO media_packages (id, media_id, rendition_profile, status, created_at_ms, updated_at_ms)
 		VALUES ('pkg-gone', 'gone', 'h264-1080p-8mbps', 'ready', 0, 0)`)
 
@@ -119,7 +117,6 @@ func TestHandleMaintenanceMissingMedia(t *testing.T) {
 		"media (gone)":            `SELECT COUNT(*) FROM media WHERE id = 'gone'`,
 		"channel_media (gone)":    `SELECT COUNT(*) FROM channel_media WHERE media_id = 'gone'`,
 		"schedule_entries (gone)": `SELECT COUNT(*) FROM schedule_entries WHERE media_id = 'gone'`,
-		"play_history (gone)":     `SELECT COUNT(*) FROM play_history WHERE media_id = 'gone'`,
 		"media_packages (gone)":   `SELECT COUNT(*) FROM media_packages WHERE media_id = 'gone'`,
 	}
 	for label, q := range checks {
@@ -184,8 +181,8 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	// Layout:
@@ -237,8 +234,8 @@ func TestHandleMaintenanceOrphanPackages(t *testing.T) {
 		}
 	}
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
+		required_package_profile, hidden_from_guide)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('keep', '/tmp/keep.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
@@ -374,8 +371,8 @@ func TestHandleMaintenanceOrphanPackagesPreservesExtraFiles(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	// Package dir that has generated files AND an unrecognised file.
@@ -448,8 +445,8 @@ func TestHandleMaintenancePackageDelete(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	makeDir := func(rel string) string {
@@ -472,8 +469,8 @@ func TestHandleMaintenancePackageDelete(t *testing.T) {
 		}
 	}
 	mustExec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile, hidden_from_guide)
-		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 0)`)
+		required_package_profile, hidden_from_guide)
+		VALUES ('ch', 'Ch', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 0)`)
 	mustExec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
 		VALUES ('ref', '/tmp/ref.mkv', '/tmp', 18000, 'mkv', 'h264', 1080, 'aac', 1, 0),
@@ -582,8 +579,8 @@ func TestHandleMaintenanceOptimizeDB(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	// Generate some churn so VACUUM has something to reclaim. Insert and delete
@@ -632,8 +629,8 @@ func TestHandleMaintenanceOptimizeDBMissingPath(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	app := New(Config{DB: conn}) // no DBPath
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/maintenance/optimize-db", nil)

@@ -21,8 +21,8 @@ func newWorkerTestDB(t *testing.T) string {
 		t.Fatalf("open rw: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	return path
 }
@@ -36,9 +36,9 @@ func seedPackagedChannel(t *testing.T, path string) {
 	defer conn.Close()
 
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled,
-		created_at_ms, playback_mode, required_package_profile, package_prefill_ms)
-		VALUES ('ch-pkg', 'Packaged', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 86400000),
-		       ('ch-gen', 'Generated', '/tmp', 'alphabetical', 1, 0, 'generated', NULL, NULL)`); err != nil {
+		created_at_ms, required_package_profile, package_prefill_ms)
+		VALUES ('ch-pkg', 'Packaged', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 86400000),
+		       ('ch-gen', 'Generated', '/tmp', 'alphabetical', 1, 0, NULL, NULL)`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -296,8 +296,8 @@ func TestDiscoverIncludesMusicMediaOnMusicChannel(t *testing.T) {
 	defer rw.Close()
 
 	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled,
-		created_at_ms, playback_mode, required_package_profile, package_prefill_ms, media_kind)
-		VALUES ('music-ch', 'Music', '/music', 'alphabetical', 1, 0, 'packaged', 'music-aac-720p', 86400000, 'music')`); err != nil {
+		created_at_ms, required_package_profile, package_prefill_ms, media_kind)
+		VALUES ('music-ch', 'Music', '/music', 'alphabetical', 1, 0, 'music-aac-720p', 86400000, 'music')`); err != nil {
 		t.Fatalf("insert music channel: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,

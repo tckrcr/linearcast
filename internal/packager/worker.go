@@ -165,7 +165,6 @@ func (w *Worker) loop(ctx context.Context, idx int) {
 		if ctx.Err() != nil {
 			return
 		}
-		w.recordQueueDepth()
 		job, err := w.claimNext(ctx)
 		if err != nil {
 			log.Printf("worker=%d ERROR claim: %v", idx, err)
@@ -178,17 +177,6 @@ func (w *Worker) loop(ctx context.Context, idx int) {
 			return
 		case <-time.After(w.PollInterval):
 		}
-	}
-}
-
-func (w *Worker) recordQueueDepth() {
-	rows, err := db.PackageProfileSummaries(context.Background(), w.DB)
-	if err != nil {
-		log.Printf("WARN package queue metrics: %v", err)
-		return
-	}
-	for _, row := range rows {
-		metrics.PackageQueueDepth.WithLabelValues(row.RenditionProfile, metrics.PackageStatusLabel(row.Status)).Set(float64(row.PackageCount))
 	}
 }
 
@@ -475,9 +463,8 @@ needed AS (
             ELSE json_array(COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?))
         END
     )
-    WHERE c.enabled = 1
-      AND c.upstream_hls_url IS NULL
-      AND c.prefill_mode = 'eager'
+	WHERE c.enabled = 1
+	  AND c.prefill_mode = 'eager'
       AND COALESCE(NULLIF(TRIM(json_each.value), ''), COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)) != ''
     GROUP BY cm.media_id, COALESCE(NULLIF(TRIM(json_each.value), ''), COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)), c.media_kind
 )

@@ -1,10 +1,13 @@
 package admin
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/tckrcr/linearcast/internal/db"
 )
 
 func inventoryBody(t *testing.T, app *App, target string) mediaInventoryResponse {
@@ -98,6 +101,36 @@ func TestHandleMediaInventoryKindShowsExcludesMovieGroups(t *testing.T) {
 	}
 }
 
+func TestHandleMediaInventoryKindProgramsExcludesFillerAndMusic(t *testing.T) {
+	app, conn := testAdminApp(t)
+	insertMedia(t, conn, "show-one-s01e01", 12000)
+	insertMedia(t, conn, "movie-one", 12000)
+	insertMedia(t, conn, "bumper-one", 12000)
+	insertMedia(t, conn, "track-one", 12000)
+	if _, err := conn.Exec(`UPDATE media SET title = 'Movie One', scheduling_group = 'movie:Movie One' WHERE id = 'movie-one'`); err != nil {
+		t.Fatalf("seed movie: %v", err)
+	}
+	if _, err := conn.Exec(`UPDATE media SET media_kind = 'music' WHERE id = 'track-one'`); err != nil {
+		t.Fatalf("seed music: %v", err)
+	}
+	if _, err := conn.Exec(`INSERT INTO filler_assets (id, media_id, label, kind, enabled, created_at_ms)
+		VALUES ('fa-1', 'bumper-one', 'Bumper One', 'bumper', 1, 0)`); err != nil {
+		t.Fatalf("seed filler asset: %v", err)
+	}
+
+	got := inventoryBody(t, app, "/api/media/inventory?kind=programs")
+	if got.Count != 2 || len(got.Media) != 2 {
+		t.Fatalf("unexpected programs result: %+v", got)
+	}
+	ids := map[string]bool{}
+	for _, row := range got.Media {
+		ids[row.MediaID] = true
+	}
+	if !ids["show-one-s01e01"] || !ids["movie-one"] {
+		t.Fatalf("expected show and movie rows, got %+v", ids)
+	}
+}
+
 func TestHandleMediaInventoryRejectsInvalidLimit(t *testing.T) {
 	app, _ := testAdminApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/media/inventory?limit=abc", nil)
@@ -129,5 +162,103 @@ func TestHandleMediaInventorySortsAndFilters(t *testing.T) {
 	got = inventoryBody(t, app, "/api/media/inventory?sortBy=title&sortDir=asc")
 	if len(got.Media) != 2 || got.Media[0].MediaID != "a" || got.Media[1].MediaID != "b" {
 		t.Fatalf("unexpected title sort order: %+v", got.Media)
+	}
+}
+
+// seedInventorySwapFixtures inserts two episodes and one movie with varying
+// ratings, season numbers, and package states to exercise the swap-era
+// filters and per-profile fields.
+func seedInventorySwapFixtures(t *testing.T, conn *sql.DB) {
+	t.Helper()
+	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, title, scheduling_group, season_number, episode_number, rating, duration_ms, container, video_codec, video_height, video_bitrate_bps, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES
+		('ep-ready', '/srv/media/Show/ep-ready.mkv', '/srv/media/Show', 'Ready Episode', 'Show', 1, 1, 9.0, 12000, 'mkv', 'h264', 1080, 8000000, 'aac', 1, 0),
+		('ep-missing', '/srv/media/Show/ep-missing.mkv', '/srv/media/Show', 'Missing Episode', 'Show', 1, 2, 5.0, 13000, 'mkv', 'h264', 1080, 8000000, 'aac', 1, 0),
+		('movie-low', '/srv/media/movie-low.mkv', '/srv/media', 'Low Movie', 'movie:Low Movie', NULL, NULL, 3.0, 90000, 'mkv', 'h264', 720, 4000000, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("seed media: %v", err)
+	}
+	insertReadyPackage(t, conn, "ep-ready", 11500)
+}
+
+func TestHandleMediaInventoryProfilePackageStatusFilter(t *testing.T) {
+	app, conn := testAdminApp(t)
+	seedInventorySwapFixtures(t, conn)
+
+	got := inventoryBody(t, app, "/api/media/inventory?profile="+db.DefaultPackageProfile+"&profilePackageStatus=ready")
+	if got.Count != 1 || len(got.Media) != 1 {
+		t.Fatalf("expected 1 ready, got %+v", got)
+	}
+	if got.Media[0].MediaID != "ep-ready" {
+		t.Fatalf("expected ep-ready, got %q", got.Media[0].MediaID)
+	}
+	if got.Media[0].ProfilePackageStatus != "ready" {
+		t.Fatalf("profilePackageStatus=%q, want ready", got.Media[0].ProfilePackageStatus)
+	}
+	if got.Media[0].PackagedDurationMs == nil || *got.Media[0].PackagedDurationMs != 11500 {
+		t.Fatalf("packagedDurationMs=%v, want 11500", got.Media[0].PackagedDurationMs)
+	}
+
+	got = inventoryBody(t, app, "/api/media/inventory?profile="+db.DefaultPackageProfile+"&profilePackageStatus=missing")
+	if got.Count != 2 || len(got.Media) != 2 {
+		t.Fatalf("expected 2 missing, got %+v", got)
+	}
+	for _, row := range got.Media {
+		if row.ProfilePackageStatus != "missing" {
+			t.Fatalf("profilePackageStatus=%q, want missing", row.ProfilePackageStatus)
+		}
+		if row.PackagedDurationMs != nil {
+			t.Fatalf("packagedDurationMs should be nil for missing, got %v", *row.PackagedDurationMs)
+		}
+	}
+}
+
+func TestHandleMediaInventoryProfilePackageStatusRequiresProfile(t *testing.T) {
+	app, _ := testAdminApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/media/inventory?profilePackageStatus=ready", nil)
+	res := httptest.NewRecorder()
+	app.handleMediaInventory(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestHandleMediaInventoryVideoBitrateBpsInResponse(t *testing.T) {
+	app, conn := testAdminApp(t)
+	seedInventorySwapFixtures(t, conn)
+
+	got := inventoryBody(t, app, "/api/media/inventory?q=Ready")
+	if got.Count != 1 || len(got.Media) != 1 {
+		t.Fatalf("expected 1 result, got %+v", got)
+	}
+	if got.Media[0].VideoBitrateBps != 8000000 {
+		t.Fatalf("videoBitrateBps=%d, want 8000000", got.Media[0].VideoBitrateBps)
+	}
+}
+
+func TestHandleMediaInventoryMinRatingFilter(t *testing.T) {
+	app, conn := testAdminApp(t)
+	seedInventorySwapFixtures(t, conn)
+
+	got := inventoryBody(t, app, "/api/media/inventory?minRating=8.0")
+	if got.Count != 1 || len(got.Media) != 1 {
+		t.Fatalf("expected 1 result with rating >= 8.0, got %+v", got)
+	}
+	if got.Media[0].MediaID != "ep-ready" {
+		t.Fatalf("expected ep-ready, got %q", got.Media[0].MediaID)
+	}
+}
+
+func TestHandleMediaInventoryEpisodesOnlyFilter(t *testing.T) {
+	app, conn := testAdminApp(t)
+	seedInventorySwapFixtures(t, conn)
+
+	got := inventoryBody(t, app, "/api/media/inventory?episodesOnly=1")
+	if got.Count != 2 || len(got.Media) != 2 {
+		t.Fatalf("expected 2 episodes, got %+v", got)
+	}
+	for _, row := range got.Media {
+		if row.SeasonNumber == nil {
+			t.Fatalf("expected season_number to be set, got nil for %q", row.MediaID)
+		}
 	}
 }

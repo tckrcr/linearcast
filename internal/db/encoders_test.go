@@ -969,4 +969,3 @@ func TestRequeueEncoderJobs_RecoversOwnLeasesBeforeExpiry(t *testing.T) {
 		t.Fatalf("lease not cleared, %d remain", n)
 	}
 }
-

@@ -12,8 +12,8 @@ func TestLocalMediaSourceCRUD(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	created, err := UpsertLocalMediaSource(context.Background(), conn, LocalMediaSource{

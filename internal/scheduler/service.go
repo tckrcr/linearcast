@@ -3,11 +3,11 @@ package scheduler
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
-	"github.com/tckrcr/linearcast/internal/metrics"
 )
 
 type ServiceOptions struct {
@@ -18,11 +18,6 @@ type ServiceOptions struct {
 	ClearAfterMs         sql.NullInt64
 	NowMs                int64
 	InTransaction        bool
-	// BootstrapRequireAllReady delays first schedule creation until every
-	// codec-passing channel_media item has a ready package for the channel's
-	// active rendition profile. Existing schedules still use normal low-water
-	// tail extension.
-	BootstrapRequireAllReady bool
 	// ResumeAfterMediaID, if set, overrides the last-scheduled media ID used to
 	// position the starting cursor in BuildEntries. Use this when the caller has
 	// already removed an entry and wants the extend to skip that media item and
@@ -46,9 +41,9 @@ type ExtendResult struct {
 	RemainingMs          int64
 	Cleared              int64
 	SkippedLowWater      bool
-	BootstrapDelayed     bool
-	BootstrapReady       int64
-	BootstrapTotal       int64
+	ReadinessLimited     bool
+	ReadyMedia           int64
+	TotalMedia           int64
 	RequireReadyPackages bool
 	RenditionProfile     string
 	ScheduleMode         string
@@ -64,6 +59,25 @@ type ExtendAllResult struct {
 // CLI and the extender daemon. It owns channel loading, optional schedule
 // clearing, packaged eligibility decisions, tail continuation, and insertion.
 func ExtendChannel(ctx context.Context, conn db.Execer, channelID string, opts ServiceOptions) (ExtendResult, error) {
+	if !opts.InTransaction {
+		sqlDB, ok := conn.(*sql.DB)
+		if !ok {
+			return ExtendResult{}, fmt.Errorf("transaction is required for channel extension")
+		}
+		var result ExtendResult
+		txOpts := opts
+		txOpts.InTransaction = true
+		err := db.WithImmediateTx(ctx, sqlDB, func(tx db.Execer) error {
+			var err error
+			result, err = extendChannel(ctx, tx, channelID, txOpts)
+			return err
+		})
+		return result, err
+	}
+	return extendChannel(ctx, conn, channelID, opts)
+}
+
+func extendChannel(ctx context.Context, conn db.Execer, channelID string, opts ServiceOptions) (ExtendResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ExtendResult{}, err
 	}
@@ -78,17 +92,6 @@ func ExtendChannel(ctx context.Context, conn db.Execer, channelID string, opts S
 	nowMs := opts.NowMs
 	if nowMs == 0 {
 		nowMs = time.Now().UTC().UnixMilli()
-	}
-
-	// External HLS channels proxy a live stream and have no packaged media to
-	// schedule. Skip silently — the extender should not touch them.
-	if ch.UpstreamHLSURL != nil {
-		return ExtendResult{
-			ChannelID:       ch.ID,
-			DisplayName:     ch.DisplayName,
-			Ordering:        ch.Ordering,
-			SkippedLowWater: true,
-		}, nil
 	}
 
 	var cleared int64
@@ -137,17 +140,14 @@ func ExtendChannel(ctx context.Context, conn db.Execer, channelID string, opts S
 	result.ScheduleMode = effective.ScheduleMode
 	result.SlotDurationMs = effective.SlotDurationMs
 
-	if opts.BootstrapRequireAllReady && last == nil && effective.RequireReadyPackages {
+	if effective.RequireReadyPackages {
 		readiness, rerr := db.ChannelProfileReadiness(ctx, conn, channelID, effective.RenditionProfile)
 		if rerr != nil {
 			return result, fmt.Errorf("channel package readiness: %w", rerr)
 		}
-		result.BootstrapReady = readiness.Ready
-		result.BootstrapTotal = readiness.Total
-		if readiness.Total > 0 && readiness.Ready < readiness.Total {
-			result.BootstrapDelayed = true
-			return result, nil
-		}
+		result.ReadyMedia = readiness.Ready
+		result.TotalMedia = readiness.Total
+		result.ReadinessLimited = readiness.Ready < readiness.Total
 	}
 
 	if opts.LowWaterHours > 0 && last != nil {
@@ -190,6 +190,10 @@ func ExtendAllEnabled(ctx context.Context, conn *sql.DB, opts ServiceOptions) (E
 		}
 		res, err := ExtendChannel(ctx, conn, ch.ID, opts)
 		if err != nil {
+			if errors.Is(err, ErrNoReadyPackages) {
+				out.Channels = append(out.Channels, res)
+				continue
+			}
 			out.Channels = append(out.Channels, ExtendResult{
 				ChannelID:   ch.ID,
 				DisplayName: ch.DisplayName,
@@ -199,34 +203,6 @@ func ExtendAllEnabled(ctx context.Context, conn *sql.DB, opts ServiceOptions) (E
 			continue
 		}
 		out.Channels = append(out.Channels, res)
-		RecordChannelMetrics(ctx, conn, ch.ID, res.RenditionProfile)
 	}
 	return out, nil
-}
-
-func RecordChannelMetrics(ctx context.Context, conn db.Execer, channelID, renditionProfile string) {
-	pkgMs, _ := db.ChannelPackageCoverageMs(ctx, conn, channelID, renditionProfile)
-	metrics.PackageReadyDurationMs.WithLabelValues(channelID, renditionProfile).Set(float64(pkgMs))
-
-	nowMs := time.Now().UTC().UnixMilli()
-	gaps, _ := db.ScheduleGaps(ctx, conn, channelID, nowMs, nowMs+int64(48*3600*1000))
-	metrics.ScheduleGapCount.WithLabelValues(channelID).Set(float64(len(gaps)))
-	active := 0
-	for _, gap := range gaps {
-		if gap.StartMs <= nowMs && nowMs < gap.EndMs {
-			active = 1
-			break
-		}
-	}
-	metrics.ScheduleGapActive.WithLabelValues(channelID).Set(float64(active))
-
-	last, _ := db.LastScheduleEntry(ctx, conn, channelID)
-	if last != nil {
-		runway := float64(last.StartMs+last.DurationMs-nowMs) / 1000
-		if runway < 0 {
-			runway = 0
-		}
-		metrics.ScheduleRunwaySeconds.Set(runway)
-		metrics.ScheduleRunwayByChannelSeconds.WithLabelValues(channelID).Set(runway)
-	}
 }

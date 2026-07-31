@@ -202,7 +202,7 @@ export function App() {
   });
 
   const activeSource =
-    activeSources.find((c) => c.id === activeChannelID) ?? null;
+    sortedSources.find((c) => c.id === activeChannelID) ?? sortedSources[0] ?? null;
 
   // The wall clock currently on screen, ticking every second. Sourced from the
   // playhead's program-date-time when available, falling back to a skew-corrected
@@ -237,7 +237,7 @@ export function App() {
   const baseSource = urlSourceOverride || activeSource?.manifestUrl || "";
   const appliedSource = baseSource;
 
-  const probe = useStreamProbe(appliedSource || "/__no_source__");
+  const probe = useStreamProbe(appliedSource);
 
   const overlayOpen = channelsOpen || debugOpen;
   const cornerVisible = !idle || overlayOpen;
@@ -256,6 +256,7 @@ export function App() {
         probe={probe}
         activeSource={activeSource}
         nowSlot={liveSlot}
+        sourcesLoaded={playableSources !== null}
         hasSources={activeSources.length > 0}
         onStats={setStats}
         videoRef={videoRef}

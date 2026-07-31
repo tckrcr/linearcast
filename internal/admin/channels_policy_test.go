@@ -34,9 +34,9 @@ func policyRequest(app *App, channelID string) *httptest.ResponseRecorder {
 func TestHandleChannelPolicyNullFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if _, err := conn.Exec(`INSERT INTO channels (
-			id, display_name, source_directory, ordering, enabled, created_at_ms, playback_mode
+			id, display_name, source_directory, ordering, enabled, created_at_ms
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged')`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0)`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 
@@ -47,7 +47,7 @@ func TestHandleChannelPolicyNullFieldsWireShape(t *testing.T) {
 
 	defaultProfile := db.DefaultPackageProfileForMediaKind(db.MediaKindVideo)
 	want := fmt.Sprintf(
-		`{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":%q,"adaptiveBitrate":false,"packagePrefillMs":null,"mediaKind":"video"}`+"\n",
+		`{"channelId":"ch","requiredPackageProfile":%q,"adaptiveBitrate":false,"packagePrefillMs":null,"mediaKind":"video"}`+"\n",
 		defaultProfile,
 	)
 	if got := res.Body.String(); got != want {
@@ -59,9 +59,9 @@ func TestHandleChannelPolicySetFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if _, err := conn.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile, package_prefill_ms
+			required_package_profile, package_prefill_ms
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 5000)`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 5000)`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 
@@ -70,7 +70,7 @@ func TestHandleChannelPolicySetFieldsWireShape(t *testing.T) {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 
-	want := `{"channelId":"ch","playbackMode":"packaged","requiredPackageProfile":"h264-1080p-8mbps","adaptiveBitrate":false,"packagePrefillMs":5000,"mediaKind":"video"}` + "\n"
+	want := `{"channelId":"ch","requiredPackageProfile":"h264-1080p-8mbps","adaptiveBitrate":false,"packagePrefillMs":5000,"mediaKind":"video"}` + "\n"
 	if got := res.Body.String(); got != want {
 		t.Fatalf("policy body mismatch:\n got: %s\nwant: %s", got, want)
 	}

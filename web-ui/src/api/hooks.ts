@@ -8,6 +8,8 @@ import type {
 } from "../types";
 import { usePolling } from "../hooks/usePolling";
 import { getGuide } from "./channels";
+import { apiFetch, apiFetchRaw } from "./client";
+import type { AdminNowDTO, ChannelListResponseDTO } from "./dto";
 import { getPlayableSources } from "./sources";
 
 export function useAdminNow(intervalMs = 3000) {
@@ -20,12 +22,10 @@ export function useAdminNow(intervalMs = 3000) {
     maxIntervalMs: 60_000,
     task: async (signal) => {
       try {
-        const response = await fetch("/api/now", {
+        const body = await apiFetch<AdminNowDTO>("/api/now", {
           signal,
           cache: "no-store",
         });
-        if (!response.ok) throw new Error(`admin api ${response.status}`);
-        const body = (await response.json()) as AdminNow;
         setData(body);
         setError("");
         setUpdatedAt(Date.now());
@@ -46,10 +46,8 @@ export function useChannelList(intervalMs = 5000) {
   const [tick, setTick] = useState(0);
 
   async function refresh(signal?: AbortSignal) {
-    const response = await fetch("/api/channels", { signal, cache: "no-store" });
-    if (!response.ok) throw new Error(`admin api ${response.status}`);
-    const body = (await response.json()) as { channels: ChannelSummary[] };
-    setChannels(body.channels || []);
+    const body = await apiFetch<ChannelListResponseDTO>("/api/channels", { signal, cache: "no-store" });
+    setChannels(body.channels);
     setLoaded(true);
   }
 
@@ -124,20 +122,24 @@ export function useGuide(fromMs: number, hours: number, intervalMs = 60_000) {
 export function useStreamProbe(source: string) {
   const [probe, setProbe] = useState<StreamProbe>({
     status: "checking",
-    detail: "probing manifest",
+    detail: source ? "probing manifest" : "loading channels",
   });
 
   useEffect(() => {
-    setProbe({ status: "checking", detail: "probing manifest" });
+    setProbe({
+      status: "checking",
+      detail: source ? "probing manifest" : "loading channels",
+    });
   }, [source]);
 
   usePolling({
+    enabled: source !== "",
     intervalMs: 3000,
     maxIntervalMs: 30_000,
     resetKey: source,
     task: async (signal) => {
       try {
-        const response = await fetch(source, {
+        const response = await apiFetchRaw(source, {
           method: "GET",
           signal,
           cache: "no-store",

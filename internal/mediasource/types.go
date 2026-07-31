@@ -23,6 +23,7 @@ type Item struct {
 	Description   string
 	ThumbnailPath string
 	ContentRating string
+	Rating        float64 // audience/critic rating from the source, 0 if unknown
 	Genres        []string
 	Path          string
 	Resolution    string // e.g. "1080", "720", "4k"

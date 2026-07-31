@@ -4,20 +4,16 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: scripts/smoke/release-smoke.sh <host> [--timeout <seconds>]
-       scripts/smoke/release-smoke.sh --host <host> [--web-base-url <url>] [--playback-base-url <url>] [--admin-api-url <url>] [--timeout <seconds>]
+       scripts/smoke/release-smoke.sh --base-url <url> [--timeout <seconds>]
 
 Environment:
-  WEB_UI_PORT        Web UI port used with --host (default: 8080)
-  LINEARCAST_PORT    Playback port used with --host (default: 8888)
-  LINEARCAST_ADMIN_PORT  Direct admin API port, only used when --admin-api-url is passed explicitly
-  SMOKE_TIMEOUT      Seconds to wait for health endpoints (default: 30)
+  WEB_UI_PORT    Public nginx port used with <host> (default: 8080)
+  SMOKE_TIMEOUT  Seconds to wait for health endpoints (default: 30)
 EOF
 }
 
 host=""
-web_base_url="${WEB_BASE_URL:-}"
-playback_base_url="${PLAYBACK_BASE_URL:-}"
-admin_api_url="${ADMIN_API_URL:-}"
+base_url="${BASE_URL:-}"
 timeout_seconds="${SMOKE_TIMEOUT:-30}"
 
 while [[ $# -gt 0 ]]; do
@@ -26,21 +22,9 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    --host)
+    --base-url)
       shift
-      host="${1:-}"
-      ;;
-    --web-base-url)
-      shift
-      web_base_url="${1:-}"
-      ;;
-    --playback-base-url)
-      shift
-      playback_base_url="${1:-}"
-      ;;
-    --admin-api-url)
-      shift
-      admin_api_url="${1:-}"
+      base_url="${1:-}"
       ;;
     --timeout)
       shift
@@ -65,13 +49,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$host" ]]; then
-  web_base_url="${web_base_url:-http://$host:${WEB_UI_PORT:-8080}}"
-  playback_base_url="${playback_base_url:-http://$host:${LINEARCAST_PORT:-8888}}"
-  admin_api_url="${admin_api_url:-$web_base_url}"
+  base_url="${base_url:-http://$host:${WEB_UI_PORT:-8080}}"
 fi
 
-if [[ -z "$web_base_url" || -z "$playback_base_url" || -z "$admin_api_url" ]]; then
-  echo "provide --host or all of --web-base-url, --playback-base-url, and --admin-api-url" >&2
+if [[ -z "$base_url" ]]; then
+  echo "provide a host or --base-url" >&2
   usage >&2
   exit 2
 fi
@@ -86,6 +68,18 @@ check_url() {
   local label="$2"
   if ! curl -fsS "$url" >/dev/null; then
     echo "Health check failed: $label ($url)" >&2
+    return 1
+  fi
+}
+
+check_status() {
+  local url="$1"
+  local want="$2"
+  local label="$3"
+  local got
+  got="$(curl -sS -o /dev/null -w '%{http_code}' "$url")"
+  if [[ "$got" != "$want" ]]; then
+    echo "Route check failed: $label ($url) returned $got, want $want" >&2
     return 1
   fi
 }
@@ -106,15 +100,22 @@ wait_for_ok() {
   return "${last_err:-1}"
 }
 
-wait_for_ok "$playback_base_url/healthz" "playback healthz" || exit $?
-wait_for_ok "$admin_api_url/api/healthz" "admin healthz" || exit $?
-wait_for_ok "$web_base_url/healthz" "web healthz" || exit $?
+wait_for_ok "$base_url/healthz" "composed backend healthz" || exit $?
+check_url "$base_url/api/healthz" "admin healthz" || exit $?
+check_url "$base_url/" "web root" || exit $?
+check_url "$base_url/admin" "admin shell" || exit $?
+check_url "$base_url/status" "playback status" || exit $?
+check_url "$base_url/api/playable-sources" "public viewer metadata" || exit $?
+check_status "$base_url/hls/channels/__smoke_missing__/stream.m3u8" "404" "public playback routing" || exit $?
+auth_status="$(curl -fsS "$base_url/api/auth/status")"
+if grep -q '"enabled":true' <<<"$auth_status"; then
+  check_status "$base_url/api/status" "401" "protected admin routing" || exit $?
+else
+  check_status "$base_url/api/status" "200" "intentionally unauthenticated admin routing" || exit $?
+fi
+check_status "$base_url/api/encoder/ping" "401" "encoder bearer-token routing" || exit $?
 
-check_url "$web_base_url/" "web root" || exit $?
-check_url "$web_base_url/admin" "admin shell" || exit $?
-check_url "$playback_base_url/status" "playback status" || exit $?
-
-metrics_body="$(curl -fsS "$playback_base_url/metrics")"
+metrics_body="$(curl -fsS "$base_url/metrics")"
 if ! grep -q '^linearcast_' <<<"$metrics_body"; then
   echo "Health check failed: playback metrics do not expose project metrics" >&2
   exit 1

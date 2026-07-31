@@ -80,10 +80,16 @@
 }
 
 .mp-rail-row.is-draggable {
-  cursor: grab;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
 }
 
-.mp-rail-row.is-draggable:active {
+.mp-rail-row-grip {
+  color: var(--text-muted);
+  cursor: grab;
+  user-select: none;
+}
+
+.mp-rail-row-grip:active {
   cursor: grabbing;
 }
 

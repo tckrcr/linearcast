@@ -349,7 +349,7 @@ export function MaintenancePanel({ onChanged }: { onChanged: () => void }) {
         setStatus(`checked ${preview.checked} media rows; no missing files`);
         return;
       }
-      const msg = `Delete ${preview.missing.length} missing media row(s)? This also removes dependent schedule, history, and package rows.`;
+      const msg = `Delete ${preview.missing.length} missing media row(s)? This also removes dependent schedule and package rows.`;
       if (!window.confirm(msg)) {
         setStatus("missing media cleanup cancelled");
         return;

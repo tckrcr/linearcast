@@ -412,16 +412,16 @@ type ClaimRequest struct {
 }
 
 // ClaimPackage atomically claims a media_packages row for work. It is the
-// single entry point for both local workers (EncoderID="") and remote
-// encoders (EncoderID set). Steps, in one transaction:
+// single entry point for registered local workers, remote encoders, and legacy
+// lease-free/one-shot callers. Steps, in one transaction:
 //
-//  1. Validate the encoder is registered and not revoked (remote only).
+//  1. For leased claims, validate the encoder is registered and not revoked.
 //  2. Resolve channel encoder_policy across every channel referencing the
 //     media; reject the claim if any channel forbids this claim type.
 //  3. Move the package row pending/failed→processing (or insert a fresh row
 //     at processing if missing). Increment attempts, clear error and
 //     last_attempt_error.
-//  4. Insert an encoder_jobs lease row (remote only).
+//  4. For leased claims, insert an encoder_jobs lease row.
 //
 // Returns true when the caller wins the claim. Returns false (with nil err)
 // when the row is already in a state that can't be claimed — e.g. ready,
@@ -706,25 +706,29 @@ func MarkPackageFailedWithKind(ctx context.Context, conn *sql.DB, packageID, kin
 	return newStatus, tx.Commit()
 }
 
-// ChannelProfileReadiness returns packaging coverage counts for all
-// codec-check-passing media in a channel's playlist at the given profile.
+// ChannelProfileReadiness returns packaging coverage counts for all schedulable
+// media in a channel's playlist at the given profile. A ready row without a
+// finalized packaged duration is not counted ready because the scheduler cannot
+// safely derive an entry duration from it.
 func ChannelProfileReadiness(ctx context.Context, conn Execer, channelID, profile string) (ProfileReadiness, error) {
 	r := ProfileReadiness{Profile: profile}
 	err := conn.QueryRowContext(ctx, `
 		SELECT
 		  COUNT(*),
-		  COALESCE(SUM(CASE WHEN p.status = 'ready'      THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN p.status = 'ready' AND p.packaged_duration_ms IS NOT NULL THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN p.status = 'pending'    THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN p.status = 'processing' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN p.status = 'failed'     THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN p.id IS NULL            THEN 1 ELSE 0 END), 0)
 		FROM channel_media cm
 		JOIN media m ON m.id = cm.media_id
+		JOIN channels c ON c.id = cm.channel_id
 		LEFT JOIN media_packages p
 		       ON p.media_id = cm.media_id
 		      AND p.rendition_profile = ?
 		WHERE cm.channel_id = ?
-		  AND m.codec_check_passed = 1`,
+		  AND m.codec_check_passed = 1
+		  AND COALESCE(m.media_kind, 'video') = c.media_kind`,
 		profile, channelID,
 	).Scan(&r.Total, &r.Ready, &r.Pending, &r.Processing, &r.Failed, &r.Missing)
 	return r, err

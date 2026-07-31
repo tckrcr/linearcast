@@ -3,47 +3,14 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/tckrcr/linearcast/internal/playback"
 )
 
 func TestLoadStartupConfigRequiresDatabasePath(t *testing.T) {
 	_, err := loadStartupConfig(linearcastTestEnv(map[string]string{}))
 	if err == nil || !strings.Contains(err.Error(), "LINEARCAST_DB is required") {
 		t.Fatalf("expected DB path error, got %v", err)
-	}
-}
-
-func TestLoadStartupConfigDefaultsClockCheckToStrict(t *testing.T) {
-	cfg, err := loadStartupConfig(linearcastTestEnv(map[string]string{
-		"LINEARCAST_DB": "/tmp/linearcast.db",
-	}))
-	if err != nil {
-		t.Fatalf("load startup config: %v", err)
-	}
-	if cfg.clockCheckMode != clockCheckStrict {
-		t.Fatalf("clockCheckMode=%q, want %q", cfg.clockCheckMode, clockCheckStrict)
-	}
-}
-
-func TestLoadStartupConfigAcceptsDisabledClockCheck(t *testing.T) {
-	cfg, err := loadStartupConfig(linearcastTestEnv(map[string]string{
-		"LINEARCAST_DB":          "/tmp/linearcast.db",
-		"LINEARCAST_CLOCK_CHECK": " disabled ",
-	}))
-	if err != nil {
-		t.Fatalf("load startup config: %v", err)
-	}
-	if cfg.clockCheckMode != clockCheckDisabled {
-		t.Fatalf("clockCheckMode=%q, want %q", cfg.clockCheckMode, clockCheckDisabled)
-	}
-}
-
-func TestLoadStartupConfigRejectsUnknownClockCheck(t *testing.T) {
-	_, err := loadStartupConfig(linearcastTestEnv(map[string]string{
-		"LINEARCAST_DB":          "/tmp/linearcast.db",
-		"LINEARCAST_CLOCK_CHECK": "warn",
-	}))
-	if err == nil || !strings.Contains(err.Error(), "LINEARCAST_CLOCK_CHECK") {
-		t.Fatalf("expected clock check error, got %v", err)
 	}
 }
 
@@ -111,11 +78,11 @@ func TestLoadStartupConfigOnDemandTiming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load startup config: %v", err)
 	}
-	if cfg.onDemandPlaybackLagMs != defaultOnDemandPlaybackLagMs {
-		t.Fatalf("blank lag=%d, want default %d", cfg.onDemandPlaybackLagMs, defaultOnDemandPlaybackLagMs)
+	if cfg.onDemandPlaybackLagMs != playback.DefaultOnDemandPlaybackLagMs {
+		t.Fatalf("blank lag=%d, want default %d", cfg.onDemandPlaybackLagMs, playback.DefaultOnDemandPlaybackLagMs)
 	}
-	if cfg.onDemandWarmupMs != defaultOnDemandWarmupMs {
-		t.Fatalf("blank warmup=%d, want default %d", cfg.onDemandWarmupMs, defaultOnDemandWarmupMs)
+	if cfg.onDemandWarmupMs != playback.DefaultOnDemandWarmupMs {
+		t.Fatalf("blank warmup=%d, want default %d", cfg.onDemandWarmupMs, playback.DefaultOnDemandWarmupMs)
 	}
 
 	cfg, err = loadStartupConfig(linearcastTestEnv(map[string]string{
@@ -192,6 +159,30 @@ func TestLoadStartupConfigAcceptsValidAddr(t *testing.T) {
 		if cfg.addr != addr {
 			t.Fatalf("addr %q: got %q", addr, cfg.addr)
 		}
+	}
+}
+
+func TestLoadStartupConfigAdminSecurity(t *testing.T) {
+	cfg, err := loadStartupConfig(linearcastTestEnv(map[string]string{
+		"LINEARCAST_DB":                  "/tmp/linearcast.db",
+		"LINEARCAST_ADMIN_ALLOW_NO_AUTH": " yes ",
+		"LINEARCAST_ADMIN_COOKIE_SECURE": "true",
+	}))
+	if err != nil {
+		t.Fatalf("load startup config: %v", err)
+	}
+	if !cfg.adminAllowNoAuth || !cfg.adminCookieSecure {
+		t.Fatalf("admin flags not loaded: %+v", cfg)
+	}
+}
+
+func TestLoadStartupConfigRejectsInvalidAdminSecurity(t *testing.T) {
+	_, err := loadStartupConfig(linearcastTestEnv(map[string]string{
+		"LINEARCAST_DB":                  "/tmp/linearcast.db",
+		"LINEARCAST_ADMIN_ALLOW_NO_AUTH": "sometimes",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "LINEARCAST_ADMIN_ALLOW_NO_AUTH") {
+		t.Fatalf("expected admin boolean error, got %v", err)
 	}
 }
 

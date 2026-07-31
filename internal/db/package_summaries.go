@@ -247,7 +247,6 @@ func ChannelPackageNeedSummaries(ctx context.Context, conn *sql.DB) ([]ChannelPa
 		  ON p.media_id = cm.media_id
 		 AND p.rendition_profile = COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)
 		WHERE c.enabled = 1
-		  AND c.playback_mode = ?
 		  AND c.prefill_mode = 'eager'
 		  AND m.codec_check_passed = 1
 		GROUP BY c.id, c.display_name, COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?)
@@ -258,7 +257,6 @@ func ChannelPackageNeedSummaries(ctx context.Context, conn *sql.DB) ([]ChannelPa
 		string(PackageStatusPending),
 		string(PackageStatusFailed),
 		DefaultPackageProfile,
-		string(PlaybackModePackaged),
 		DefaultPackageProfile,
 	)
 }

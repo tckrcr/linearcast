@@ -9,7 +9,6 @@ import {
   restartChannelPlayback as apiRestartPlayback,
   updateChannelArtwork as apiUpdateChannelArtwork,
   updateChannelOnDemandProfile as apiUpdateChannelOnDemandProfile,
-  updateChannelUpstreamHLS as apiUpdateChannelUpstreamHLS,
 } from "../api";
 import { formatBytes } from "../format";
 import type { PackageProfile, RowBusy, RowStatus } from "../types";
@@ -216,20 +215,6 @@ export function useChannelActions({
     }
   }
 
-  async function updateUpstreamHLS(channelID: string, url: string) {
-    setBusy(channelID, true);
-    setStatus(channelID, "saving...");
-    try {
-      await apiUpdateChannelUpstreamHLS(channelID, url);
-      setStatus(channelID, "saved");
-      refreshChannels();
-    } catch (err) {
-      setStatus(channelID, err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(channelID, false);
-    }
-  }
-
   async function changeOnDemandProfile(
     channelID: string,
     displayName: string,
@@ -296,7 +281,6 @@ export function useChannelActions({
     cloneChannel,
     updateArtwork,
     resetArtwork,
-    updateUpstreamHLS,
     changeOnDemandProfile,
   };
 }

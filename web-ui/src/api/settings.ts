@@ -1,5 +1,6 @@
-import type { EncoderSweeperSettings, PublicServerURL, SchedulerTunables, SubtitleSettings } from "../types";
+import type { EncoderSweeperSettings, PublicServerURL, SchedulerTunables } from "../types";
 import { apiFetch } from "./client";
+import type { SubtitleSettingsDTO } from "./dto";
 
 export async function getSchedulerTunables() {
   return apiFetch<SchedulerTunables>("/api/admin/scheduler-tunables", {
@@ -28,13 +29,13 @@ export async function updateEncoderSweeperSettings(settings: EncoderSweeperSetti
 }
 
 export async function getSubtitleSettings() {
-  return apiFetch<SubtitleSettings>("/api/subtitle-settings", {
+  return apiFetch<SubtitleSettingsDTO>("/api/subtitle-settings", {
     cache: "no-store",
   });
 }
 
-export async function updateSubtitleSettings(settings: SubtitleSettings) {
-  return apiFetch<SubtitleSettings>("/api/subtitle-settings", {
+export async function updateSubtitleSettings(settings: SubtitleSettingsDTO) {
+  return apiFetch<SubtitleSettingsDTO>("/api/subtitle-settings", {
     method: "PUT",
     json: settings,
   });

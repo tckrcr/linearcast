@@ -16,8 +16,8 @@ func TestLastPrimaryScheduleEntryUsesEntryKind(t *testing.T) {
 	}
 	defer rw.Close()
 	ctx := context.Background()
-	if err := ApplySchema(ctx, rw); err != nil {
-		t.Fatalf("ApplySchema: %v", err)
+	if err := Migrate(ctx, rw); err != nil {
+		t.Fatalf("Migrate: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms)
 		VALUES ('chA', 'A', '/tmp', 'alphabetical', 1, 0), ('chB', 'B', '/tmp', 'alphabetical', 1, 0)`); err != nil {

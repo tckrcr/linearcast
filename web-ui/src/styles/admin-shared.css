@@ -25,41 +25,6 @@
   font-size: 12px;
 }
 
-
-/* ---------- Episode package status pills (shared) ---------- */
-
-.episode-pkg {
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  white-space: nowrap;
-  color: var(--text-muted);
-}
-
-.episode-pkg-ready {
-  color: var(--good);
-  border-color: rgba(111, 224, 154, 0.3);
-  background: var(--good-bg);
-}
-
-.episode-pkg-failed {
-  color: var(--danger);
-  border-color: rgba(255, 122, 138, 0.3);
-  background: var(--danger-bg);
-}
-
-.episode-pkg-pending {
-  color: var(--warn);
-  border-color: rgba(255, 176, 102, 0.3);
-  background: var(--warn-bg);
-}
-
-.episode-pkg-missing {
-  color: var(--text-dim);
-}
-
 @media (max-width: 900px) {
   .admin-panel {
     width: min(100% - 28px, 1180px);

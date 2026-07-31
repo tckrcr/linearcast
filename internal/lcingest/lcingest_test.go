@@ -329,9 +329,9 @@ func openTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("OpenReadWrite: %v", err)
 	}
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
+	if err := db.Migrate(context.Background(), conn); err != nil {
 		conn.Close()
-		t.Fatalf("ApplySchema: %v", err)
+		t.Fatalf("Migrate: %v", err)
 	}
 	return conn
 }

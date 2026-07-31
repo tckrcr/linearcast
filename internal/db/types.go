@@ -36,13 +36,6 @@ func DefaultPackageProfileForMediaKind(kind MediaKind) string {
 	return DefaultPackageProfile
 }
 
-type PlaybackMode string
-
-const (
-	PlaybackModeGenerated PlaybackMode = "generated"
-	PlaybackModePackaged  PlaybackMode = "packaged"
-)
-
 type PackageStatus string
 
 const (
@@ -62,17 +55,12 @@ type Channel struct {
 	Description            string
 	HiddenFromGuide        bool
 	ArtworkURL             string
-	PlaybackMode           PlaybackMode
 	RequiredPackageProfile string
 	ABRLadder              []string
 	PackagePrefillMs       *int64
 	MediaKind              MediaKind
 	ScheduleMode           string
 	SlotDurationMs         *int64
-	// UpstreamHLSURL is nil for a normal packaged channel; non-nil (the URL,
-	// possibly empty) marks an external/live channel. The nil/non-nil split is
-	// load-bearing — readers gate external-channel behavior on it.
-	UpstreamHLSURL *string
 	// PrefillMode controls how the channel's media is encoded:
 	//   "eager"    — package the entire channel ahead of playback (default)
 	//   "on_demand"— defer encoding until a viewer tunes in
@@ -127,6 +115,7 @@ type Media struct {
 	Description      string
 	ThumbPath        string
 	ContentRating    string
+	Rating           float64 // audience/critic rating from source, 0 if unknown
 	Genres           []string
 }
 
@@ -199,18 +188,6 @@ type ScheduleEntry struct {
 	// value is treated as 'primary' on insert. Full-row readers populate it;
 	// readers that don't select entry_kind leave it empty.
 	Kind string
-}
-
-type PlayHistoryEntry struct {
-	ID              int64
-	ChannelID       string
-	ScheduleEntryID string
-	MediaID         string
-	StartedAtMs     int64
-	EndedAtMs       int64
-	DurationMs      int64
-	MediaTitle      string
-	MediaPath       string
 }
 
 type MediaPackage struct {
@@ -377,7 +354,6 @@ type ChannelWrite struct {
 	DisplayName            string
 	SourceDirectory        string
 	Ordering               string
-	PlaybackMode           PlaybackMode
 	RequiredPackageProfile string
 	ABRLadder              []string
 	PackagePrefillMs       *int64
@@ -385,7 +361,6 @@ type ChannelWrite struct {
 	MediaKind              MediaKind
 	ScheduleMode           string
 	SlotDurationMs         *int64
-	UpstreamHLSURL         *string
 	PrefillMode            string
 }
 

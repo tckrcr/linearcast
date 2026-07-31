@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type Hls from "hls.js";
 import { useHlsPlayer } from "./hooks/useHlsPlayer";
 import { usePlaybackStats } from "./hooks/usePlaybackStats";
+import { apiFetchRaw } from "./api/client";
 import { PlayerControls } from "./PlayerControls";
 import { formatMs, mediaTitle } from "./format";
 import type { LiveSlot } from "./playbackClock";
@@ -47,6 +48,7 @@ type PlayerProps = {
   probe: StreamProbe;
   activeSource: PlayableSource | null;
   nowSlot: LiveSlot;
+  sourcesLoaded: boolean;
   hasSources: boolean;
   onStats: (stats: PlaybackStats) => void;
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -65,6 +67,7 @@ export function Player({
   probe,
   activeSource,
   nowSlot,
+  sourcesLoaded,
   hasSources,
   onStats,
   videoRef,
@@ -148,7 +151,7 @@ export function Player({
       )}
       {probe.status !== "ready" && !subtitleSwitching && !stats.streamUnavailable && !stats.fatalError && (
         <div className="player-overlay">
-          {!hasSources ? (
+          {sourcesLoaded && !hasSources ? (
             <>
               <strong>No channels configured</strong>
               <span>Create a channel in the admin panel to get started.</span>
@@ -238,7 +241,7 @@ async function waitForManifestReady(source: string): Promise<void> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(source, { cache: "no-store" });
+      const res = await apiFetchRaw(source, { cache: "no-store" });
       if (res.ok) return;
     } catch {
       // Keep polling through transient network errors while the encoder warms.

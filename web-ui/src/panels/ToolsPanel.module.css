@@ -73,7 +73,7 @@
 .settings-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .settings-table th,
@@ -121,25 +121,6 @@
 
 .settings-value select {
   width: 130px;
-}
-
-/* Spotify URL value cell: input plus advisory test/status/now-playing lines. */
-.spotify-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 12px;
-}
-
-.spotify-cell-meta {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.spotify-cell .link-button {
-  font-size: 12px;
 }
 
 .settings-desc {

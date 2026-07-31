@@ -1,6 +1,8 @@
-// cmd/linearcast-extender is a long-running writer that keeps every
-// enabled channel's schedule covered out to a target horizon. It reuses
-// internal/scheduler to extend each channel when the remaining future
+// cmd/linearcast-extender is a long-running writer that normally keeps every
+// enabled channel's schedule covered out to a target horizon. While an eager,
+// back-to-back channel is still packaging, it intentionally extends only
+// through the next contiguous ready playlist run and resumes on a later tick.
+// It reuses internal/scheduler to extend each channel when the remaining future
 // drops below a low-water mark.
 //
 // Linearcast itself stays read-only on the database; the extender is the
@@ -51,9 +53,6 @@ func main() {
 	}
 	defer conn.Close()
 
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		log.Fatalf("apply schema: %v", err)
-	}
 	if err := db.VerifySchema(context.Background(), conn); err != nil {
 		log.Fatalf("verify schema: %v", err)
 	}
@@ -84,9 +83,10 @@ func main() {
 }
 
 // loadConfig assembles the runtime config from the DB. The settings table is
-// seeded by ApplySchema, so on a fresh install we get the package defaults
-// (24/23/300); operators change them from the admin UI. Changes only take
-// effect on the next process restart — the ticker is built once here.
+// seeded by the canonical migration command, so on a fresh install we get the
+// package defaults (24/23/300); operators change them from the admin UI.
+// Changes only take effect on the next process restart — the ticker is built
+// once here.
 func loadConfig(conn *sql.DB, dbPath string) (config, error) {
 	tunables, err := db.GetSchedulerTunables(context.Background(), conn)
 	if err != nil {
@@ -114,10 +114,9 @@ func loadConfig(conn *sql.DB, dbPath string) (config, error) {
 
 func tick(ctx context.Context, conn *sql.DB, cfg config) {
 	result, err := scheduler.ExtendAllEnabled(ctx, conn, scheduler.ServiceOptions{
-		HorizonHours:             cfg.horizonHours,
-		LowWaterHours:            cfg.lowWaterHours,
-		RenditionProfile:         cfg.packageProfile,
-		BootstrapRequireAllReady: true,
+		HorizonHours:     cfg.horizonHours,
+		LowWaterHours:    cfg.lowWaterHours,
+		RenditionProfile: cfg.packageProfile,
 	})
 	if err != nil {
 		log.Printf("ERROR extend enabled channels: %v", err)
@@ -131,10 +130,12 @@ func tick(ctx context.Context, conn *sql.DB, cfg config) {
 		if ch.SkippedLowWater {
 			continue
 		}
-		if ch.BootstrapDelayed {
-			log.Printf("channel=%s bootstrap delayed ready=%d total=%d profile=%s",
-				ch.ChannelID, ch.BootstrapReady, ch.BootstrapTotal, ch.RenditionProfile)
-			continue
+		if ch.ReadinessLimited {
+			log.Printf("channel=%s extension limited by package readiness ready=%d total=%d profile=%s inserted=%d",
+				ch.ChannelID, ch.ReadyMedia, ch.TotalMedia, ch.RenditionProfile, ch.Inserted)
+			if ch.Inserted == 0 {
+				continue
+			}
 		}
 		log.Printf("channel=%s extending remaining_ms=%d horizon_hours=%d require_packages=%t profile=%s",
 			ch.ChannelID, ch.RemainingMs, cfg.horizonHours, ch.RequireReadyPackages, ch.RenditionProfile)

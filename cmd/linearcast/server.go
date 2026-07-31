@@ -6,32 +6,28 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/tckrcr/linearcast/internal/playback"
 )
 
-func (a *app) routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /channels/{channelID}/stream.m3u8", a.handleManifest)
-	mux.HandleFunc("GET /channels/{channelID}/"+streamPath+"/{profile}/stream.m3u8", a.handleRenditionManifest)
-	mux.HandleFunc("GET /channels/{channelID}/"+streamPath+"/{profile}/init/{packageID}/init.mp4", a.handlePackagedInit)
-	mux.HandleFunc("GET /channels/{channelID}/"+streamPath+"/{profile}/segments/{packageID}/{name}", a.handlePackagedSegment)
-	mux.HandleFunc("GET /channels/{channelID}/"+encodingPath+"/{encodingID}/init.mp4", a.handleEncodingInit)
-	mux.HandleFunc("GET /channels/{channelID}/"+encodingPath+"/{encodingID}/{name}", a.handleEncodingSegment)
-	mux.HandleFunc("GET /channels/{channelID}/"+streamPath+"/{profile}/subs/{language}/playlist.m3u8", a.handleSubtitlePlaylist)
-	mux.HandleFunc("GET /channels/{channelID}/"+streamPath+"/{profile}/subs/{packageID}/{name}", a.handleSubtitleVTT)
-	mux.HandleFunc("GET /channels/{channelID}/"+streamPath+"/{profile}/subs/empty.vtt", a.handleEmptySubtitle)
-	mux.HandleFunc("GET /channels/{channelID}/"+streamPath+"/{profile}/"+onDemandSubtitlePath+"/{rest...}", a.handleOnDemandSubtitleFile)
-	mux.HandleFunc("GET /channels/{channelID}/subtitles", a.handleBurnSubtitleList)
-	mux.HandleFunc("POST /channels/{channelID}/subtitles", a.handleBurnSubtitleSet)
-	mux.HandleFunc("POST /channels/{channelID}/ondemand/restart", a.handleOnDemandRestart)
-	mux.HandleFunc("GET /channels/{channelID}/now", a.handleNow)
-	mux.HandleFunc("GET /channels/{channelID}/direct-play", a.handleDirectPlay)
-	mux.HandleFunc("GET /external/{channelID}/stream.m3u8", a.handleExternalHLSManifest)
-	mux.HandleFunc("GET /external/{channelID}/proxy/{path...}", a.handleExternalHLSProxy)
-	mux.HandleFunc("GET /healthz", a.handleHealth)
-	mux.HandleFunc("GET /readyz", a.handleReady)
-	mux.HandleFunc("GET /status", a.handleStatus)
-	mux.Handle("GET /metrics", promhttp.Handler())
-	return requestLogMiddleware(mux)
+func composeRoutes(
+	playbackHandler http.Handler,
+	adminHandler http.Handler,
+	readiness playback.ReadinessChecker,
+	status playback.StatusProvider,
+) http.Handler {
+	service := serviceEndpoints{readiness: readiness, status: status}
+	public := http.NewServeMux()
+	public.HandleFunc("GET /healthz", service.handleHealth)
+	public.HandleFunc("GET /readyz", service.handleReady)
+	public.HandleFunc("GET /status", service.handleStatus)
+	public.Handle("GET /metrics", promhttp.Handler())
+	public.Handle("/channels/", playbackHandler)
+
+	composed := http.NewServeMux()
+	composed.Handle("/api/", adminHandler)
+	composed.Handle("/", requestLogMiddleware(public))
+	return composed
 }
 
 // requestLogMiddleware logs every HTTP request with method, path, status, and

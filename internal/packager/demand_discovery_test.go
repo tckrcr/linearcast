@@ -20,8 +20,8 @@ func TestDiscoverCandidatesExcludesOnDemandButPicksUpEnqueued(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled,
-		created_at_ms, playback_mode, required_package_profile, prefill_mode)
-		VALUES ('od', 'On Demand', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 'on_demand')`); err != nil {
+		created_at_ms, required_package_profile, prefill_mode)
+		VALUES ('od', 'On Demand', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 'on_demand')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,

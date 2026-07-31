@@ -225,8 +225,7 @@ func PackageProfileReferencesForName(ctx context.Context, conn *sql.DB, name str
 	if err := conn.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM channels c
-		WHERE c.upstream_hls_url IS NULL
-		  AND (
+		WHERE (
 		  	COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?) = ?
 		  	OR EXISTS (
 		  		SELECT 1
@@ -246,8 +245,7 @@ func PackageProfileReferencesForName(ctx context.Context, conn *sql.DB, name str
 		SELECT COUNT(*)
 		FROM schedule_entries se
 		JOIN channels c ON c.id = se.channel_id
-		WHERE c.upstream_hls_url IS NULL
-		  AND (
+		WHERE (
 		  	COALESCE(NULLIF(TRIM(c.required_package_profile), ''), ?) = ?
 		  	OR EXISTS (
 		  		SELECT 1

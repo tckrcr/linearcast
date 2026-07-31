@@ -45,10 +45,6 @@ func TestEnabledChannelsAndSchedule(t *testing.T) {
 	if len(chans) != 1 || chans[0].ID != "ch1" {
 		t.Fatalf("want ch1 only, got %+v", chans)
 	}
-	if chans[0].PlaybackMode != PlaybackModePackaged {
-		t.Fatalf("default playback mode = %q, want packaged", chans[0].PlaybackMode)
-	}
-
 	entries, err := ScheduleWindow(context.Background(), ro, "ch1", 0, 12000)
 	if err != nil {
 		t.Fatalf("schedule window: %v", err)
@@ -72,7 +68,7 @@ func TestEnabledChannelsAndSchedule(t *testing.T) {
 	}
 }
 
-func TestChannelPlaybackPolicy(t *testing.T) {
+func TestChannelPolicy(t *testing.T) {
 	path := newTestDB(t)
 	rw, err := OpenReadWrite(path)
 	if err != nil {
@@ -89,13 +85,12 @@ func TestChannelPlaybackPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("channel by id: %v", err)
 	}
-	if ch.PlaybackMode != PlaybackModePackaged || ch.RequiredPackageProfile != "" || ch.PackagePrefillMs != nil {
+	if ch.RequiredPackageProfile != "" || ch.PackagePrefillMs != nil {
 		t.Fatalf("unexpected default policy: %+v", ch)
 	}
 
 	prefill := int64(86400000)
-	updated, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModePackaged,
-		"h264-1080p-8mbps", nil, &prefill, MediaKindVideo)
+	updated, err := UpdateChannelPolicy(context.Background(), rw, "ch1", "h264-1080p-8mbps", nil, &prefill, MediaKindVideo)
 	if err != nil || !updated {
 		t.Fatalf("update packaged policy updated=%v err=%v", updated, err)
 	}
@@ -103,17 +98,13 @@ func TestChannelPlaybackPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("channel by id after update: %v", err)
 	}
-	if ch.PlaybackMode != PlaybackModePackaged ||
-		ch.RequiredPackageProfile != "h264-1080p-8mbps" || ch.PackagePrefillMs == nil ||
+	if ch.RequiredPackageProfile != "h264-1080p-8mbps" || ch.PackagePrefillMs == nil ||
 		*ch.PackagePrefillMs != 86400000 {
 		t.Fatalf("unexpected packaged policy: %+v", ch)
 	}
 
-	if _, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModePackaged, "", nil, nil, MediaKindVideo); err != nil {
+	if _, err := UpdateChannelPolicy(context.Background(), rw, "ch1", "", nil, nil, MediaKindVideo); err != nil {
 		t.Fatalf("expected packaged policy without profile to default successfully: %v", err)
-	}
-	if _, err := UpdateChannelPlaybackPolicy(context.Background(), rw, "ch1", PlaybackModeGenerated, "", nil, nil, MediaKindVideo); err == nil {
-		t.Fatalf("expected generated policy to fail")
 	}
 }
 
@@ -168,7 +159,6 @@ func TestInsertChannelWritesHiddenFromGuideFalse(t *testing.T) {
 			description TEXT,
 			hidden_from_guide INTEGER,
 			artwork_url TEXT,
-			playback_mode TEXT NOT NULL DEFAULT 'packaged',
 			required_package_profile TEXT,
 			abr_ladder_json TEXT,
 			package_prefill_ms INTEGER,
@@ -176,7 +166,6 @@ func TestInsertChannelWritesHiddenFromGuideFalse(t *testing.T) {
 			media_kind TEXT NOT NULL DEFAULT 'video',
 			schedule_mode TEXT NOT NULL DEFAULT 'back_to_back',
 			slot_duration_ms INTEGER,
-			upstream_hls_url TEXT,
 			prefill_mode TEXT NOT NULL DEFAULT 'eager'
 		)`); err != nil {
 		t.Fatalf("create legacy channels table: %v", err)
@@ -210,10 +199,10 @@ func TestCloneChannelCopiesConfigAndMediaWithoutSchedule(t *testing.T) {
 
 	if _, err := rw.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			description, playback_mode, required_package_profile, package_prefill_ms
+			description, required_package_profile, package_prefill_ms
 		)
 		VALUES ('ch1', 'Channel One', '/tmp/src', 'block', 1, 1000,
-			'desc', 'packaged', 'h264-1080p-8mbps', 86400000)`); err != nil {
+			'desc', 'h264-1080p-8mbps', 86400000)`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -241,7 +230,6 @@ func TestCloneChannelCopiesConfigAndMediaWithoutSchedule(t *testing.T) {
 	if clone.SourceDirectory != "/tmp/src" || clone.Ordering != "block" || clone.Enabled ||
 		clone.CreatedAtMs != 2000 || clone.Description != "desc" ||
 		clone.HiddenFromGuide ||
-		clone.PlaybackMode != PlaybackModePackaged ||
 		clone.RequiredPackageProfile != "h264-1080p-8mbps" ||
 		clone.PackagePrefillMs == nil || *clone.PackagePrefillMs != 86400000 {
 		t.Fatalf("clone did not preserve config: %+v", clone)
@@ -297,46 +285,5 @@ func TestCloneChannelMissingReturnsNoRows(t *testing.T) {
 	_, err = CloneChannel(context.Background(), rw, "missing", 0)
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("err=%v, want sql.ErrNoRows", err)
-	}
-}
-
-func TestExternalChannelReturnsSingletonOrNil(t *testing.T) {
-	path := newTestDB(t)
-	rw, err := OpenReadWrite(path)
-	if err != nil {
-		t.Fatalf("open rw: %v", err)
-	}
-	defer rw.Close()
-
-	// No external channel configured yet.
-	got, err := ExternalChannel(context.Background(), rw)
-	if err != nil {
-		t.Fatalf("external (none): %v", err)
-	}
-	if got != nil {
-		t.Fatalf("want nil external channel, got %+v", got)
-	}
-
-	// A packaged channel (no upstream_hls_url) must not count as external.
-	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms)
-        VALUES ('packaged', 'Packaged', '/tmp', 'alphabetical', 1, 0)`); err != nil {
-		t.Fatalf("insert packaged: %v", err)
-	}
-	if got, err := ExternalChannel(context.Background(), rw); err != nil || got != nil {
-		t.Fatalf("packaged channel must not be external: got=%+v err=%v", got, err)
-	}
-
-	// Two external channels: the lowest id wins deterministically.
-	if _, err := rw.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms, upstream_hls_url)
-        VALUES ('zeta', 'Zeta', '', 'alphabetical', 1, 0, 'https://example.com/z.m3u8'),
-               ('alpha', 'Alpha', '', 'alphabetical', 1, 0, 'https://example.com/a.m3u8')`); err != nil {
-		t.Fatalf("insert external: %v", err)
-	}
-	got, err = ExternalChannel(context.Background(), rw)
-	if err != nil {
-		t.Fatalf("external: %v", err)
-	}
-	if got == nil || got.ID != "alpha" || got.UpstreamHLSURL == nil || *got.UpstreamHLSURL != "https://example.com/a.m3u8" {
-		t.Fatalf("want alpha external channel, got %+v", got)
 	}
 }

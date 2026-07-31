@@ -9,11 +9,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+// Shared production thresholds used by both the realtime scrape collector and
+// playback's operator-facing degraded signals.
+const (
+	DefaultDiskFreeThresholdGB = 5
+	DefaultCapacityUtilization = 1.0
+)
+
 var (
-	PackageQueueDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "linearcast_package_queue_depth",
-		Help: "Current package rows by rendition profile and bounded status.",
-	}, []string{"rendition_profile", "status"})
 	PackageJobDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "linearcast_package_job_duration_seconds",
 		Help:    "Package worker job duration by rendition profile and result.",
@@ -54,14 +57,6 @@ var (
 		Name: "linearcast_schedule_files_written_total",
 		Help: "Schedule files written by the scheduler.",
 	})
-	ScheduleRunwaySeconds = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "linearcast_schedule_runway_seconds",
-		Help: "Seconds between now and the latest schedule horizon end.",
-	})
-	ScheduleRunwayByChannelSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "linearcast_schedule_runway_by_channel_seconds",
-		Help: "Seconds between now and each channel's latest schedule entry end.",
-	}, []string{"channel_id"})
 	ScheduleEntriesWrittenTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "linearcast_schedule_entries_written_total",
 		Help: "Schedule entries written by the scheduler.",
@@ -83,18 +78,6 @@ var (
 		Name: "linearcast_schedule_policy_picks_total",
 		Help: "Scheduler media picks by daypart and whether a daypart-tagged pool was active.",
 	}, []string{"daypart", "tagged"})
-	PackageReadyDurationMs = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "linearcast_package_ready_duration_ms",
-		Help: "Total packaged_duration_ms of all ready packages per channel.",
-	}, []string{"channel_id", "rendition_profile"})
-	ScheduleGapCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "linearcast_schedule_gap_count",
-		Help: "Number of schedule gaps exceeding threshold per channel.",
-	}, []string{"channel_id"})
-	ScheduleGapActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "linearcast_schedule_gap_active",
-		Help: "1 if now falls inside a schedule gap for the channel, 0 otherwise.",
-	}, []string{"channel_id"})
 
 	OnDemandEncodingSpawnsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "linearcast_on_demand_encoding_spawns_total",

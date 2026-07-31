@@ -25,28 +25,7 @@ export type CacheStatus = {
   latestGeneratedAt?: string;
 };
 
-// "live" / "down" are reported for external (live-proxy) channels by the admin
-// reachability heartbeat; "unknown" before the first probe resolves.
-export type ChannelStatus = "playing" | "gap" | "unscheduled" | "live" | "down" | "unknown" | string;
-
-export type NowPlaying = {
-  title?: string;
-  artist?: string;
-  album?: string;
-  artUrl?: string;
-  playing: boolean;
-};
-
-// SpotifyUrl is the singleton Spotify→HLS URL. configured is false when none is
-// set.
-export type SpotifyUrl = {
-  configured: boolean;
-  channelId?: string;
-  displayName?: string;
-  upstreamHlsUrl?: string;
-  status?: ChannelStatus;
-  nowPlaying?: NowPlaying;
-};
+export type ChannelStatus = "playing" | "gap" | "unscheduled" | "unknown" | string;
 
 export type ChannelNow = {
   id: string;
@@ -69,10 +48,6 @@ export type ChannelNow = {
   packageCoverageHours: number;
   packageReadyCount: number;
   packageProfile: string;
-  playbackMode?: string;
-  isExternal?: boolean;
-  upstreamHlsUrl?: string;
-  nowPlaying?: NowPlaying;
   cache?: CacheStatus;
 };
 
@@ -85,7 +60,7 @@ export type PlayableSource = {
   id: string;
   displayName: string;
   artworkUrl?: string;
-  kind: "vod" | "live" | string;
+  kind: "vod" | string;
   playbackType: "hls" | string;
   status: ChannelStatus;
   manifestUrl: string;
@@ -99,8 +74,6 @@ export type PlayableSource = {
   packageProfile?: string;
   adaptiveBitrate?: boolean;
   prefillMode?: "eager" | "on_demand" | string;
-  playbackMode?: string;
-  nowPlaying?: NowPlaying;
 };
 
 export type PlayableSourcesResponse = {
@@ -125,11 +98,9 @@ export type GuideChannel = {
   displayName: string;
   artworkUrl?: string;
   status: ChannelStatus;
-  isExternal?: boolean;
   prefillMode?: "eager" | "on_demand" | string;
   scheduleMode?: "back_to_back" | "slot_grid" | string;
   slotDurationMs?: number;
-  nowPlaying?: NowPlaying;
   // End of the channel's last scheduled entry; used to stop paging the guide
   // past where a schedule has actually been built.
   scheduleEndMs?: number;
@@ -184,7 +155,6 @@ export type EncoderSweeperSettings = {
 
 export type ChannelPolicy = {
   channelId: string;
-  playbackMode: string;
   requiredPackageProfile: string;
   adaptiveBitrate: boolean;
   packagePrefillMs: number | null;
@@ -843,11 +813,10 @@ export type ScheduleEditTarget =
 export type DraftChannelConfig = {
   packageProfile: string;
   displayName: string;
-	playbackMode?: "packaged";
   scheduleMode?: "back_to_back" | "slot_grid" | string;
   slotDurationMs?: number;
   prefillMode?: "eager" | "on_demand";
-  adaptiveBitrate?: string;
+  adaptiveBitrate?: "cpu" | "hdr";
   onImported: (channelId: string, result: { scheduleMode?: "back_to_back" | "slot_grid" | string }) => void;
 };
 
@@ -866,4 +835,15 @@ export type ScheduleInsertItem = {
 export type ScheduleDraftEntry = ChannelSchedule["entries"][number] & {
   draftId: string;
   needsPackage?: boolean;
+};
+
+export type DegradedSignal = {
+  signal: string;
+  degraded: boolean;
+  detail: string;
+};
+
+export type DegradedResponse = {
+  signals: DegradedSignal[];
+  degraded: boolean;
 };

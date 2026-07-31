@@ -11,8 +11,8 @@ import (
 )
 
 // These characterize the JSON wire shape of the row-projection types
-// (ChannelMediaPackageRow, ChannelFillerAsset, MediaPackageCandidate,
-// PlayHistoryEntry) across the A1 de-leak that flips Title/SchedulingGroup
+// (ChannelMediaPackageRow, ChannelFillerAsset, MediaPackageCandidate)
+// across the A1 de-leak that flips Title/SchedulingGroup
 // from sql.NullString → string and package-projection fields
 // (PackageID, PackageStatus, etc.) from sql.Null* → pointer/*string.
 // The handler signatures and response structs are unchanged,
@@ -24,7 +24,7 @@ func TestHandleChannelMediaNullFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertMedia(t, conn, "ep1", 12000)
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-null', 'Null Field', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+		required_package_profile) VALUES ('ch-null', 'Null Field', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -53,7 +53,7 @@ func TestHandleChannelMediaSetFieldsWireShape(t *testing.T) {
 		t.Fatalf("set fields: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-set', 'Set Field', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+		required_package_profile) VALUES ('ch-set', 'Set Field', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
@@ -81,7 +81,7 @@ func TestHandleChannelMediaSetFieldsWireShape(t *testing.T) {
 func TestHandleChannelFillerAssetsNullFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-fa-null', 'Null FA', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+		required_package_profile) VALUES ('ch-fa-null', 'Null FA', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	insertMedia(t, conn, "fa1", 30000)
@@ -111,7 +111,7 @@ func TestHandleChannelFillerAssetsNullFieldsWireShape(t *testing.T) {
 func TestHandleChannelFillerAssetsSetFieldsWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	if _, err := conn.Exec(`INSERT INTO channels (id, display_name, source_directory, ordering, enabled, created_at_ms,
-		playback_mode, required_package_profile) VALUES ('ch-fa-set', 'Set FA', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+		required_package_profile) VALUES ('ch-fa-set', 'Set FA', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	insertMedia(t, conn, "fa2", 45000)
@@ -171,7 +171,10 @@ func TestHandleMediaPackageCandidatesNullTitleGroupWireShape(t *testing.T) {
 func TestHandleMediaPackageCandidatesSetTitleGroupWireShape(t *testing.T) {
 	app, conn := testAdminApp(t)
 	insertMedia(t, conn, "cand-set", 24000)
-	if _, err := conn.Exec(`UPDATE media SET title = 'Candidate Title', scheduling_group = 'Group C', source_ref = 'plex://101' WHERE id = 'cand-set'`); err != nil {
+	if _, err := conn.Exec(`UPDATE media
+		SET title = 'Candidate Title', scheduling_group = 'Group C', source_ref = 'plex://101',
+		    season_number = 2, episode_number = 3, rating = 8.5
+		WHERE id = 'cand-set'`); err != nil {
 		t.Fatalf("set fields: %v", err)
 	}
 	pkgBytes := int64(123456)
@@ -196,8 +199,9 @@ func TestHandleMediaPackageCandidatesSetTitleGroupWireShape(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
+	responseBody := res.Body.Bytes()
 	var body mediaPackageCandidateResponse
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(responseBody, &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(body.Media) != 1 {
@@ -210,63 +214,15 @@ func TestHandleMediaPackageCandidatesSetTitleGroupWireShape(t *testing.T) {
 	if e.PackageBytes == nil || *e.PackageBytes != pkgBytes {
 		t.Fatalf("packageBytes=%v, want %d", e.PackageBytes, pkgBytes)
 	}
-}
-
-// --- ChannelHistory endpoint (PlayHistoryEntry) ---
-
-func TestHandleChannelHistoryMediaFieldsWireShape(t *testing.T) {
-	app, conn := testAdminApp(t)
-	// The fixture inserts media m1 with NULL title and path /tmp/m1.mkv.
-	insertDeleteFixture(t, conn, true)
-
-	// Insert a second entry with a set title.
-	insertMedia(t, conn, "m2", 12000)
-	if _, err := conn.Exec(`UPDATE media SET title = 'History Title' WHERE id = 'm2'`); err != nil {
-		t.Fatalf("set title: %v", err)
+	var raw struct {
+		Media []map[string]json.RawMessage `json:"media"`
 	}
-	var tailAnchor string
-	if err := conn.QueryRow(`SELECT id FROM schedule_entries WHERE channel_id = 'ch' ORDER BY start_ms DESC LIMIT 1`).Scan(&tailAnchor); err != nil {
-		t.Fatalf("read tail: %v", err)
+	if err := json.Unmarshal(responseBody, &raw); err != nil {
+		t.Fatalf("decode raw response: %v", err)
 	}
-	e2 := db.ScheduleEntry{ID: "hist-m2", ChannelID: "ch", StartMs: 42000, MediaID: "m2", OffsetMs: 0, DurationMs: 12000, AnchorScheduleEntryID: &tailAnchor}
-	if _, err := conn.Exec(`INSERT INTO schedule_entries (id, channel_id, start_ms, media_id, offset_ms, duration_ms, anchor_schedule_entry_id, created_at_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 0)`, e2.ID, e2.ChannelID, e2.StartMs, e2.MediaID, e2.OffsetMs, e2.DurationMs, tailAnchor); err != nil {
-		t.Fatalf("insert e2: %v", err)
-	}
-	if _, err := db.RecordPlayHistory(context.Background(), conn, e2); err != nil {
-		t.Fatalf("record history: %v", err)
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/api/channels/ch/history?since=1", nil)
-	req.SetPathValue("channelID", "ch")
-	res := httptest.NewRecorder()
-	app.handleChannelHistory(res, req)
-
-	if res.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
-	}
-	var body playHistoryResponse
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	byID := map[string]playHistoryAPIEntry{}
-	for _, e := range body.Entries {
-		byID[e.ScheduleEntryID] = e
-	}
-	// m2 has set title, m1 has NULL title.
-	if e := byID[e2.ID]; e.MediaTitle != "History Title" || e.MediaPath != "/tmp/m2.mkv" {
-		t.Fatalf("m2 history entry mismatch: %+v", e)
-	}
-	// m1 from fixture: the fixture creates the first entry in insertDeleteFixture.
-	// The fixture entry has a random ID, so find it by media_id.
-	for _, e := range body.Entries {
-		if e.MediaID == "m1" && e.DurationMs == 18000 {
-			if e.MediaTitle != "" {
-				t.Fatalf("m1 NULL title should be empty, got %q", e.MediaTitle)
-			}
-			if e.MediaPath != "/tmp/m1.mkv" {
-				t.Fatalf("m1 path mismatch: got %q", e.MediaPath)
-			}
+	for _, field := range []string{"seasonNumber", "episodeNumber", "rating"} {
+		if _, ok := raw.Media[0][field]; ok {
+			t.Fatalf("candidate response unexpectedly contains inventory field %q: %s", field, res.Body.String())
 		}
 	}
 }

@@ -4,12 +4,10 @@ import { ChannelArtwork } from "./ChannelArtwork";
 import { ChannelGuide } from "./ChannelGuide";
 import { Dialog } from "./Dialog";
 import {
-  describeProbeResult,
   getMediaPackageProfileList,
   getAdminAuthStatus,
   logoutAdmin,
   UNAUTHORIZED_EVENT,
-  probeUpstreamHLS,
   useAdminNow,
   useChannelList,
 } from "./api";
@@ -37,6 +35,9 @@ const ToolsPanel = lazy(() =>
 const ScheduleBuilderPanel = lazy(() =>
   import("./panels/ScheduleBuilderPanel").then((m) => ({ default: m.ScheduleBuilderPanel }))
 );
+const OverviewPanel = lazy(() =>
+  import("./panels/OverviewPanel").then((m) => ({ default: m.OverviewPanel }))
+);
 import type {
   ChannelNow,
   ChannelSummary,
@@ -44,7 +45,7 @@ import type {
 } from "./types";
 
 const SCHEDULE_WARN_HOURS = 6;
-const ADMIN_PANEL_IDS = new Set(["guide", "library", "sources", "tools", "encoding", "profiles", "schedule"]);
+const ADMIN_PANEL_IDS = new Set(["overview", "guide", "library", "sources", "tools", "encoding", "profiles", "schedule"]);
 const SIDEBAR_AUTO_CLOSE_QUERY = "(max-width: 900px)";
 const NON_ERROR_STATUS_PREFIXES = [
   "queueing package run",
@@ -190,7 +191,7 @@ function AdminWorkspace({
   const { data: adminNow } = useAdminNow(15000);
   const { channels: allChannels, loaded: channelsLoaded, refresh: refreshChannels } = useChannelList(60000);
 
-  const [selected, setSelected] = useState<string>("library"); // channelID or an ADMIN_PANEL_IDS value
+  const [selected, setSelected] = useState<string>("overview"); // channelID or an ADMIN_PANEL_IDS value
   // Once the Inventory panel has been opened we keep it mounted (hidden when
   // another view is active) so returning to it is instant and doesn't re-run
   // its inventory query.
@@ -208,6 +209,11 @@ function AdminWorkspace({
   // When the schedule panel is open in edit mode this holds the channel to
   // preload; null means the panel is building a brand-new channel.
   const [scheduleChannelId, setScheduleChannelId] = useState<string | null>(null);
+  // Keep a fresh-channel draft mounted while the operator checks another admin
+  // panel. Existing-channel editing remains ephemeral and separate so it can
+  // never overwrite the preserved fresh draft.
+  const [freshScheduleVisited, setFreshScheduleVisited] = useState(false);
+  const [freshScheduleKey, setFreshScheduleKey] = useState(0);
   const {
     rowBusy,
     rowStatus,
@@ -219,7 +225,6 @@ function AdminWorkspace({
     deleteChannel,
     cloneChannel,
     updateArtwork,
-    updateUpstreamHLS,
     changeOnDemandProfile,
   } = useChannelActions({
     allowedProfiles,
@@ -287,6 +292,17 @@ function AdminWorkspace({
     if (window.matchMedia(SIDEBAR_AUTO_CLOSE_QUERY).matches) setSidebarOpen(false);
   }
 
+  // Opening an admin panel by id. The schedule builder needs its draft state
+  // reset to "brand new channel" first, so every entry point into it — the
+  // sidebar and the overview's empty state — goes through here.
+  function openPanel(panel: string) {
+    if (panel === "schedule") {
+      setScheduleChannelId(null);
+      setFreshScheduleVisited(true);
+    }
+    selectChannel(panel);
+  }
+
   async function logout() {
     await logoutAdmin().catch(() => {});
     onLogout();
@@ -321,6 +337,13 @@ function AdminWorkspace({
       <div className="admin-page-body">
         {/* Sidebar */}
         <nav className={`admin-sidebar${sidebarOpen ? "" : " is-collapsed"}`} aria-hidden={!sidebarOpen}>
+          <button
+            type="button"
+            className={`admin-sidebar-item${selected === "overview" ? " is-selected" : ""}`}
+            onClick={() => selectChannel("overview")}
+          >
+            Overview
+          </button>
           <button
             type="button"
             className={`admin-sidebar-item${selected === "guide" ? " is-selected" : ""}`}
@@ -366,12 +389,9 @@ function AdminWorkspace({
           <button
             type="button"
             className={`admin-sidebar-item${selected === "schedule" ? " is-selected" : ""}`}
-            onClick={() => {
-              setScheduleChannelId(null);
-              selectChannel("schedule");
-            }}
+            onClick={() => openPanel("schedule")}
           >
-            Schedule builder
+            Create channel
           </button>
 
           {enabledChannels.length > 0 && (
@@ -412,6 +432,19 @@ function AdminWorkspace({
         {/* Main panel */}
         <main className="admin-main">
           <Suspense fallback={<div className="admin-panel"><section className="admin-panel-section"><p className="muted">loading…</p></section></div>}>
+          {selected === "overview" && (
+            <OverviewPanel
+              channels={enabledChannels}
+              loaded={adminNow !== null && channelsLoaded}
+              disabledCount={disabledChannels.length}
+              busy={rowBusy}
+              status={rowStatus}
+              onSelectChannel={selectChannel}
+              onOpenPanel={openPanel}
+              onExtend={(id, hours) => void extendSchedule(id, hours)}
+            />
+          )}
+
           {selected === "guide" && (
             <div className="admin-panel">
               <section className="admin-panel-section">
@@ -428,7 +461,7 @@ function AdminWorkspace({
             </div>
           )}
 
-          {selected === "tools" && <ToolsPanel onChannelChanged={refreshChannels} />}
+			{selected === "tools" && <ToolsPanel />}
 
           {libraryVisited && (
             <div style={{ display: selected === "library" ? undefined : "none" }}>
@@ -446,13 +479,27 @@ function AdminWorkspace({
 
           {selected === "profiles" && <ProfilesPanel />}
 
-          {selected === "schedule" && (
+          {freshScheduleVisited && (
+            <div style={{ display: selected === "schedule" && scheduleChannelId === null ? undefined : "none" }}>
+              <ScheduleBuilderPanel
+                key={freshScheduleKey}
+                active={selected === "schedule" && scheduleChannelId === null}
+                onChannelImported={() => {
+                  refreshChannels();
+                  setFreshScheduleKey((current) => current + 1);
+                  selectChannel("library");
+                }}
+                onOpenMediaSources={() => selectChannel("sources")}
+              />
+            </div>
+          )}
+
+          {selected === "schedule" && scheduleChannelId && (
             <ScheduleBuilderPanel
-              existingChannel={scheduleChannelId ? enabledChannels.find((c) => c.id === scheduleChannelId) : undefined}
+              existingChannel={enabledChannels.find((c) => c.id === scheduleChannelId)}
               onChannelImported={() => {
                 refreshChannels();
-                // Return to the channel just edited, or Inventory for a brand-new one.
-                const target = scheduleChannelId ?? "library";
+                const target = scheduleChannelId;
                 setScheduleChannelId(null);
                 selectChannel(target);
               }}
@@ -484,7 +531,6 @@ function AdminWorkspace({
                   selectedEnabled.artworkUrl,
                 )
               }
-              onUpdateUpstreamHLS={(url) => void updateUpstreamHLS(selectedEnabled.id, url)}
               onEditSchedule={() => {
                 setScheduleChannelId(selectedEnabled.id);
                 selectChannel("schedule");
@@ -558,7 +604,6 @@ function ChannelPanel({
   onClearSchedule,
   onClone,
   onUpdateArtwork,
-  onUpdateUpstreamHLS,
   onEditSchedule,
   onHiddenFromGuideChange,
   onDisable,
@@ -573,30 +618,12 @@ function ChannelPanel({
   onClearSchedule: () => void;
   onClone: () => void;
   onUpdateArtwork: () => void;
-  onUpdateUpstreamHLS: (url: string) => void;
   onEditSchedule: () => void;
   onHiddenFromGuideChange: (hidden: boolean) => void;
   onDisable: () => void;
   onDelete: () => void;
 }) {
-  const [extendHours, setExtendHours] = useState("24");
-  const [hlsUrlDraft, setHlsUrlDraft] = useState(channel.upstreamHlsUrl ?? "");
-  const [hlsProbing, setHlsProbing] = useState(false);
-  const [hlsProbe, setHlsProbe] = useState<{ ok: boolean; text: string } | null>(null);
-
-  async function testUpstreamHLS() {
-    const trimmed = hlsUrlDraft.trim();
-    if (!trimmed) return;
-    setHlsProbing(true);
-    setHlsProbe(null);
-    try {
-      setHlsProbe(describeProbeResult(await probeUpstreamHLS(trimmed)));
-    } catch (err) {
-      setHlsProbe({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setHlsProbing(false);
-    }
-  }
+	const [extendHours, setExtendHours] = useState("24");
   const schedHrs = channel.scheduleCoverageHours ?? 0;
   const schedWarn = schedHrs < SCHEDULE_WARN_HOURS;
   const pkgWarn = (channel.packageCoverageMs ?? 0) === 0;
@@ -618,21 +645,15 @@ function ChannelPanel({
           {channel.hiddenFromGuide && <span className="status">hidden</span>}
         </div>
         <div className="channel-panel-coverage">
-          {channel.isExternal ? (
-            <span className="muted">live proxy</span>
-          ) : (
-            <>
-              <span className={schedWarn ? "danger" : ""}>
-                schedule {formatMs(channel.scheduleCoverageMs)}
-              </span>
-              <span className="muted">·</span>
-              <span className={pkgWarn ? "danger" : ""}>
-                {channel.packageReadyCount} items ({formatMs(channel.packageCoverageMs)})
-              </span>
-              <span className="muted">·</span>
-              <span className="muted">{channel.packageProfile}</span>
-            </>
-          )}
+			<span className={schedWarn ? "danger" : ""}>
+				schedule {formatMs(channel.scheduleCoverageMs)}
+			</span>
+			<span className="muted">·</span>
+			<span className={pkgWarn ? "danger" : ""}>
+				{channel.packageReadyCount} items ({formatMs(channel.packageCoverageMs)})
+			</span>
+			<span className="muted">·</span>
+			<span className="muted">{channel.packageProfile}</span>
           <span className="muted">·</span>
           <span className="muted">{channel.mediaKind}</span>
         </div>
@@ -642,9 +663,7 @@ function ChannelPanel({
       <section className="admin-panel-section">
         <h3>Actions</h3>
         <div className="channel-actions">
-          {!channel.isExternal && (
-            <>
-              <div className="channel-action-extend">
+			<div className="channel-action-extend">
                 <button
                   type="button"
                   disabled={busy}
@@ -665,27 +684,23 @@ function ChannelPanel({
                   />
                   <span className="muted">h</span>
                 </label>
-              </div>
-              <button type="button" disabled={busy} onClick={onRestart} title="Clear the schedule and rebuild from ready packages now.">
-                {busy ? "…" : "Remake schedule"}
-              </button>
-            </>
-          )}
+			</div>
+			<button type="button" disabled={busy} onClick={onRestart} title="Clear the schedule and rebuild from ready packages now.">
+				{busy ? "…" : "Remake schedule"}
+			</button>
           <button type="button" disabled={busy} onClick={onClone}>
             {busy ? "…" : "Duplicate channel"}
           </button>
-          {!channel.isExternal && isLiveEncoded && (
+			{isLiveEncoded && (
             <button type="button" disabled={busy} onClick={onChangeProfile}>
               {busy ? "…" : "Change profile"}
             </button>
           )}
-          {!channel.isExternal && (
-            <div className="channel-action-artwork">
+			<div className="channel-action-artwork">
               <button type="button" disabled={busy} onClick={onUpdateArtwork}>
                 {busy ? "…" : channel.artworkUrl ? "Update artwork" : "Set artwork"}
               </button>
-            </div>
-          )}
+			</div>
           <button
             type="button"
             disabled={busy}
@@ -693,11 +708,9 @@ function ChannelPanel({
           >
             {busy ? "…" : channel.hiddenFromGuide ? "Show in guide" : "Hide from guide"}
           </button>
-          {!channel.isExternal && (
-            <button type="button" className="danger" disabled={busy} onClick={onClearSchedule}>
-              {busy ? "…" : "Clear schedule"}
-            </button>
-          )}
+			<button type="button" className="danger" disabled={busy} onClick={onClearSchedule}>
+				{busy ? "…" : "Clear schedule"}
+			</button>
           <button type="button" className="danger" disabled={busy} onClick={onDisable}>
             {busy ? "…" : "Disable channel"}
           </button>
@@ -708,53 +721,8 @@ function ChannelPanel({
         {status && <p className="channel-status-msg muted">{status}</p>}
       </section>
 
-      {channel.isExternal && (
-        <section className="admin-panel-section">
-          <h3>Source</h3>
-          <div className="policy-editor-row">
-            <label style={{ flex: 1 }}>
-              <span>Spotify HLS URL</span>
-              <input
-                type="url"
-                value={hlsUrlDraft}
-                disabled={busy}
-                onChange={(e) => {
-                  setHlsUrlDraft(e.target.value);
-                  setHlsProbe(null);
-                }}
-                placeholder="https://..."
-                style={{ width: "100%" }}
-              />
-            </label>
-            <button
-              type="button"
-              disabled={busy || hlsProbing || !hlsUrlDraft.trim()}
-              onClick={() => void testUpstreamHLS()}
-            >
-              {hlsProbing ? "Testing…" : "Test"}
-            </button>
-            <button
-              type="button"
-              className="primary"
-              disabled={busy || hlsUrlDraft === channel.upstreamHlsUrl}
-              onClick={() => onUpdateUpstreamHLS(hlsUrlDraft)}
-            >
-              Save
-            </button>
-          </div>
-          {hlsProbe && (
-            <p className={hlsProbe.ok ? "success" : "warn"}>
-              {hlsProbe.ok ? "✓ " : "⚠ "}
-              {hlsProbe.text}
-            </p>
-          )}
-        </section>
-      )}
-
-      {!channel.isExternal && (
-        <>
-          {/* Schedule */}
-          <section className="admin-panel-section">
+		{/* Schedule */}
+		<section className="admin-panel-section">
             <div className="section-headline">
               <h3>Schedule</h3>
               <button type="button" className="link-button" onClick={onEditSchedule}>
@@ -764,9 +732,7 @@ function ChannelPanel({
             <p className="muted">
               Opens the schedule builder with this channel preloaded.
             </p>
-          </section>
-        </>
-      )}
+		</section>
     </div>
   );
 }

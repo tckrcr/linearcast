@@ -95,7 +95,7 @@ media_ids_json+="]"
 delete_encode() {
   local media_id="$1"
   docker compose exec -T linearcast \
-    linearcast-admin maint delete-encode --force "$media_id"
+    linearcast-maint delete-encode --force "$media_id"
 }
 
 require_reset_service() {

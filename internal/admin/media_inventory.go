@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,31 +18,35 @@ type mediaInventoryResponse struct {
 }
 
 type mediaInventoryListEntry struct {
-	MediaID            string `json:"mediaId"`
-	Title              string `json:"title"`
-	Path               string `json:"path"`
-	PathRoot           string `json:"pathRoot"`
-	ReleaseGroup       string `json:"releaseGroup,omitempty"`
-	EpisodeCode        string `json:"episodeCode,omitempty"`
-	SeasonNumber       *int64 `json:"seasonNumber,omitempty"`
-	EpisodeNumber      *int64 `json:"episodeNumber,omitempty"`
-	Collection         string `json:"collection"`
-	SourceRef          string `json:"sourceRef,omitempty"`
-	Source             string `json:"source"`
-	MediaKind          string `json:"mediaKind"`
-	DurationMs         int64  `json:"durationMs"`
-	Container          string `json:"container"`
-	VideoCodec         string `json:"videoCodec"`
-	VideoWidth         int64  `json:"videoWidth,omitempty"`
-	VideoHeight        int64  `json:"videoHeight,omitempty"`
-	AudioCodec         string `json:"audioCodec"`
-	CodecCheckPassed   bool   `json:"codecCheckPassed"`
-	CodecCheckReason   string `json:"codecCheckReason,omitempty"`
-	ReadyPackages      int64  `json:"readyPackages"`
-	PendingPackages    int64  `json:"pendingPackages"`
-	ProcessingPackages int64  `json:"processingPackages"`
-	FailedPackages     int64  `json:"failedPackages"`
-	PackageProfiles    string `json:"packageProfiles,omitempty"`
+	MediaID              string  `json:"mediaId"`
+	Title                string  `json:"title"`
+	Path                 string  `json:"path"`
+	PathRoot             string  `json:"pathRoot"`
+	ReleaseGroup         string  `json:"releaseGroup,omitempty"`
+	EpisodeCode          string  `json:"episodeCode,omitempty"`
+	SeasonNumber         *int64  `json:"seasonNumber,omitempty"`
+	EpisodeNumber        *int64  `json:"episodeNumber,omitempty"`
+	Rating               float64 `json:"rating,omitempty"`
+	Collection           string  `json:"collection"`
+	SourceRef            string  `json:"sourceRef,omitempty"`
+	Source               string  `json:"source"`
+	MediaKind            string  `json:"mediaKind"`
+	DurationMs           int64   `json:"durationMs"`
+	Container            string  `json:"container"`
+	VideoCodec           string  `json:"videoCodec"`
+	VideoWidth           int64   `json:"videoWidth,omitempty"`
+	VideoHeight          int64   `json:"videoHeight,omitempty"`
+	VideoBitrateBps      int64   `json:"videoBitrateBps,omitempty"`
+	AudioCodec           string  `json:"audioCodec"`
+	CodecCheckPassed     bool    `json:"codecCheckPassed"`
+	CodecCheckReason     string  `json:"codecCheckReason,omitempty"`
+	ProfilePackageStatus string  `json:"profilePackageStatus,omitempty"`
+	PackagedDurationMs   *int64  `json:"packagedDurationMs,omitempty"`
+	ReadyPackages        int64   `json:"readyPackages"`
+	PendingPackages      int64   `json:"pendingPackages"`
+	ProcessingPackages   int64   `json:"processingPackages"`
+	FailedPackages       int64   `json:"failedPackages"`
+	PackageProfiles      string  `json:"packageProfiles,omitempty"`
 }
 
 func (a *App) handleMediaInventory(w http.ResponseWriter, r *http.Request) {
@@ -64,22 +69,45 @@ func (a *App) handleMediaInventory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	profile := strings.TrimSpace(r.URL.Query().Get("profile"))
+	profilePackageStatus := strings.TrimSpace(r.URL.Query().Get("profilePackageStatus"))
+	if profilePackageStatus != "" && profile == "" {
+		writeError(w, http.StatusBadRequest, "missing_profile", "profilePackageStatus requires the profile param")
+		return
+	}
+
+	var minRating float64
+	if raw := r.URL.Query().Get("minRating"); raw != "" {
+		if _, err := fmt.Sscanf(raw, "%f", &minRating); err != nil || minRating <= 0 || minRating > 10 {
+			writeError(w, http.StatusBadRequest, "invalid_min_rating", "minRating must be a number between 0.1 and 10")
+			return
+		}
+	}
+	episodesOnly := false
+	if raw := r.URL.Query().Get("episodesOnly"); raw != "" {
+		episodesOnly = raw == "1" || strings.EqualFold(raw, "true")
+	}
+
 	rows, count, err := db.MediaInventory(r.Context(), a.dbConn, db.MediaInventoryFilter{
-		Search:        r.URL.Query().Get("q"),
-		Title:         r.URL.Query().Get("title"),
-		Episode:       r.URL.Query().Get("episode"),
-		PathRoot:      r.URL.Query().Get("pathRoot"),
-		ReleaseGroup:  r.URL.Query().Get("releaseGroup"),
-		Media:         r.URL.Query().Get("media"),
-		Source:        r.URL.Query().Get("source"),
-		MediaKind:     r.URL.Query().Get("kind"),
-		Collection:    r.URL.Query().Get("collection"),
-		PackageStatus: r.URL.Query().Get("packageStatus"),
-		CodecStatus:   r.URL.Query().Get("codecStatus"),
-		SortBy:        r.URL.Query().Get("sortBy"),
-		SortDir:       r.URL.Query().Get("sortDir"),
-		Limit:         limit,
-		Offset:        offset,
+		Search:               r.URL.Query().Get("q"),
+		Title:                r.URL.Query().Get("title"),
+		Episode:              r.URL.Query().Get("episode"),
+		PathRoot:             r.URL.Query().Get("pathRoot"),
+		ReleaseGroup:         r.URL.Query().Get("releaseGroup"),
+		Media:                r.URL.Query().Get("media"),
+		Source:               r.URL.Query().Get("source"),
+		MediaKind:            r.URL.Query().Get("kind"),
+		Collection:           r.URL.Query().Get("collection"),
+		PackageStatus:        r.URL.Query().Get("packageStatus"),
+		CodecStatus:          r.URL.Query().Get("codecStatus"),
+		Profile:              profile,
+		ProfilePackageStatus: profilePackageStatus,
+		MinRating:            minRating,
+		EpisodesOnly:         episodesOnly,
+		SortBy:               r.URL.Query().Get("sortBy"),
+		SortDir:              r.URL.Query().Get("sortDir"),
+		Limit:                limit,
+		Offset:               offset,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "db_error", err.Error())
@@ -99,31 +127,35 @@ func (a *App) handleMediaInventory(w http.ResponseWriter, r *http.Request) {
 			collection = ""
 		}
 		resp.Media = append(resp.Media, mediaInventoryListEntry{
-			MediaID:            row.ID,
-			Title:              row.Title,
-			Path:               row.Path,
-			PathRoot:           mediaPathRoot(row.Path),
-			ReleaseGroup:       releaseGroupFromPath(row.Path),
-			EpisodeCode:        episodeCodeFromPath(row.Path),
-			SeasonNumber:       row.SeasonNumber,
-			EpisodeNumber:      row.EpisodeNumber,
-			Collection:         collection,
-			SourceRef:          row.SourceRef,
-			Source:             sourceLabel(row.SourceRef),
-			MediaKind:          kind,
-			DurationMs:         row.DurationMs,
-			Container:          row.Container,
-			VideoCodec:         row.VideoCodec,
-			VideoWidth:         row.VideoWidth,
-			VideoHeight:        row.VideoHeight,
-			AudioCodec:         row.AudioCodec,
-			CodecCheckPassed:   row.CodecCheckPassed,
-			CodecCheckReason:   row.CodecCheckReason,
-			ReadyPackages:      row.ReadyPackages,
-			PendingPackages:    row.PendingPackages,
-			ProcessingPackages: row.ProcessingPackages,
-			FailedPackages:     row.FailedPackages,
-			PackageProfiles:    row.PackageProfiles,
+			MediaID:              row.ID,
+			Title:                row.Title,
+			Path:                 row.Path,
+			PathRoot:             mediaPathRoot(row.Path),
+			ReleaseGroup:         releaseGroupFromPath(row.Path),
+			EpisodeCode:          episodeCodeFromPath(row.Path),
+			SeasonNumber:         row.SeasonNumber,
+			EpisodeNumber:        row.EpisodeNumber,
+			Rating:               row.Rating,
+			Collection:           collection,
+			SourceRef:            row.SourceRef,
+			Source:               sourceLabel(row.SourceRef),
+			MediaKind:            kind,
+			DurationMs:           row.DurationMs,
+			Container:            row.Container,
+			VideoCodec:           row.VideoCodec,
+			VideoWidth:           row.VideoWidth,
+			VideoHeight:          row.VideoHeight,
+			VideoBitrateBps:      row.VideoBitrateBps,
+			AudioCodec:           row.AudioCodec,
+			CodecCheckPassed:     row.CodecCheckPassed,
+			CodecCheckReason:     row.CodecCheckReason,
+			ProfilePackageStatus: row.ProfilePackageStatus,
+			PackagedDurationMs:   row.PackagedDurationMs,
+			ReadyPackages:        row.ReadyPackages,
+			PendingPackages:      row.PendingPackages,
+			ProcessingPackages:   row.ProcessingPackages,
+			FailedPackages:       row.FailedPackages,
+			PackageProfiles:      row.PackageProfiles,
 		})
 	}
 	writeJSON(w, resp)

@@ -49,9 +49,6 @@ func main() {
 	}
 	defer conn.Close()
 
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		log.Fatalf("apply schema: %v", err)
-	}
 	if err := db.VerifySchema(context.Background(), conn); err != nil {
 		log.Fatalf("verify schema: %v", err)
 	}

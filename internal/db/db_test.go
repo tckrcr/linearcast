@@ -14,8 +14,8 @@ func newTestDB(t *testing.T) string {
 		t.Fatalf("open rw: %v", err)
 	}
 	defer conn.Close()
-	if err := ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	return path
 }

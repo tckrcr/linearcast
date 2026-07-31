@@ -4,11 +4,16 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
+    "api:generate": "openapi-typescript ../api/openapi.yaml -o src/api/generated/schema.ts",
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "playwright test tests/e2e",
+    "test:visual": "playwright test tests/visual",
+    "audit:schedule-builder": "RUN_SCHEDULE_BUILDER_AUDIT=1 playwright test tests/visual/audit-schedule-builder.pw.ts",
+    "capture:viewer": "playwright test tests/visual/capture-viewer.pw.ts",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
@@ -21,11 +26,13 @@
     "vite": "^7.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/react": "^16.3.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "jsdom": "^29.1.1",
-    "vitest": "^2.1.9"
+    "openapi-typescript": "^7.13.0",
+    "vitest": "^4.1.10"
   }
 }

@@ -1,28 +1,25 @@
 import { FormEvent, ReactNode, useEffect, useState } from "react";
 import {
-  cleanupInvalidProfilePackages,
-  clearSpotifyUrl,
-  describeProbeResult,
-  getCacheSummary,
+	cleanupInvalidProfilePackages,
+	getCacheSummary,
+  getDegraded,
   getEncoderSweeperSettings,
   getPublicServerURL,
   getSchedulerTunables,
-  getSpotifyUrl,
-  getSubtitleSettings,
-  probeUpstreamHLS,
-  saveSpotifyUrl,
+	getSubtitleSettings,
   updateEncoderSweeperSettings,
   updatePublicServerURL,
   updateSchedulerTunables,
   updateSubtitleSettings,
 } from "../api";
 import { formatBytes, formatMs } from "../format";
-import type { CacheSummary, SpotifyUrl } from "../types";
+import type { CacheSummary, DegradedSignal } from "../types";
+import { SIGNAL_ACTIONS, SIGNAL_LABELS } from "./degradedSignals";
 import { MaintenancePanel } from "./MaintenancePanel";
 import { WriteLogPanel } from "./WriteLogPanel";
 import styles from "./ToolsPanel.module.css";
 
-export function ToolsPanel({ onChannelChanged }: { onChannelChanged?: () => void }) {
+export function ToolsPanel() {
   const [cacheSummary, setCacheSummary] = useState<CacheSummary | null>(null);
   const [cacheBusy, setCacheBusy] = useState(false);
   const [cacheStatus, setCacheStatus] = useState("");
@@ -47,7 +44,8 @@ export function ToolsPanel({ onChannelChanged }: { onChannelChanged?: () => void
   return (
     <>
       <div className="admin-panel">
-        <SettingsSection onChannelChanged={onChannelChanged} />
+		<RecoverySection />
+		<SettingsSection />
 
         <section className="admin-panel-section">
           <div className="section-headline">
@@ -86,19 +84,18 @@ export function ToolsPanel({ onChannelChanged }: { onChannelChanged?: () => void
 // ---------------------------------------------------------------------------
 // Settings — one table consolidating the scalar operational tunables that used
 // to live in their own per-group sections (the scheduler tunables that lived
-// under Guide, the encoder sweeper, subtitles) plus the singleton Spotify→HLS
-// channel URL. The single top-right Save persists every underlying endpoint.
+// under Guide, the encoder sweeper, and subtitles). The single top-right Save
+// persists every underlying endpoint.
 // ---------------------------------------------------------------------------
 
 const SETTINGS_HELP = {
   horizonHours: "How far ahead the scheduler tries to keep each channel filled. Larger values build more schedule in advance.",
   lowWaterHours: "When remaining coverage drops below this many hours, the scheduler extends the channel back up toward the horizon. Must be less than horizon hours.",
   tickSeconds: "How often the scheduler wakes up to check whether any channel has fallen below the low-water mark.",
-  sweepIntervalSeconds: "How often the admin server checks for encoder jobs whose lease expired because the worker stopped heartbeating.",
+  sweepIntervalSeconds: "How often the backend checks for encoder jobs whose lease expired because the worker stopped heartbeating.",
   maxAttempts: "How many transient encode failures a package can accumulate before it is marked failed instead of being retried.",
   subtitleLanguages: "Preferred subtitle languages, in order, used when extracting and selecting caption tracks. Comma-separated 3-letter ISO 639-2 codes, e.g. eng, spa.",
   subtitleAutoEnable: "Automatically enable the top preferred language as a caption track in the player.",
-  spotifyUrl: "Play one external audio stream — a Spotify→HLS bridge — as a channel. Set or update the HLS URL to upsert the channel; clear it to remove the channel. Appears in the guide within a minute.",
   publicServerUrl: "Public origin used for copyable IPTV/DVR URLs. Leave empty to use the address currently open in this browser.",
 };
 
@@ -110,7 +107,6 @@ type SettingsDraft = {
   maxAttempts: string;
   subtitleLanguages: string;
   subtitleAutoEnable: boolean;
-  spotifyUrl: string;
   publicServerUrl: string;
 };
 
@@ -124,25 +120,20 @@ const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
   maxAttempts: "",
   subtitleLanguages: "",
   subtitleAutoEnable: false,
-  spotifyUrl: "",
   publicServerUrl: "",
 };
 
-export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () => void }) {
-  const [draft, setDraft] = useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
-  const [spotify, setSpotify] = useState<SpotifyUrl | null>(null);
-  const [probe, setProbe] = useState<{ ok: boolean; text: string } | null>(null);
-  const [probing, setProbing] = useState(false);
+export function SettingsSection() {
+	const [draft, setDraft] = useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([getSchedulerTunables(), getEncoderSweeperSettings(), getSubtitleSettings(), getSpotifyUrl(), getPublicServerURL()])
-      .then(([scheduler, sweeper, subtitles, spotifyUrl, publicServer]) => {
-        if (cancelled) return;
-        setSpotify(spotifyUrl);
+		Promise.all([getSchedulerTunables(), getEncoderSweeperSettings(), getSubtitleSettings(), getPublicServerURL()])
+			.then(([scheduler, sweeper, subtitles, publicServer]) => {
+				if (cancelled) return;
         setDraft({
           horizonHours: String(scheduler.horizonHours),
           lowWaterHours: String(scheduler.lowWaterHours),
@@ -151,7 +142,6 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
           maxAttempts: String(sweeper.maxAttempts),
           subtitleLanguages: subtitles.subtitleLanguagePreference.join(", "),
           subtitleAutoEnable: subtitles.subtitleAutoEnable,
-          spotifyUrl: spotifyUrl.upstreamHlsUrl ?? "",
           publicServerUrl: publicServer.publicServerUrl ?? "",
         });
         setLoaded(true);
@@ -166,20 +156,6 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
   function setField(key: keyof SettingsDraft, value: string | boolean) {
     setDraft((prev) => ({ ...prev, [key]: value }));
     setStatus("");
-  }
-
-  async function testSpotify() {
-    const trimmed = draft.spotifyUrl.trim();
-    if (!trimmed) return;
-    setProbing(true);
-    setProbe(null);
-    try {
-      setProbe(describeProbeResult(await probeUpstreamHLS(trimmed)));
-    } catch (err) {
-      setProbe({ ok: false, text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setProbing(false);
-    }
   }
 
   async function save(event: FormEvent<HTMLFormElement>) {
@@ -214,14 +190,6 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
       return;
     }
 
-    // Spotify URL is upserted when set/changed and the channel is removed when
-    // the field is emptied — guard the destructive case before anything saves.
-    const spotifyTrimmed = draft.spotifyUrl.trim();
-    const spotifyOriginal = spotify?.upstreamHlsUrl ?? "";
-    const spotifyChanged = spotifyTrimmed !== spotifyOriginal;
-    const clearingSpotify = spotifyChanged && spotifyTrimmed === "" && (spotify?.configured ?? false);
-    if (clearingSpotify && !window.confirm("Remove the Spotify channel?")) return;
-
     setBusy(true);
     setStatus("saving…");
     try {
@@ -234,13 +202,7 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
         }),
         updatePublicServerURL(draft.publicServerUrl.trim()),
       ]);
-      let nextSpotify = spotify;
-      if (spotifyChanged) {
-        nextSpotify = spotifyTrimmed ? await saveSpotifyUrl(spotifyTrimmed) : await clearSpotifyUrl();
-        setSpotify(nextSpotify);
-        setProbe(null);
-      }
-      setDraft({
+			setDraft({
         horizonHours: String(scheduler.horizonHours),
         lowWaterHours: String(scheduler.lowWaterHours),
         tickSeconds: String(scheduler.tickSeconds),
@@ -248,11 +210,9 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
         maxAttempts: String(sweeper.maxAttempts),
         subtitleLanguages: subtitles.subtitleLanguagePreference.join(", "),
         subtitleAutoEnable: subtitles.subtitleAutoEnable,
-        spotifyUrl: nextSpotify?.upstreamHlsUrl ?? "",
         publicServerUrl: publicServer.publicServerUrl ?? "",
       });
       setStatus("saved");
-      if (spotifyChanged) onChannelChanged?.();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err));
     } finally {
@@ -268,46 +228,6 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
       disabled={busy || !loaded}
       onChange={(event) => setField(key, event.target.value)}
     />
-  );
-
-  const np = spotify?.nowPlaying;
-  const spotifyControl = (
-    <div className={styles["spotify-cell"]}>
-      <input
-        type="url"
-        value={draft.spotifyUrl}
-        disabled={busy || !loaded}
-        placeholder="https://example.com/stream.m3u8"
-        onChange={(event) => {
-          setField("spotifyUrl", event.target.value);
-          setProbe(null);
-        }}
-      />
-      <div className={styles["spotify-cell-meta"]}>
-        <button
-          type="button"
-          className="link-button"
-          disabled={busy || probing || !draft.spotifyUrl.trim()}
-          onClick={() => void testSpotify()}
-        >
-          {probing ? "Testing…" : "Test reachability"}
-        </button>
-        {spotify?.configured && spotify.status && (
-          <span className={`status status-${spotify.status}`}>{spotify.status}</span>
-        )}
-      </div>
-      {probe && (
-        <span className={probe.ok ? "success" : "warn"}>
-          {probe.ok ? "✓ " : "⚠ "}
-          {probe.text}
-        </span>
-      )}
-      {spotify?.configured && np?.title && (
-        <span className="muted">
-          Now playing: {np.artist ? `${np.title} — ${np.artist}` : np.title}
-        </span>
-      )}
-    </div>
   );
 
   const rows: { label: string; control: ReactNode; description: string }[] = [
@@ -343,7 +263,6 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
       ),
       description: SETTINGS_HELP.subtitleAutoEnable,
     },
-    { label: "Spotify URL", control: spotifyControl, description: SETTINGS_HELP.spotifyUrl },
     {
       label: "Public server URL",
       control: (
@@ -366,7 +285,7 @@ export function SettingsSection({ onChannelChanged }: { onChannelChanged?: () =>
           <div className="section-headline-main">
             <h2>Settings</h2>
             <p className="section-purpose">
-              Operational tunables for the scheduler, encoder sweeper, subtitles, IPTV URLs, and the Spotify channel.
+				Operational tunables for the scheduler, encoder sweeper, subtitles, and IPTV URLs.
             </p>
           </div>
           <div className="section-headline-actions">
@@ -535,4 +454,75 @@ function parseSubtitleLanguageText(text: string):
   const invalid = unique.find((l) => !/^[a-z]{3}$/.test(l));
   if (invalid) return { valid: false, message: `${invalid} must be a 3-letter ISO 639-2 code` };
   return { valid: true, languages: unique };
+}
+
+// ── Recovery ────────────────────────────────────────────────────────────────
+
+function RecoverySection() {
+  const [signals, setSignals] = useState<DegradedSignal[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  async function refresh() {
+    setLoading(true);
+    setError("");
+    try {
+      const resp = await getDegraded();
+      setSignals(resp.signals);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const anyDegraded = signals.some((s) => s.degraded);
+
+  return (
+    <section className="admin-panel-section">
+      <div className="section-headline">
+        <div className="section-headline-main">
+          <h2>System health</h2>
+          <p className="section-purpose">
+            Operator-attention signals from the scrape owner. Degraded means still serving but needs attention — not unhealthy.
+          </p>
+        </div>
+        <button type="button" disabled={loading} onClick={() => void refresh()}>
+          {loading ? "refreshing" : "refresh"}
+        </button>
+      </div>
+
+      {error && <span className={`muted ${styles["cache-warning"]}`}>{error}</span>}
+
+      {!error && signals.length === 0 && !loading && (
+        <span className="muted">No signals available.</span>
+      )}
+
+      {signals.length > 0 && (
+        <ul className={styles["cache-channel-list"]}>
+          {signals.map((s) => (
+            <li key={s.signal}>
+              <span className={s.degraded ? "danger" : ""}>
+                {SIGNAL_LABELS[s.signal] ?? s.signal}
+              </span>
+              <span>
+                {s.detail}
+                {s.degraded && SIGNAL_ACTIONS[s.signal] && ` — ${SIGNAL_ACTIONS[s.signal]}`}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {anyDegraded && (
+        <span className={styles["cache-warning"]}>
+          One or more signals need operator attention. See Maintenance below for cleanup actions.
+        </span>
+      )}
+    </section>
+  );
 }

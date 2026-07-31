@@ -310,4 +310,14 @@ func TestHandleScheduleBuilderCreateChannelQueuedAndAlreadyReady(t *testing.T) {
 	if len(resp.Queued)+len(resp.AlreadyPending) < 1 {
 		t.Fatal("expected at least one queued or already-pending item for media without package")
 	}
+	if resp.ScheduleEntries != 1 {
+		t.Fatalf("scheduleEntries=%d, want one ready-prefix entry", resp.ScheduleEntries)
+	}
+	entries, err := db.ScheduleEntriesOrdered(context.Background(), conn, resp.ChannelID)
+	if err != nil {
+		t.Fatalf("schedule entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MediaID != "ready" {
+		t.Fatalf("entries=%+v, want only the ready media before the pending boundary", entries)
+	}
 }

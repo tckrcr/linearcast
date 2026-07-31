@@ -340,4 +340,3 @@ func TestBestFitLeadingPrimaryReturnsNoneWhenNothingFits(t *testing.T) {
 		t.Fatalf("expected no leading primary, got %+v / %s", leading, resumeID)
 	}
 }
-

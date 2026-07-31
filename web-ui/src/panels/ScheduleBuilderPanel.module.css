@@ -10,32 +10,179 @@
   margin-top: 4px;
 }
 
+.sb-intro-section {
+  background:
+    radial-gradient(circle at 92% 0%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 38%),
+    #121212;
+}
+
+.sb-progress {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  max-width: 920px;
+  margin: 0 0 18px;
+  padding: 0;
+  list-style: none;
+}
+
+.sb-progress li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sb-progress li > span {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.sb-progress li.is-current {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.sb-progress li.is-current > span {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.sb-progress li.is-complete {
+  border-color: color-mix(in srgb, var(--good) 55%, var(--border));
+  color: var(--text-muted);
+}
+
+.sb-progress li.is-complete > span {
+  border-color: color-mix(in srgb, var(--good) 42%, var(--border));
+  color: var(--good);
+}
+
 .sb-config {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  margin-top: 10px;
-  max-width: 720px;
+  gap: 16px;
+  max-width: 920px;
 }
 
 .sb-name-label {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
+  gap: 7px;
+  max-width: 720px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   color: var(--text-muted);
 }
 
-.sb-profile-field,
-.sb-schedule-mode {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.sb-name-label input {
+  height: 44px;
+  padding: 9px 12px;
+  font-size: 17px;
+  font-weight: 550;
+  letter-spacing: 0;
+  text-transform: none;
+  background: color-mix(in srgb, var(--bg-elev) 82%, transparent);
 }
 
-.sb-schedule-mode p {
+.sb-profile-status {
   margin: 0;
   font-size: 12px;
+}
+
+.sb-advanced {
+  max-width: 920px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-elev) 72%, transparent);
+  overflow: hidden;
+}
+
+.sb-advanced summary {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  min-height: 42px;
+  padding: 0 13px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.sb-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.sb-advanced summary::before {
+  content: "›";
+  width: 14px;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  transform-origin: center;
+  transition: transform 120ms ease;
+}
+
+.sb-advanced[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.sb-advanced summary > span:first-child {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.sb-policy-summary {
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-weight: 400;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sb-advanced-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 22px;
+  padding: 15px;
+  border-top: 1px solid var(--border);
+}
+
+.sb-option-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sb-option-group p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .sb-mode-btns {
@@ -79,23 +226,18 @@
 }
 
 .sb-field-label {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--text);
-}
-
-.sb-warning {
-  padding: 8px 10px;
-  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
-  border-radius: 8px;
-  background: var(--warn-bg);
-  color: var(--text);
   font-size: 12px;
-  line-height: 1.4;
+  font-weight: 650;
+  color: var(--text);
 }
 
-.sb-warning strong {
-  color: var(--warn);
+.sb-abr-select {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr);
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .sb-profile-btns {
@@ -128,17 +270,19 @@
 .sb-content-btns {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 4px;
+  gap: 10px;
+  margin-bottom: 14px;
 }
 
 .sb-content-btn {
-  padding: 9px 22px;
-  font-size: 13px;
-  font-weight: 500;
-  border-radius: 6px;
+  min-width: 132px;
+  padding: 13px 22px;
+  font-size: 14px;
+  font-weight: 650;
+  text-align: left;
+  border-radius: 9px;
   border: 1px solid var(--border);
-  background: transparent;
+  background: var(--bg-elev);
   color: var(--text);
   cursor: pointer;
   transition: background 0.1s, border-color 0.1s;
@@ -152,14 +296,15 @@
   background: var(--accent-soft);
   color: var(--accent);
   border-color: var(--accent-border);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .sb-picker-expanded {
-  margin-bottom: 20px;
+  margin-bottom: 18px;
 }
 
-.sb-queue-headline {
-  margin-top: 4px;
+.sb-workspace {
+  min-width: 0;
 }
 
 .sb-ready-filter {
@@ -183,25 +328,76 @@
 }
 
 .sb-list-section {
-  padding-bottom: 0;
+  padding-bottom: 28px;
 }
 
-.sb-list-meta {
-  font-weight: 400;
-  font-size: 13px;
+.sb-draft-card {
+  min-width: 0;
+  margin-top: 22px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-elev) 78%, #101010);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.12);
+}
+
+.sb-draft-headline {
+  margin-bottom: 16px;
+}
+
+.sb-grid-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 0 0 14px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+}
+
+.sb-grid-option > label:first-child {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.sb-grid-option input {
+  margin-top: 3px;
+}
+
+.sb-grid-option label span {
+  display: grid;
+  gap: 2px;
+}
+
+.sb-grid-option strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sb-grid-option small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .sb-empty {
   font-size: 13px;
-  margin: 8px 0;
+  margin: 0 0 12px;
+}
+
+.sb-empty-timeline :global(.schedule-timeline-gap-label) {
+  display: none;
 }
 
 .sb-list-preview {
-  margin: 22px 0 0;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--bg-elev-2) 45%, transparent);
+  margin: 14px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
 }
 
 .sb-list-preview-head {
@@ -214,14 +410,14 @@
 
 .sb-list-preview-head h4 {
   margin: 0;
-  font-size: 12px;
+  font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-muted);
 }
 
 .sb-list-preview-head span {
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .sb-entry-list {
@@ -329,6 +525,23 @@
   flex-direction: column;
   gap: 10px;
   min-width: 0;
+}
+
+.sb-show-results {
+  display: grid;
+  gap: 8px;
+}
+
+.sb-result-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sb-result-heading h4 {
+  margin: 0;
+  font-size: 13px;
 }
 
 .sb-shows-grid {
@@ -479,18 +692,88 @@
 }
 
 .sb-show-season-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
   gap: 10px;
+}
+
+.sb-show-season-toggle {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: baseline;
+  justify-content: start;
+  gap: 7px;
+  min-width: 0;
+  padding: 3px 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-align: left;
+}
+
+.sb-show-season-toggle:hover {
+  background: none;
+  color: var(--accent);
+}
+
+.sb-show-season-chevron {
+  width: 10px;
+  color: var(--text-muted);
 }
 
 .sb-show-season-label {
   font-size: 13px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .sb-show-season-sub {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sb-show-season-add {
+  white-space: nowrap;
+}
+
+.sb-show-episodes {
+  display: grid;
+  gap: 5px;
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 8px 0 0 19px;
+  border-top: 1px solid var(--border);
+}
+
+.sb-show-episode {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 5px;
+  background: var(--bg-secondary, var(--bg));
+}
+
+.sb-show-episode-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sb-show-episode-title {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sb-show-episode-code,
+.sb-show-episode-duration {
   font-size: 11px;
   white-space: nowrap;
 }
@@ -500,9 +783,157 @@
   align-items: center;
   gap: 14px;
   flex-wrap: wrap;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.sb-import-row > :global(.primary) {
+  min-height: 38px;
+  padding-inline: 18px;
+}
+
+.sb-summary {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  padding: 15px;
+  border: 1px solid var(--accent-border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg));
+}
+
+.sb-summary h4 {
+  margin: 0 0 4px;
+  font-size: 13px;
+}
+
+.sb-summary p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.sb-summary dl {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.sb-summary dl > div {
+  min-width: 0;
+}
+
+.sb-summary dt {
+  margin-bottom: 3px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sb-summary dd {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (max-width: 600px) {
+  .sb-intro-section,
+  .sb-workspace {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .sb-advanced summary {
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+    padding: 9px 11px;
+  }
+
+  .sb-advanced summary > span:first-child {
+    grid-column: 2;
+  }
+
+  .sb-policy-summary {
+    grid-column: 2;
+    grid-row: 2;
+    text-align: left;
+  }
+
+  .sb-advanced-body {
+    grid-template-columns: 1fr;
+  }
+
+  .sb-progress {
+    gap: 3px;
+  }
+
+  .sb-progress li {
+    gap: 5px;
+    padding-inline: 4px;
+    font-size: 10px;
+  }
+
+  .sb-content-btns {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .sb-content-btn {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .sb-draft-card {
+    padding: 13px;
+  }
+
+  .sb-grid-option {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sb-slot-label {
+    justify-content: space-between;
+  }
+
+  .sb-slot-label select {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .sb-list-preview-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .sb-entry {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .sb-entry-main {
+    flex-basis: calc(100% - 64px);
+  }
+
+  .sb-import-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .sb-import-row > :global(.primary) {
+    width: 100%;
+  }
+
+  .sb-summary dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .sb-shows-grid {
     grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
   }
@@ -514,6 +945,26 @@
 
   .sb-show-detail-title h4 {
     white-space: normal;
+  }
+
+  .sb-show-season-head {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sb-show-season-add {
+    width: 100%;
+  }
+
+  .sb-show-episodes {
+    padding-left: 0;
+  }
+
+  .sb-show-episode {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .sb-show-episode-duration {
+    display: none;
   }
 
 }

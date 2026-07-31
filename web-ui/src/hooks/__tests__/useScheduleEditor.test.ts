@@ -12,7 +12,6 @@ const api = vi.hoisted(() => ({
   getChannelSchedule: vi.fn(),
   getChannelSchedulePreview: vi.fn(),
   getMediaPackageCandidates: vi.fn(),
-  getScheduleBuilderCandidates: vi.fn(),
   getScheduleBuilderFillerCandidates: vi.fn(),
   insertScheduleEntryAfter: vi.fn(),
   insertScheduleEntryBefore: vi.fn(),
@@ -101,13 +100,13 @@ describe("useScheduleEditor — draft-mode invariants", () => {
     expect(api.getChannelSchedule).not.toHaveBeenCalled();
   });
 
-  it("loadMedia uses getScheduleBuilderCandidates, not getChannelMedia", async () => {
-    api.getScheduleBuilderCandidates.mockResolvedValue({ media: [] });
+  it("loadMedia uses getMediaPackageCandidates, not getChannelMedia", async () => {
+    api.getMediaPackageCandidates.mockResolvedValue({ media: [] });
     const { result } = renderHook(() => useScheduleEditor(null, draftConfig()));
     await act(async () => {
       await result.current.loadMedia(true);
     });
-    expect(api.getScheduleBuilderCandidates).toHaveBeenCalledWith("default", undefined, "all");
+    expect(api.getMediaPackageCandidates).toHaveBeenCalledWith("default", undefined, "all");
     expect(api.getChannelMedia).not.toHaveBeenCalled();
   });
 });

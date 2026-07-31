@@ -1,3 +1,11 @@
+import type {
+  AdminAuthStatusDTO,
+  AdminLoginRequestDTO,
+  AdminLogoutResponseDTO,
+  AdminPasswordChangeRequestDTO,
+  ErrorResponseDTO,
+} from "./dto";
+
 export type QueryValue = string | number | boolean | undefined | null;
 
 export function buildPath(path: string, params?: Record<string, QueryValue>): string {
@@ -15,13 +23,7 @@ export type ApiFetchOptions = Omit<RequestInit, "body"> & {
   query?: Record<string, QueryValue>;
 };
 
-export type AdminAuthStatus = {
-  enabled: boolean;
-  authenticated: boolean;
-  mustChange?: boolean;
-};
-
-async function readBody(response: Response): Promise<any> {
+async function readBody(response: Response): Promise<unknown> {
   return response.json().catch(() => null);
 }
 
@@ -29,17 +31,23 @@ export class ApiError extends Error {
   code?: string;
   body?: unknown;
   status: number;
-  constructor(message: string, status: number, body?: unknown) {
+  constructor(message: string, status: number, body?: ErrorResponseDTO | unknown) {
     super(message);
     this.status = status;
-    this.code = (body as any)?.code;
+    this.code = isErrorResponse(body) ? body.error : undefined;
     this.body = body;
   }
 }
 
-function failure(response: Response, body: any): ApiError {
-  const message = body?.message || `admin api ${response.status}`;
-  return new ApiError(body?.hint ? `${message} ${body.hint}` : message, response.status, body);
+function isErrorResponse(body: unknown): body is ErrorResponseDTO {
+  return typeof body === "object" && body !== null
+    && typeof (body as { error?: unknown }).error === "string"
+    && typeof (body as { message?: unknown }).message === "string";
+}
+
+function failure(response: Response, body: unknown): ApiError {
+  const message = isErrorResponse(body) ? body.message : `admin api ${response.status}`;
+  return new ApiError(isErrorResponse(body) && body.hint ? `${message} ${body.hint}` : message, response.status, body);
 }
 
 // UNAUTHORIZED_EVENT fires whenever a request 401s on a non-auth endpoint —
@@ -60,63 +68,59 @@ export async function apiFetch<T = unknown>(
   path: string,
   options: ApiFetchOptions = {},
 ): Promise<T> {
-  const { json, query, headers, ...rest } = options;
-  const init: RequestInit = { ...rest };
-  if (json !== undefined) {
-    init.body = JSON.stringify(json);
-    init.headers = { "Content-Type": "application/json", ...(headers || {}) };
-  } else if (headers) {
-    init.headers = headers;
-  }
-  const response = await fetch(buildPath(path, query), init);
+  const response = await apiFetchRaw(path, options);
   const body = await readBody(response);
   if (!response.ok) {
-    if (response.status === 401) notifyUnauthorized(path);
     throw failure(response, body);
   }
   return body as T;
 }
 
+// apiFetchRaw applies the shared request construction and session-expiry
+// notification, but deliberately returns non-2xx responses unchanged. Manifest
+// probes use the status code to distinguish "warming" from network failure.
 export async function apiFetchRaw(
   path: string,
   options: ApiFetchOptions = {},
 ): Promise<Response> {
   const { json, query, headers, ...rest } = options;
   const init: RequestInit = { ...rest };
+  const requestHeaders = new Headers(headers);
   if (json !== undefined) {
     init.body = JSON.stringify(json);
-    init.headers = { "Content-Type": "application/json", ...(headers || {}) };
-  } else if (headers) {
-    init.headers = headers;
+    if (!requestHeaders.has("Content-Type")) {
+      requestHeaders.set("Content-Type", "application/json");
+    }
+  }
+  if ([...requestHeaders].length > 0) {
+    init.headers = requestHeaders;
   }
   const response = await fetch(buildPath(path, query), init);
-  if (!response.ok) {
-    if (response.status === 401) notifyUnauthorized(path);
-    const body = await readBody(response);
-    throw failure(response, body);
-  }
+  if (response.status === 401) notifyUnauthorized(path);
   return response;
 }
 
-export function getAdminAuthStatus(): Promise<AdminAuthStatus> {
-  return apiFetch<AdminAuthStatus>("/api/auth/status", { cache: "no-store" });
+export function getAdminAuthStatus(): Promise<AdminAuthStatusDTO> {
+  return apiFetch<AdminAuthStatusDTO>("/api/auth/status", { cache: "no-store" });
 }
 
-export function loginAdmin(password: string): Promise<AdminAuthStatus> {
-  return apiFetch<AdminAuthStatus>("/api/auth/login", {
+export function loginAdmin(password: string): Promise<AdminAuthStatusDTO> {
+  const request: AdminLoginRequestDTO = { password };
+  return apiFetch<AdminAuthStatusDTO>("/api/auth/login", {
     method: "POST",
-    json: { password },
+    json: request,
   });
 }
 
-export function logoutAdmin(): Promise<{ authenticated: boolean }> {
-  return apiFetch<{ authenticated: boolean }>("/api/auth/logout", { method: "POST" });
+export function logoutAdmin(): Promise<AdminLogoutResponseDTO> {
+  return apiFetch<AdminLogoutResponseDTO>("/api/auth/logout", { method: "POST" });
 }
 
-export function changeAdminPassword(currentPassword: string, newPassword: string): Promise<AdminAuthStatus> {
-  return apiFetch<AdminAuthStatus>("/api/auth/change-password", {
+export function changeAdminPassword(currentPassword: string, newPassword: string): Promise<AdminAuthStatusDTO> {
+  const request: AdminPasswordChangeRequestDTO = { currentPassword, newPassword };
+  return apiFetch<AdminAuthStatusDTO>("/api/auth/change-password", {
     method: "POST",
-    json: { currentPassword, newPassword },
+    json: request,
   });
 }
 

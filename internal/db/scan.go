@@ -12,9 +12,9 @@ import (
 func channelColumns(prefix string) string {
 	return prefix + "id, " + prefix + "display_name, " + prefix + "source_directory, " +
 		prefix + "ordering, " + prefix + "enabled, " + prefix + "created_at_ms, " +
-		prefix + "description, " + prefix + "hidden_from_guide, " + prefix + "artwork_url, " + prefix + "playback_mode, " +
+		prefix + "description, " + prefix + "hidden_from_guide, " + prefix + "artwork_url, " +
 		prefix + "required_package_profile, " + prefix + "abr_ladder_json, " + prefix + "package_prefill_ms, " + prefix + "media_kind, " +
-		prefix + "schedule_mode, " + prefix + "slot_duration_ms, " + prefix + "upstream_hls_url, " +
+		prefix + "schedule_mode, " + prefix + "slot_duration_ms, " +
 		prefix + "prefill_mode"
 }
 
@@ -26,11 +26,11 @@ func scanChannel(row scanner) (*Channel, error) {
 	var c Channel
 	var enabled int64
 	var hidden int64
-	var description, artworkURL, requiredProfile, abrLadderJSON, upstreamURL sql.NullString
+	var description, artworkURL, requiredProfile, abrLadderJSON sql.NullString
 	var prefillMs, slotDurationMs sql.NullInt64
 	if err := row.Scan(&c.ID, &c.DisplayName, &c.SourceDirectory, &c.Ordering, &enabled,
-		&c.CreatedAtMs, &description, &hidden, &artworkURL, &c.PlaybackMode, &requiredProfile,
-		&abrLadderJSON, &prefillMs, &c.MediaKind, &c.ScheduleMode, &slotDurationMs, &upstreamURL, &c.PrefillMode); err != nil {
+		&c.CreatedAtMs, &description, &hidden, &artworkURL, &requiredProfile,
+		&abrLadderJSON, &prefillMs, &c.MediaKind, &c.ScheduleMode, &slotDurationMs, &c.PrefillMode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -50,10 +50,6 @@ func scanChannel(row scanner) (*Channel, error) {
 		v := slotDurationMs.Int64
 		c.SlotDurationMs = &v
 	}
-	if upstreamURL.Valid {
-		v := upstreamURL.String
-		c.UpstreamHLSURL = &v
-	}
 	return &c, nil
 }
 
@@ -66,7 +62,7 @@ func mediaColumns(prefix string) string {
 		prefix + "video_height, " + prefix + "video_bitrate_bps, " + prefix + "color_transfer, " + prefix + "color_primaries, " +
 		prefix + "audio_codec, " + prefix + "codec_check_passed, " + prefix + "codec_check_reason, " +
 		prefix + "ingested_at_ms, " + prefix + "media_kind, " + prefix + "source_ref, " +
-		prefix + "description, " + prefix + "thumb_path, " + prefix + "content_rating, " +
+		prefix + "description, " + prefix + "thumb_path, " + prefix + "content_rating, " + prefix + "rating, " +
 		"NULL, " +
 		prefix + "codec_tag_string"
 }
@@ -87,7 +83,7 @@ func mediaColumnsWithCollection(mediaPrefix, collectionPrefix string) string {
 		mediaPrefix + "video_height, " + mediaPrefix + "video_bitrate_bps, " + mediaPrefix + "color_transfer, " + mediaPrefix + "color_primaries, " +
 		mediaPrefix + "audio_codec, " + mediaPrefix + "codec_check_passed, " + mediaPrefix + "codec_check_reason, " +
 		mediaPrefix + "ingested_at_ms, " + mediaPrefix + "media_kind, " + mediaPrefix + "source_ref, " +
-		mediaPrefix + "description, " + mediaPrefix + "thumb_path, " + mediaPrefix + "content_rating, " +
+		mediaPrefix + "description, " + mediaPrefix + "thumb_path, " + mediaPrefix + "content_rating, " + mediaPrefix + "rating, " +
 		collectionPrefix + "genres_json, " +
 		mediaPrefix + "codec_tag_string"
 }
@@ -98,11 +94,12 @@ func scanMedia(row scanner) (*Media, error) {
 	var title, group, colorTransfer, colorPrimaries, codecReason, mediaKind, sourceRef, description, thumbPath, contentRating, genresJSON, codecTag sql.NullString
 	var collectionID sql.NullString
 	var seasonNumber, episodeNumber, userPref, videoWidth sql.NullInt64
+	var rating sql.NullFloat64
 	if err := row.Scan(&m.ID, &m.Path, &m.Directory, &title, &group, &collectionID,
 		&seasonNumber, &episodeNumber, &userPref, &m.DurationMs, &m.Container, &m.VideoCodec, &videoWidth,
 		&m.VideoHeight, &m.VideoBitrateBps, &colorTransfer, &colorPrimaries,
 		&m.AudioCodec, &passed, &codecReason, &m.IngestedAtMs, &mediaKind, &sourceRef,
-		&description, &thumbPath, &contentRating, &genresJSON, &codecTag); err != nil {
+		&description, &thumbPath, &contentRating, &rating, &genresJSON, &codecTag); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -121,6 +118,7 @@ func scanMedia(row scanner) (*Media, error) {
 	m.Description = description.String
 	m.ThumbPath = thumbPath.String
 	m.ContentRating = contentRating.String
+	m.Rating = rating.Float64
 	if genresJSON.Valid && genresJSON.String != "" {
 		_ = json.Unmarshal([]byte(genresJSON.String), &m.Genres)
 	}

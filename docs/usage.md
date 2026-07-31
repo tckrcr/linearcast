@@ -10,7 +10,7 @@ Use `/admin` → Library → Media sources to connect Plex, Jellyfin, or local
 media directories. `linearcast-ingest` remains available only as a
 recovery/bootstrap tool when the admin API is unavailable.
 
-Once ingest finishes, open `/admin` → Schedule Builder to create channels.
+Once ingest finishes, open `/admin` → Create channel to build a channel.
 
 On-demand channels can change package profile later from the channel page's
 Change profile action. The new profile is used after the next runtime
@@ -20,9 +20,24 @@ that encoding strategy changes.
 
 ## Add a channel
 
-Use `/admin` → Schedule Builder for routine channel creation.
+Use `/admin` → Create channel for routine channel creation. Name the channel,
+then choose Movies, Shows, or Music. Shows opens the full collection browser
+immediately; its search keeps show matches grouped and also finds individual
+episode titles and codes. Open a show and expand a season to browse and add
+individual episodes, or add the entire season or show.
 
-`linearcast-extender` keeps the schedule filled automatically after channel creation. New channels are picked up on the next channel refresh tick without a restart.
+New channels use the configured default package profile with on-demand,
+back-to-back playback unless Advanced options or the contextual timeline grid
+control is changed before creation.
+
+`linearcast-extender` keeps the schedule filled automatically after channel
+creation. New channels are picked up on the next channel refresh tick without a
+restart. A pre-encoded, back-to-back channel can become playable before its
+whole playlist finishes encoding: the initial schedule contains only the
+contiguous ready programs at the front of the playlist and stops at the first
+program still preparing. Later ticks continue from that boundary. The extender
+does not skip the pending program or loop the smaller ready subset across the
+guide; it returns to normal horizon filling once the full playlist is ready.
 
 ### Ordering modes
 
@@ -36,14 +51,16 @@ Use the admin UI/API for routine schedule and channel management. The remaining 
 - `check` audits schedule *structure* over a future window (gaps, overlaps, grid alignment, missing media, out-of-bounds offsets, not-ready packages).
 - `validate-segments` is a decode-level pre-flight: for each schedule entry in the window it demuxes the ready package backing it — feeding `init.mp4` byte-concatenated with the first and last `.m4s` fragment to `ffprobe -count_packets` — to confirm the m3u8 references fragments that carry decodable packets of the expected stream/codec, not just files that exist. (Counting packets, rather than reading stream metadata, is what catches a truncated or stub fragment: codec/kind are reported from `init.mp4` even for a 0-byte segment.) Report-only by default; `--requeue` marks failing packages pending for re-encode. Exits non-zero when any package fails. Example: `LINEARCAST_DB=… linearcast-maint validate-segments --hours 12 [--channel <id>] [--all] [--requeue]`.
 
-`linearcast-extender` keeps each enabled channel scheduled to the configured
-horizon. The default is 24 hours to avoid generating long stretches of repeated
-entries for small channels; raise `/admin` -> Guide -> Scheduler tunables only
-for deployments that need a longer guide or prebuilt schedule window.
+`linearcast-extender` normally keeps each enabled channel scheduled to the
+configured horizon. A partially packaged pre-encoded channel is intentionally
+shorter until its next playlist item is ready. The default horizon is 24 hours
+to avoid generating long stretches of repeated entries for small channels;
+raise `/admin` -> Guide -> Scheduler tunables only for deployments that need a
+longer guide or prebuilt schedule window.
 
 ## Maintenance
 
-Use `/admin` → Tools → Maintenance for operator cleanup tasks: missing source media cleanup, orphan package cache cleanup, package-cache import, and SQLite database optimization (`PRAGMA optimize` plus `VACUUM`). Missing-media and orphan-package cleanup run a dry scan first and ask for confirmation before deleting rows or cache directories. Package import reattaches existing finalized package artifacts to the database without re-encoding video and rebuilds package-owned subtitle track metadata from the source. For package-size accounting on databases with existing ready packages, run `linearcast-admin maint backfill-package-bytes`; it fills `media_packages.package_bytes` from the init and segment paths already tracked in SQLite.
+Use `/admin` → Tools → Maintenance for operator cleanup tasks: missing source media cleanup, orphan package cache cleanup, package-cache import, and SQLite database optimization (`PRAGMA optimize` plus `VACUUM`). Missing-media and orphan-package cleanup run a dry scan first and ask for confirmation before deleting rows or cache directories. Package import reattaches existing finalized package artifacts to the database without re-encoding video and rebuilds package-owned subtitle track metadata from the source. For package-size accounting on databases with existing ready packages, run `linearcast-maint backfill-package-bytes`; it fills `media_packages.package_bytes` from the init and segment paths already tracked in SQLite.
 
 ## Subtitles
 

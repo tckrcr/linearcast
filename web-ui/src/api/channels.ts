@@ -6,15 +6,14 @@ import type {
   ChannelSchedule,
   ChannelSchedulePreview,
   EncodeReclaimResponse,
-  GuideResponse,
-  SpotifyUrl,
 } from "../types";
 import { apiFetch, channelPath } from "./client";
+import type { GuideResponseDTO } from "./dto";
 
 // getGuide fetches the viewer-safe EPG (all guide channels + a trimmed
 // schedule window) in a single request.
 export async function getGuide(fromMs: number, hours = 24, signal?: AbortSignal) {
-  return apiFetch<GuideResponse>("/api/guide", {
+  return apiFetch<GuideResponseDTO>("/api/guide", {
     cache: "no-store",
     signal,
     query: { from: fromMs, hours },
@@ -36,60 +35,6 @@ export async function createChannel(req: {
     syncedMedia: number;
     scheduleEntries: number;
   }>("/api/channels", { method: "POST", json: req });
-}
-
-// The Spotify URL is a singleton (one Spotify→HLS stream per account):
-// getSpotifyUrl reads it, saveSpotifyUrl upserts the one URL, clearSpotifyUrl
-// deletes it.
-export async function getSpotifyUrl() {
-  return apiFetch<SpotifyUrl>("/api/spotify-url", { cache: "no-store" });
-}
-
-export async function saveSpotifyUrl(upstreamHlsUrl: string) {
-  return apiFetch<SpotifyUrl>("/api/spotify-url", {
-    method: "PUT",
-    json: { upstreamHlsUrl },
-  });
-}
-
-export async function clearSpotifyUrl() {
-  return apiFetch<{ configured: boolean; deleted: boolean }>("/api/spotify-url", {
-    method: "DELETE",
-  });
-}
-
-export type UpstreamProbeResult = {
-  reachable: boolean;
-  status?: number;
-  contentType?: string;
-  looksLikeHls: boolean;
-  error?: string;
-};
-
-// probeUpstreamHLS asks the server to fetch the upstream once and report
-// reachability. It is advisory only — saving the Spotify URL never requires the
-// probe to pass.
-export async function probeUpstreamHLS(upstreamHlsUrl: string) {
-  return apiFetch<UpstreamProbeResult>("/api/channels/probe-upstream", {
-    method: "POST",
-    json: { upstreamHlsUrl },
-  });
-}
-
-// describeProbeResult turns a raw probe into a short message and an ok flag.
-// ok=false is an advisory warning (reachability/format), not a hard failure.
-export function describeProbeResult(r: UpstreamProbeResult): { ok: boolean; text: string } {
-  if (!r.reachable) {
-    return { ok: false, text: `Not reachable${r.error ? `: ${r.error}` : ""}` };
-  }
-  const status = r.status ?? 200;
-  if (status < 200 || status >= 400) {
-    return { ok: false, text: `Reachable but returned HTTP ${status}` };
-  }
-  if (!r.looksLikeHls) {
-    return { ok: false, text: `Reachable (HTTP ${status}) but does not look like an HLS playlist` };
-  }
-  return { ok: true, text: `Reachable — looks like HLS (HTTP ${status})` };
 }
 
 export async function extendChannel(channelID: string, hours?: number) {
@@ -181,13 +126,6 @@ export async function updateChannelArtwork(channelID: string, artworkUrl: string
     channelPath(channelID, "/artwork"),
     { method: "PUT", json: { artworkUrl } },
   );
-}
-
-export async function updateChannelUpstreamHLS(channelID: string, upstreamHlsUrl: string) {
-  return apiFetch<void>(channelPath(channelID, "/upstream-hls"), {
-    method: "PUT",
-    json: { upstreamHlsUrl },
-  });
 }
 
 export async function resetChannelArtwork(channelID: string) {

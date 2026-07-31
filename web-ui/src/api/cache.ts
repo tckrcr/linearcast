@@ -1,5 +1,6 @@
 import type {
   CacheSummary,
+  DegradedResponse,
   EncodeReclaimResponse,
   ImportPackagesResponse,
   InvalidProfilePackageCleanupResponse,
@@ -12,6 +13,10 @@ import type {
   ScheduleCheckResponse,
 } from "../types";
 import { apiFetch } from "./client";
+
+export async function getDegraded() {
+  return apiFetch<DegradedResponse>("/api/degraded", { cache: "no-store" });
+}
 
 export async function cleanupInvalidProfilePackages(dryRun: boolean) {
   return apiFetch<InvalidProfilePackageCleanupResponse>("/api/cache/invalid-profiles", {

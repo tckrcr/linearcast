@@ -27,8 +27,8 @@ func testAdminApp(t *testing.T) (*App, *sql.DB) {
 		t.Fatalf("open db: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	return New(Config{DB: conn}), conn
 }
@@ -41,9 +41,9 @@ func insertDeleteFixture(t *testing.T, conn *sql.DB, enabled bool) {
 	}
 	if _, err := conn.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile
+			required_package_profile
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', ?, 0, 'packaged', 'h264-1080p-8mbps')`, enabledInt); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', ?, 0, 'h264-1080p-8mbps')`, enabledInt); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	if _, err := conn.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -120,9 +120,9 @@ func insertFutureRangeFixture(t *testing.T, conn *sql.DB) int64 {
 	t.Helper()
 	if _, err := conn.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile
+			required_package_profile
 		)
-		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps')`); err != nil {
+		VALUES ('ch', 'Channel', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps')`); err != nil {
 		t.Fatalf("insert channel: %v", err)
 	}
 	for _, mediaID := range []string{"m1", "m2", "m3", "m4"} {

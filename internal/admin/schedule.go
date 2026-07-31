@@ -11,15 +11,15 @@ import (
 )
 
 type scheduleEntryItem struct {
-	EntryID         string `json:"entryId"`
-	MediaID         string `json:"mediaId"`
-	Title           string `json:"title,omitempty"`
-	Path            string `json:"path,omitempty"`
+	EntryID        string `json:"entryId"`
+	MediaID        string `json:"mediaId"`
+	Title          string `json:"title,omitempty"`
+	Path           string `json:"path,omitempty"`
 	CollectionName string `json:"collectionName,omitempty"`
-	StartMs         int64  `json:"startMs"`
-	EndMs           int64  `json:"endMs"`
-	OffsetMs        int64  `json:"offsetMs,omitempty"`
-	DurationMs      int64  `json:"durationMs"`
+	StartMs        int64  `json:"startMs"`
+	EndMs          int64  `json:"endMs"`
+	OffsetMs       int64  `json:"offsetMs,omitempty"`
+	DurationMs     int64  `json:"durationMs"`
 }
 
 type channelScheduleResponse struct {

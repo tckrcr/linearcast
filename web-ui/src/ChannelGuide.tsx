@@ -64,12 +64,10 @@ export function ChannelGuide({ activeChannelID, onSelect }: Props) {
   const { data, error, loading } = useGuide(windowStartMs, windowHours, REFRESH_MS);
   const channels = data?.channels ?? [];
 
-  // Furthest point any VOD channel has a schedule built to. External channels
-  // are always "live" (never a gap), so they don't bound paging. Once the
-  // current window already reaches this, advancing only reveals expected,
-  // not-yet-generated gaps — so "next" is locked there.
+  // Furthest point any channel has a schedule built to. Once the current window
+  // reaches this, advancing only reveals expected, not-yet-generated gaps.
   const maxScheduleEndMs = channels.reduce(
-    (max, c) => (!c.isExternal && c.scheduleEndMs != null && c.scheduleEndMs > max ? c.scheduleEndMs : max),
+    (max, c) => (c.scheduleEndMs != null && c.scheduleEndMs > max ? c.scheduleEndMs : max),
     0,
   );
 
@@ -234,27 +232,6 @@ function renderChannelBlocks(
   msToPct: (ms: number) => number,
   onSelect: (id: string) => void,
 ) {
-  if (channel.isExternal) {
-    const down = channel.status === "down";
-    const np = channel.nowPlaying;
-    const label = down
-      ? "offline"
-      : np?.title
-        ? np.artist ? `${np.title} — ${np.artist}` : np.title
-        : "live";
-    return (
-      <button
-        type="button"
-        className={`schedule-timeline-entry ${down ? "is-down" : "is-live"}`}
-        style={{ left: "0%", width: "100%" }}
-        onClick={() => onSelect(channel.id)}
-        title={label}
-      >
-        <span className="schedule-timeline-entry-title">{label}</span>
-      </button>
-    );
-  }
-
   const entries = channel.entries;
   if (entries.length === 0) {
     return (

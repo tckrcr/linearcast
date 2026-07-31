@@ -1,55 +1,49 @@
 # Database
 
-The SQLite database is the single source of truth for all channel state. It coordinates three independent workflows: ingest (media management), scheduling (playback planning), and packaging (pre-transcoding).
+SQLite is the durable source of truth for channel, media, schedule, package,
+encoder, and control-plane state. It also carries the explicitly ephemeral
+`on_demand_encodings` projection used for runtime observability.
 
 ---
 
 ## Role in the System
 
-The database sits between three components:
+The database coordinates several operation owners inside and beside the
+composed server:
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  linearcast      │     │  linearcast-    │     │  linearcast-    │
-│  (playback)     │     │  extender       │     │  packager      │
-│  narrow write   │     │  read/write     │     │  read/write     │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                      │                      │
-         └──────────────────────┼──────────────────────┘
-                                │
-                        ┌───────▼───────┐
-                        │  SQLite DB    │
-                        │  (single     │
-                        │  source of   │
-                        │  truth)      │
-                        └──────────────┘
+ admin/control ─┐
+ playback ──────┼──► SQLite ◄── scheduler/extender
+ ingest ────────┤       ▲
+ maintenance ───┘       └────── local and remote encoders
 ```
 
-- **linearcast** opens the database read-write for two narrow runtime paths. It
-  serves packaged media and may mark a `ready` package back to `pending` when a
-  packaged init/segment artifact is missing on disk. It also publishes ephemeral
-  `on_demand_encodings` rows while on-demand ffmpeg channel encodings are active.
-- **linearcast-extender** and **linearcast-packager** open read-write (`OpenReadWrite`). They coordinate through SQLite's WAL mode and busy timeout (5s).
-- **linearcast-admin** and maintenance tools are also read-write for channel/media CRUD, migrations, diagnostics, and repair workflows.
+All read-write handles use `OpenReadWrite` and coordinate through WAL plus the
+five-second busy timeout. Sharing the `linearcast` process does not merge admin
+and playback write ownership.
 
 ---
 
 ## Ownership Boundaries
 
-| Component | Writes | Reads |
-|-----------|--------|-------|
-| linearcast | media_packages, packaged_segments (ready artifact repair only), on_demand_encodings | All tables; exports metrics on 60s refresh tick |
-| linearcast-extender | schedule_entries | channels, media, channel_media, media_packages |
-| linearcast-packager | media_packages, packaged_segments | media |
-| linearcast-admin | channels, channel_media | All tables (read-write for Plex imports and channel management) |
-| cmd/ingest | media | channels, media |
+| Operation owner | Writes |
+|-----------------|--------|
+| scheduler transaction functions | `schedule_entries`, whether invoked by admin edits or automatic extension |
+| admin control plane | channels, channel media/filler policy, local sources, settings, package profiles, operator media metadata, and FK-cascaded dependents during explicit deletion |
+| admin request audit | `admin_write_log` |
+| playback artifact repair | only `media_packages: ready -> pending` plus deletion of stale `packaged_segments` |
+| playback on-demand lifecycle | ephemeral `on_demand_encodings` rows |
+| package worker/finalizer | `media_packages`, `packaged_segments`, `package_tracks`, and registered local encoder/lease state |
+| admin encoder transport and sweeper | `encoders`, `encoder_jobs`, remote claim/completion/failure transitions, and lease-expiry package transitions |
+| ingest/admin source scan | `media`, collections, and source metadata |
+| maintenance/migration paths | schema migrations, restore/import/reclaim, and explicitly requested package repair/retry |
 
-No component writes schedule entries except the scheduler. Package state writes
-belong to the packager except for the narrow `linearcast` ready-artifact repair
-path and explicit admin retry requests. `on_demand_encodings` is runtime
-observability owned by playback, not durable package or schedule state. Metrics are exported from
-`linearcast`'s process (which serves `/metrics`) rather than the extender, so
-Prometheus scrapes always see current values.
+Only scheduler transaction code creates, edits, or recomposes schedules;
+explicit admin channel deletion may remove its schedule through the declared FK
+cascade. Package-state changes go through named transition helpers; process or
+module location does not grant general write authority. `on_demand_encodings`
+is playback-owned runtime observability, not durable package or schedule state.
+Metrics are exported by the composed `linearcast` process.
 
 ---
 
@@ -69,15 +63,29 @@ Channel configuration and policy.
 | created_at_ms | INTEGER | Creation timestamp |
 | description | TEXT | Optional description |
 | hidden_from_guide | INTEGER | 1 = omit from public guide/source listings; direct stream URLs still work |
-| playback_mode | TEXT | Always `packaged` |
+| artwork_url | TEXT | Optional operator-managed channel artwork URL |
 | required_package_profile | TEXT | Package profile (e.g., `h264-1080p-8mbps`) |
 | abr_ladder_json | TEXT | Optional ordered JSON array of package profile names for adaptive bitrate variants |
 | package_prefill_ms | INTEGER | Package coverage horizon in ms |
+| encoder_policy | TEXT | Optional remote/local encoder selection policy |
+| media_kind | TEXT | `video` or `music` |
 | schedule_mode | TEXT | `back_to_back` or opt-in `slot_grid` |
 | slot_duration_ms | INTEGER | Slot-grid interval in ms; 6s-aligned when set |
 | prefill_mode | TEXT | `eager` (default - package the whole channel ahead) or `on_demand` (serve unpackaged entries through ephemeral channel encodings when a viewer tunes in) |
 
-**Key invariant**: `playback_mode` is always `packaged`. The system does not support generated playback. `required_package_profile` is the single schedule gate; `abr_ladder_json` only adds package demand and HLS variants, and unready ladder rungs are omitted from the master playlist. The Schedule Builder create API accepts `adaptiveBitrate` for eager video channels; channel policy updates do not toggle ABR after creation. `required_package_profile` is mutable only for `on_demand` packaged channels, where the change leaves schedules and package rows untouched. `back_to_back` remains the default schedule mode. `slot_grid` keeps primary entries at real packaged duration but advances each next primary start to the next `slot_duration_ms` wall-clock boundary, leaving explicit gaps for future filler/dead-air materialization. `prefill_mode` is `eager` by default; `on_demand` schedules from codec-eligible media without requiring ready packages and encodes at tune-in.
+**Channel-model invariant**: every channel is scheduled from library media.
+`required_package_profile` is the primary schedule/playback profile;
+`abr_ladder_json` adds package demand and ready HLS variants without replacing
+that primary gate. Unready optional ladder rungs are omitted from the master
+playlist.
+
+**Current policies**: `prefill_mode` defaults to `eager`; `on_demand` schedules
+codec-eligible media without ready packages and encodes at tune-in.
+`back_to_back` is the default schedule mode. `slot_grid` advances primary starts
+to `slot_duration_ms` wall-clock boundaries and leaves explicit gaps for
+filler/dead air. The Schedule Builder offers ABR at eager video-channel creation
+but does not toggle it later. Only on-demand channels may change their required
+profile in place, leaving schedules and durable package rows untouched.
 
 ### collections
 
@@ -178,33 +186,15 @@ Planned playback windows. Each entry specifies which media plays at which time.
 |--------|------|-------------|
 | id | TEXT PK | Stable schedule entry ID |
 | channel_id | TEXT FK | Channel |
-| start_ms | INTEGER | Start time (wall-clock offset) |
+| start_ms | INTEGER | Scheduled start as a UTC Unix timestamp in milliseconds |
 | media_id | TEXT FK | Media to play |
 | offset_ms | INTEGER | Start offset within source media |
 | duration_ms | INTEGER | Playback duration |
 | created_at_ms | INTEGER | When entry was created |
 
-**Key invariant**: `start_ms` and `duration_ms` must be aligned to 6000ms (the schedule grid). The CHECK constraint enforces this in the schema.
-
-### play_history
-
-Runtime-observed playback history. Rows are inserted by `linearcast` when a
-packaged manifest request resolves the current schedule entry and ready package.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | INTEGER PK | Autoincrement history row ID |
-| channel_id | TEXT FK | Channel |
-| schedule_entry_id | TEXT | Stable schedule entry ID |
-| media_id | TEXT FK | Media that played |
-| started_at | INTEGER | Entry start time in unix-ms |
-| ended_at | INTEGER | Entry end time in unix-ms |
-| duration_ms | INTEGER | Played entry duration |
-
-**Key invariant**: `(channel_id, schedule_entry_id)` is unique, so repeated
-manifest requests for the same entry do not create duplicate history rows. The
-schedule entry ID is intentionally not a foreign key; history remains durable
-after schedule rebuilds or clears.
+**Key invariant**: `start_ms` is an absolute UTC instant, while `duration_ms`
+is an elapsed duration. Both must be aligned to 6000ms (the schedule grid);
+the CHECK constraint enforces this in the schema.
 
 ### on_demand_encodings
 
@@ -232,7 +222,8 @@ segments progress, and deletes the row when the encoding tears down.
 
 ### media_packages
 
-Package state machine tracking pre-transcoded media.
+Package state machine and finalized-artifact metadata for durable pre-encoded
+media.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -253,7 +244,9 @@ Package state machine tracking pre-transcoded media.
 | timescale | INTEGER | fMP4 timescale |
 | packaged_duration_ms | INTEGER | Exact packaged duration |
 | package_bytes | INTEGER | Finished package size in bytes, recorded at finalize from init + segment files |
-| error | TEXT | Failure message if status = failed |
+| error | TEXT | Current terminal or repair reason; cleared when a new claim begins |
+| last_attempt_error | TEXT | Most recent transient attempt failure retained across a requeue |
+| attempts | INTEGER | Number of claims attempted; used to enforce the retry budget |
 | created_at_ms | INTEGER | Creation timestamp |
 | updated_at_ms | INTEGER | Last update timestamp |
 
@@ -266,9 +259,19 @@ profiles such as `h264-maindfdfdf-1080p` can still exist as ready packages and
 consume cache, but they are invalid for new encode work and will not satisfy a
 channel requiring `h264-1080p-8mbps`.
 
+No row for a media/profile pair means the package relationship is absent; it is
+not another `status` value. Profile-scoped candidate APIs currently render that
+absence as `packageStatus: "missing"`. A missing init or segment file is a
+different condition: it is an artifact-repair event that moves an existing
+`ready` row to `pending` and clears stale segment metadata.
+
+A `ready` row is operationally required to have finalized artifact metadata and
+reachable files. That cross-row/filesystem condition is enforced by finalization
+and integrity/repair paths rather than by the SQL `status` CHECK alone.
+
 `package_bytes` is populated for newly finalized packages. Existing ready
 packages created before the column can be filled with
-`linearcast-admin maint backfill-package-bytes`, which sums the DB-tracked init
+`linearcast-maint backfill-package-bytes`, which sums the DB-tracked init
 segment and packaged segment paths without walking package directories.
 
 ### packaged_segments
@@ -358,21 +361,23 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 
 ## Key Invariants
 
-1. **Eager channels schedule only ready packages.** For `prefill_mode = 'eager'` channels the scheduler's `EligibleReadyPackagedChannelMedia` query joins `channel_media` → `media` → `media_packages` with `status = ready`; unpackaged or in-progress media is not scheduled. Live-encoded channels (`prefill_mode = 'on_demand'`) instead schedule from `EligibleChannelMedia` (codec-eligible, package-agnostic) and serve unpackaged entries through ephemeral channel encodings.
+1. **Eager channels schedule only ready packages.** For `prefill_mode = 'eager'` channels the scheduler's `EligibleReadyPackagedChannelMedia` query joins `channel_media` → `media` → `media_packages` and requires both `status = ready` and a finalized `packaged_duration_ms`; unpackaged, incomplete, or in-progress media is not scheduled. While a back-to-back playlist is only partly ready, the scheduler appends the contiguous ready run after the durable tail and stops at the first unready item. It neither skips the gap nor repeats the smaller ready set to fill the horizon. Later extender transactions resume from the tail, and normal full-horizon looping begins after all eligible media is ready. On-demand channels instead schedule from `EligibleChannelMedia` (codec-eligible, package-agnostic) and serve unpackaged entries through ephemeral channel encodings.
 
 2. **All schedule times are 6000ms-aligned.** The schema CHECK constraint rejects any `start_ms` or `duration_ms` not divisible by 6000.
 
-3. **Playback mode is always packaged.** The `channels.playback_mode` column only accepts `packaged`. Generated playback was removed.
-
-4. **Package state is durable but repairable.** Normal worker claims skip
+3. **Package state is durable but repairable.** Normal worker claims skip
    `ready` packages, but integrity repair may move `ready -> pending` when
    packaged artifacts are missing. Failed packages are not auto-retried; the
    admin queue endpoint explicitly resets failed rows to `pending` after the
    operator restores the cause.
 
-5. **Segments are exact.** `packaged_segments.duration_ms` reflects the actual encoded duration, not a rounded or nominal value. This prevents the ~0.3% frame-skipping that occurred on generated playback.
+4. **Segments are exact.** `packaged_segments.duration_ms` reflects the actual encoded duration, not a rounded or nominal value.
 
-6. **Single-writer coordination.** Writers use `OpenReadWrite` which sets `max_open_conns = 1` and configures a 5-second busy timeout. SQLite enforces serial writes; the timeout is the coordination policy. `OpenReadWrite` intentionally pins each read-write handle to one open SQLite connection. Some write workflows use `BEGIN IMMEDIATE` through `*sql.DB` rather than passing explicit `*sql.Tx` through every helper. Do not raise `MaxOpenConns`, introduce shared read-write handles across goroutines, or split a write workflow across DB handles without revisiting transaction boundaries and adding rollback/concurrency tests.
+5. **Single-writer coordination.** Writers use `OpenReadWrite` which sets `max_open_conns = 1` and configures a 5-second busy timeout. SQLite enforces serial writes; the timeout is the coordination policy. `OpenReadWrite` intentionally pins each read-write handle to one open SQLite connection. Some write workflows use `BEGIN IMMEDIATE` through `*sql.DB` rather than passing explicit `*sql.Tx` through every helper. Channel extension includes package-readiness selection and schedule insertion in the same immediate transaction. Do not raise `MaxOpenConns`, introduce shared read-write handles across goroutines, or split a write workflow across DB handles without revisiting transaction boundaries and adding rollback/concurrency tests.
+
+These are hard data/playback invariants. Prefill mode, schedule mode, required
+profile/ABR ladder, encoder policy, and retry limits are reversible policies;
+their allowed changes matter, but their current values are not invariants.
 
 ---
 
@@ -385,24 +390,22 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 | pending | Package requested but not yet claimed |
 | processing | Worker is actively encoding |
 | ready | Package complete and playable |
-| failed | Encoding failed (retryable) |
+| failed | Encoding reached a terminal or exhausted-attempt outcome; it remains stopped until an explicit retry |
+
+An absent media/profile row is outside this state machine. APIs may project it
+as `"missing"` for operator selection, but SQLite never stores that value.
 
 ### Transitions
 
 ```
-        ┌─────────────────┐
-        │     pending     │◄──────────────┐
-        └────────┬────────┘               │
-                 │ claim                  │ artifact repair
-                 ▼                        │
-        ┌─────────────────┐
-        │   processing    │◄────────────────────┐
-        └────────┬────────┘                     │
-                 │ complete                     │ stale / retry
-                 ▼                             │
-        ┌─────────────────┐                     │
-        │     ready      │                      │
-        └─────────────────┘─────────────────────┘
+(no row)   ──queue────────────────────► pending
+(no row)   ──direct claim─────────────► processing
+pending    ──claim────────────────────► processing
+processing ──success──────────────────► ready
+processing ──transient/lease expiry───► pending
+processing ──terminal/exhausted───────► failed
+failed     ──explicit retry───────────► pending
+ready      ──missing artifact─────────► pending
 ```
 
 ### Valid Transitions
@@ -414,11 +417,14 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 | (insert) | ready | One-shot CLI |
 | (insert) | failed | One-shot CLI failure |
 | pending | processing | Worker claims via `ClaimPackage` |
+| pending | failed | Explicit admin cancellation |
 | processing | ready | Packager completes successfully |
-| processing | failed | Packager encounters error |
-| processing | processing | Stale detection (noop) |
+| processing | pending | Transient failure, lease expiry, or a leaseless stale-job reset below the attempt cap |
+| processing | failed | Terminal failure or retry budget exhausted |
+| processing | processing | Processing metadata refresh before encoding |
 | ready | pending | Artifact repair via playback 404 or worker integrity sweep |
 | failed | pending | Explicit admin retry request |
+| failed | processing | Direct explicit claim; normal operator retry queues `pending` first |
 
 ### Components
 
@@ -426,16 +432,18 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 |------------|-------------|
 | pending → processing | `ClaimPackage` (packager worker) |
 | processing → ready | Packager after successful ffmpeg |
-| processing → failed | Packager on ffmpeg failure |
-| processing → (stale) | `FailStaleProcessingPackages` (scheduler or packager startup) |
+| processing → pending/failed | Package failure classification, local-worker orphan recovery, or admin lease sweeper |
+| leaseless processing → pending/failed | Admin sweeper via `FailStaleProcessingPackages` |
 | ready → pending | `MarkReadyPackagePendingForReencode` after missing artifact detection |
 | failed → pending | Admin package queue retry |
 
 ### Failure and Retry
 
-- **Stale processing detection**: Packages stuck in `processing` for longer
-  than the configured cutoff are failed by `FailStaleProcessingPackages`. This
-  runs when the packager worker starts so the normal claim path can retry them.
+- **Stale processing detection**: The admin sweeper expires leased jobs and
+  runs `FailStaleProcessingPackages` as a backstop for old `processing` rows
+  with no lease. A transient recovery moves the row to `pending`; reaching the
+  attempt cap moves it to `failed`. A registered local worker also requeues its
+  own orphaned leases immediately on restart.
 - **Retry from failed**: Workers do not auto-discover failed rows. Operators
   retry them through the admin queue path, which resets the row to `pending`.
 - **Repair from ready**: Playback artifact 404s and worker integrity sweeps can
@@ -450,7 +458,7 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 
 ### Scheduling Flow
 
-1. **Scheduler** queries `EligibleReadyPackagedChannelMedia(channelID, profile)` which returns only media with:
+1. **Scheduler** queries `EligibleReadyPackagedChannelMedia(channelID, profile)` for eager channels, which returns only media with:
    - `codec_check_passed = 1`
    - `status = ready` for the required profile
    - `packaged_duration_ms NOT NULL`
@@ -461,16 +469,18 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 
 ### Packaging Flow
 
-1. **Packager** queries unready media for a given channel/profile using `EligibleReadyPackagedChannelMedia` (to find content gaps) or scans media without ready packages.
+1. **Package discovery** finds demanded media/profile pairs without a ready package.
 
-2. **Packager** claims work via `ClaimPackage`:
+2. A **local worker or remote encoder transport** claims work via `ClaimPackage`:
    - Atomically creates/claims a package row
    - Returns `true` only if the transition succeeded
    - Skips already-processing or ready packages
 
-3. **Packager** runs ffmpeg, updates state via `MarkPackageProcessing` → `MarkPackageReady` (or `MarkPackageFailed`).
+3. The encoder runs ffmpeg and finalization applies `processing -> ready`, or
+   classifies failure as transient/terminal.
 
-4. **Packager** writes segment metadata via `ReplacePackagedSegments`.
+4. **Finalization** writes segment and track metadata with the package-ready
+   transition.
 
 ### Playback Flow
 
@@ -478,11 +488,9 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 
 2. For each entry, **linearcast** looks up the ready package via `ReadyMediaPackage`.
 
-3. **linearcast** records the current entry in `play_history` once the ready package is resolved.
+3. **linearcast** constructs the HLS manifest using exact durations from `packaged_segments`.
 
-4. **linearcast** constructs the HLS manifest using exact durations from `packaged_segments`.
-
-5. **linearcast** serves segments from local cache (packaged artifacts). If a
+4. **linearcast** serves segments from local cache (packaged artifacts). If a
    referenced artifact is missing, it marks the ready package back to `pending`
    so the packager worker can rebuild it.
 
@@ -492,7 +500,7 @@ Used for operator timeline reconstruction and auditing. Does not capture request
 
 ### 1. Scheduling unready media
 
-Do not query `EligibleChannelMedia` (the non-package-aware version) for a packaged channel. Use `EligibleReadyPackagedChannelMedia` to ensure scheduled entries have playable packages.
+Do not query `EligibleChannelMedia` (the non-package-aware version) for an eager channel. Use `EligibleReadyPackagedChannelMedia` to ensure scheduled entries have playable packages.
 
 ### 2. Misaligned schedule times
 
@@ -500,14 +508,21 @@ Always use 6000ms-aligned schedule-grid values. The schema CHECK catches this, b
 
 ### 3. Stale package state
 
-If a worker crashes mid-encode, the package stays in `processing` until stale
-detection fails it. `FailStaleProcessingPackages` runs at worker startup.
+If a worker crashes mid-encode, its package remains `processing` until lease
+recovery acts. A registered local worker requeues its own orphaned leases on
+restart; the admin sweeper handles expired leases and old leaseless rows,
+moving them to `pending` or to `failed` when the attempt cap is exhausted.
 
 ### 4. Missing package artifacts
 
 Do not manually edit `media_packages` to recover deleted `init.mp4` or segment
 files. Use the worker integrity sweep or let playback artifact 404 handling
 move the ready row back to `pending`.
+
+This is not the same as an absent package row. An eager manifest with no ready
+row returns `503`; a stale init/segment URI whose referenced file is gone first
+returns `404` and queues the repair, after which manifest refreshes return `503`
+until rebuilding completes.
 
 ### 5. Segment duration mismatch
 
@@ -521,25 +536,50 @@ Multiple packagers using `ClaimPackage` will safely coordinate (only one wins pe
 
 ## How to Safely Modify DB Logic
 
-> The schema is a single **end-state v1 baseline** with narrow additive startup
-> migrations for live data that should be preserved. `collections` and
-> `media.collection_id` are created/backfilled idempotently by `ApplySchema`.
+> `schema.sql` is the verified fresh-database shape at `SchemaVersion`.
+> Existing supported databases advance from the v1 baseline through immutable
+> numbered migrations in `internal/db/schema.go`. `linearcast-maint migrate` is
+> the only production schema writer; other binaries call `VerifySchema`.
+
+The canonical startup migration flow is:
+
+1. inspect the schema version without opening the database read-write;
+2. if an existing database is behind, create and verify a WAL-safe snapshot in
+   `<database-dir>/backups/`;
+3. apply each missing migration in order with `BEGIN IMMEDIATE`, advancing the
+   `meta.schema_version` row in the same transaction;
+4. run `foreign_key_check` before commit and verify the final supported shape.
+
+Missing, unversioned, pre-v1, and future-version schemas are not guessed at or
+repaired. Fresh databases are initialized from `schema.sql`; unsupported old
+databases must be restored or deliberately recreated.
+
+The executable backup/restore runbook is in [deploy.md](deploy.md#restore-the-current-schema).
+A current-schema restore uses the image's maintenance binary to verify the
+snapshot before and after replacement, retains the displaced database and WAL
+sidecars, and restarts the same image before health and schedule-integrity
+checks. A pre-migration snapshot must instead be restored with the matching
+older image; image rollback and database restore are separate operations.
 
 ### Adding a new table
 
-1. Add the CREATE TABLE (and any indexes) to `schema.sql` directly.
-2. Add Go types to `internal/db/types.go` and query functions to the
+1. Add the CREATE TABLE (and any indexes) to the current `schema.sql` shape.
+2. Append a numbered migration that creates it for the prior supported version
+   and increment `SchemaVersion`; never edit an already-shipped migration.
+3. Add a prior-version fixture that proves operator-owned data and foreign keys
+   survive the upgrade.
+4. Add Go types to `internal/db/types.go` and query functions to the
    appropriate domain file (`channels.go`, `media.go`, `schedule.go`,
    `packages.go`, etc.).
-3. Add tests for CRUD operations.
+5. Add tests for CRUD operations.
 
 ### Changing an existing table
 
 Edit the table definition in `schema.sql` to the desired fresh-database end
-state. For existing databases, add an idempotent `ApplySchema` guard that
-creates missing additive structures and backfills from existing data. Avoid
-destructive table rebuilds unless the user has explicitly accepted a drop and
-recreate.
+state and append the corresponding numbered transition. The transition must be
+transactional, preserve operator-owned data, explicitly handle any invalidated
+derived state, and include a prior-version fixture. Table rebuilds must verify
+foreign keys and must not silently infer or delete unsupported operator data.
 
 ### Modifying package state machine
 
@@ -612,7 +652,7 @@ ORDER BY prev_end;
 
 The 30-second threshold filters out normal episode-to-episode transitions
 (which typically have sub-second gaps) from actual schedule gaps caused by
-missing packages or unscheduled time.
+absent required packages or unscheduled time.
 
 ### Testing changes
 

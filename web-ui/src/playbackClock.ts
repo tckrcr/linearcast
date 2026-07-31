@@ -66,8 +66,7 @@ export function resolveLiveSlot(
   const cur = current ?? null;
   const nxt = next ?? null;
   if (!cur) {
-    // No scheduled program to count down (a music channel driven by nowPlaying,
-    // or a gap).
+    // No scheduled program to count down (an unscheduled or gap channel).
     return { now: null, next: nxt, remainingMs: null, rolledPast: false };
   }
   if (nowMs < cur.endMs) {

@@ -12,8 +12,8 @@ func TestMediaByIDReadsSeasonEpisodeNumbers(t *testing.T) {
 	}
 	defer rw.Close()
 
-	if err := ApplySchema(context.Background(), rw); err != nil {
-		t.Fatalf("ApplySchema: %v", err)
+	if err := Migrate(context.Background(), rw); err != nil {
+		t.Fatalf("Migrate: %v", err)
 	}
 
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, title, season_number, episode_number, duration_ms, container,

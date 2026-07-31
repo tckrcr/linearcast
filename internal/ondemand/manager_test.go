@@ -106,8 +106,8 @@ func TestEncodingRowsMirrorActiveProcessLifecycle(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer conn.Close()
-	if err := db.ApplySchema(context.Background(), conn); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 
 	clock := &fakeClock{now: 12_000}
@@ -848,9 +848,9 @@ func TestSweepDetectsStalledSegmentProduction(t *testing.T) {
 	}
 }
 
-// TestEncodingIDForActiveEncoding verifies that the manager exposes the live
-// encoding identifier and directory for an active entry.
-func TestEncodingIDForActiveEncoding(t *testing.T) {
+// TestEncodingIDForRunningAndCompletedEncoding verifies that a completed
+// lookahead encode remains addressable when its schedule entry becomes current.
+func TestEncodingIDForRunningAndCompletedEncoding(t *testing.T) {
 	clock := &fakeClock{now: 100_000}
 	var proc *fakeProcess
 	m := newTestManager(t, clock, func(ctx context.Context, spec packager.LiveEncodingSpec) (Process, error) {
@@ -883,6 +883,10 @@ func TestEncodingIDForActiveEncoding(t *testing.T) {
 	}
 
 	proc.finish(nil)
+	<-s.done
+	if id, ok := m.EncodingID("ch1", "e1"); !ok || id != s.id {
+		t.Fatalf("EncodingID after completed encode=(%q,%v), want %q,true", id, ok, s.id)
+	}
 }
 
 func TestEncodingIDForRetainedEncoding(t *testing.T) {
@@ -1184,4 +1188,158 @@ func TestEncodingDirFailureCountsAgainstBudget(t *testing.T) {
 	if spawns != 0 {
 		t.Fatalf("post-cooldown spawned: spawns=%d, want 0", spawns)
 	}
+}
+
+// TestShutdownStopsAllEncodingsAndRemovesRoot verifies the three guarantees
+// Shutdown must provide: every encoding process is stopped, the encoding root
+// directory is removed, and all on_demand_encodings DB rows are cleared. Without
+// the root removal, a restart reuses stale segments; without the DB clear,
+// stale rows confuse the next process's startup.
+func TestShutdownStopsAllEncodingsAndRemovesRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linearcast.db")
+	conn, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
+	}
+
+	var procs []*fakeProcess
+	root := filepath.Join(t.TempDir(), "encodings")
+	m, err := NewManager(ManagerOptions{
+		Root:          root,
+		MaxConcurrent: 4,
+		NowFn:         func() int64 { return 12_000 },
+		DB:            conn,
+		Spawn: func(ctx context.Context, spec packager.LiveEncodingSpec) (Process, error) {
+			p := newFakeProcess()
+			procs = append(procs, p)
+			go func() {
+				<-ctx.Done()
+				p.finish(ctx.Err())
+			}()
+			writeLivePlaylist(t, spec.OutDir, makeTargetDurations(2), false)
+			return p, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	// Spawn encodings on two channels so Shutdown clears cross-channel state.
+	entry1 := testEntry("e1", "ch1", 0, 0, 120_000)
+	entry2 := testEntry("e2", "ch2", 0, 0, 120_000)
+	if err := m.EnsureEncoding(context.Background(), "ch1", entry1, "/media.mkv", testProfile(), scheduler.TargetSegmentMs); err != nil {
+		t.Fatalf("ensure ch1: %v", err)
+	}
+	if err := m.EnsureEncoding(context.Background(), "ch2", entry2, "/media.mkv", testProfile(), scheduler.TargetSegmentMs); err != nil {
+		t.Fatalf("ensure ch2: %v", err)
+	}
+	if len(procs) != 2 {
+		t.Fatalf("want 2 spawned processes, got %d", len(procs))
+	}
+
+	m.Shutdown()
+
+	// Every process must have exited — Shutdown calls stop on each, which
+	// cancels the context and waits on done.
+	for i, p := range procs {
+		select {
+		case <-p.done:
+		default:
+			t.Fatalf("process %d still running after Shutdown", i)
+		}
+	}
+
+	// Root directory must be gone.
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("encoding root still exists after Shutdown: stat err=%v", err)
+	}
+
+	// DB rows must be cleared.
+	rows, err := db.ListOnDemandEncodings(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("list after shutdown: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("got %d rows after shutdown, want 0", len(rows))
+	}
+}
+
+// TestKillChannelStopsEncodingAndCleansUpRow verifies that cancelling an
+// encoding via KillChannel (the operator-initiated stop path) exits the
+// encoding process and deletes its DB row. The encoding directory is
+// intentionally retained for artifact retention — KillChannel calls stop, not
+// stopAndRemove — so that path is not asserted here.
+func TestKillChannelStopsEncodingAndCleansUpRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linearcast.db")
+	conn, err := db.OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer conn.Close()
+	if err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("migrate schema: %v", err)
+	}
+
+	var proc *fakeProcess
+	m, err := NewManager(ManagerOptions{
+		Root:          filepath.Join(t.TempDir(), "encodings"),
+		MaxConcurrent: 4,
+		NowFn:         func() int64 { return 12_000 },
+		DB:            conn,
+		Spawn: func(ctx context.Context, spec packager.LiveEncodingSpec) (Process, error) {
+			proc = newFakeProcess()
+			go func() {
+				<-ctx.Done()
+				proc.finish(ctx.Err())
+			}()
+			writeLivePlaylist(t, spec.OutDir, makeTargetDurations(2), false)
+			return proc, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	defer m.Shutdown()
+
+	entry := testEntry("e1", "ch1", 0, 0, 120_000)
+	if err := m.EnsureEncoding(context.Background(), "ch1", entry, "/media.mkv", testProfile(), scheduler.TargetSegmentMs); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	rows, err := db.ListOnDemandEncodings(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row before kill, got %d", len(rows))
+	}
+
+	m.KillChannel("ch1")
+
+	// Process must have exited.
+	select {
+	case <-proc.done:
+	default:
+		t.Fatal("encoding process still running after KillChannel")
+	}
+
+	// DB row must be deleted (stop calls deleteEncodingRow).
+	rows, err = db.ListOnDemandEncodings(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("list after kill: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("got %d rows after kill, want 0", len(rows))
+	}
+
+	// Encoding must be gone from the manager's maps.
+	m.mu.Lock()
+	if len(m.byID) != 0 {
+		t.Fatalf("byID has %d entries after kill, want 0", len(m.byID))
+	}
+	m.mu.Unlock()
 }

@@ -84,6 +84,7 @@ func TestItemsMapsMetadataFields(t *testing.T) {
 				"summary":"The lead weighs an offer.",
 				"thumb":"/library/metadata/123/thumb/456",
 				"contentRating":"TV-MA",
+				"audienceRating":9.2,
 				"Genre":[{"tag":"Comedy"},{"tag":"Drama"}],
 				"Media":[{"videoResolution":"1080","Part":[{"file":"/plex/Harbor Lights/S02E04.mkv"}]}]
 			}]}}`))
@@ -106,6 +107,9 @@ func TestItemsMapsMetadataFields(t *testing.T) {
 	}
 	if got.Description != "The lead weighs an offer." || got.ThumbnailPath != "/library/metadata/123/thumb/456" || got.ContentRating != "TV-MA" {
 		t.Fatalf("rich metadata=%+v", got)
+	}
+	if got.Rating != 9.2 {
+		t.Fatalf("rating=%v, want 9.2", got.Rating)
 	}
 	if strings.Join(got.Genres, ",") != "Comedy,Drama" {
 		t.Fatalf("genres=%+v", got.Genres)

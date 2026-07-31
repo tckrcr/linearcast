@@ -2,11 +2,10 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Dev-server proxies. Defaults target backend binaries running on this host.
+// Dev-server proxies. Both route families target the composed backend.
 // Override to point `npm run dev` at a remote stack:
-//   VITE_LINEARCAST_HOST=x.x.x.x VITE_ADMIN_HOST=x.x.x.x npm run dev
+//   VITE_LINEARCAST_HOST=x.x.x.x npm run dev
 const linearcastTarget = `http://${process.env.VITE_LINEARCAST_HOST || "127.0.0.1"}:${process.env.VITE_LINEARCAST_PORT || "8888"}`;
-const adminTarget = `http://${process.env.VITE_ADMIN_HOST || "127.0.0.1"}:${process.env.VITE_ADMIN_PORT || "8890"}`;
 
 export default defineConfig({
   plugins: [react()],
@@ -32,15 +31,17 @@ export default defineConfig({
         changeOrigin: true,
       },
       "/api": {
-        target: adminTarget,
+        target: linearcastTarget,
         changeOrigin: true,
         // The admin enforces a same-origin check on writes when a password
         // is set. From the dev server the browser sends Origin: localhost:5173,
         // which the admin rejects. Rewrite Origin to match the target so the
-        // admin sees the proxied request as same-origin.
+        // admin sees the proxied request as same-origin. The target is the
+        // composed backend — admin and playback have shared one listener since
+        // the separate admin origin went away.
         configure: (proxy) => {
           proxy.on("proxyReq", (proxyReq) => {
-            proxyReq.setHeader("origin", adminTarget);
+            proxyReq.setHeader("origin", linearcastTarget);
             proxyReq.removeHeader("referer");
           });
         },

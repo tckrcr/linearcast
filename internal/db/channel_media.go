@@ -207,7 +207,7 @@ func EligibleReadyPackagedChannelMedia(ctx context.Context, conn Execer, channel
                m.container, m.video_codec, m.video_width, m.video_height, m.video_bitrate_bps,
                m.color_transfer, m.color_primaries, m.audio_codec,
                m.codec_check_passed, m.codec_check_reason, m.ingested_at_ms, m.media_kind, m.source_ref,
-               m.description, m.thumb_path, m.content_rating, col.genres_json,
+               m.description, m.thumb_path, m.content_rating, m.rating, col.genres_json,
                m.codec_tag_string
         FROM channel_media cm
         JOIN media m ON m.id = cm.media_id

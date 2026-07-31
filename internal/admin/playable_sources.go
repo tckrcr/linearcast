@@ -15,25 +15,23 @@ type playableSourcesResponse struct {
 }
 
 type playableSource struct {
-	ID                    string              `json:"id"`
-	DisplayName           string              `json:"displayName"`
-	ArtworkURL            string              `json:"artworkUrl,omitempty"`
-	Kind                  string              `json:"kind"`
-	PlaybackType          string              `json:"playbackType"`
-	Status                string              `json:"status"`
-	ManifestURL           string              `json:"manifestUrl"`
-	Enabled               bool                `json:"enabled"`
-	Current               *mediaWindow        `json:"current,omitempty"`
-	Next                  *mediaWindow        `json:"next,omitempty"`
-	ScheduleCoverageMs    int64               `json:"scheduleCoverageMs,omitempty"`
-	ScheduleCoverageHours float64             `json:"scheduleCoverageHours,omitempty"`
-	PackageCoverageMs     int64               `json:"packageCoverageMs,omitempty"`
-	PackageCoverageHours  float64             `json:"packageCoverageHours,omitempty"`
-	PackageProfile        string              `json:"packageProfile,omitempty"`
-	AdaptiveBitrate       bool                `json:"adaptiveBitrate"`
-	PrefillMode           string              `json:"prefillMode,omitempty"`
-	PlaybackMode          string              `json:"playbackMode,omitempty"`
-	NowPlaying            *externalNowPlaying `json:"nowPlaying,omitempty"`
+	ID                    string       `json:"id"`
+	DisplayName           string       `json:"displayName"`
+	ArtworkURL            string       `json:"artworkUrl,omitempty"`
+	Kind                  string       `json:"kind"`
+	PlaybackType          string       `json:"playbackType"`
+	Status                string       `json:"status"`
+	ManifestURL           string       `json:"manifestUrl"`
+	Enabled               bool         `json:"enabled"`
+	Current               *mediaWindow `json:"current,omitempty"`
+	Next                  *mediaWindow `json:"next,omitempty"`
+	ScheduleCoverageMs    int64        `json:"scheduleCoverageMs,omitempty"`
+	ScheduleCoverageHours float64      `json:"scheduleCoverageHours,omitempty"`
+	PackageCoverageMs     int64        `json:"packageCoverageMs,omitempty"`
+	PackageCoverageHours  float64      `json:"packageCoverageHours,omitempty"`
+	PackageProfile        string       `json:"packageProfile,omitempty"`
+	AdaptiveBitrate       bool         `json:"adaptiveBitrate"`
+	PrefillMode           string       `json:"prefillMode,omitempty"`
 }
 
 func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
@@ -46,25 +44,6 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 	}
 	sources := make([]playableSource, 0, len(channels))
 	for _, ch := range channels {
-		if ch.UpstreamHLSURL != nil {
-			nowPlaying, err := a.fetchExternalNowPlaying(r.Context(), ch)
-			if err != nil {
-				nowPlaying = nil
-			}
-			sources = append(sources, playableSource{
-				ID:              ch.ID,
-				DisplayName:     ch.DisplayName,
-				ArtworkURL:      artworkForExternalChannel(ch, nowPlaying),
-				Kind:            "live",
-				PlaybackType:    "hls",
-				Status:          a.externalChannelStatus(r.Context(), ch),
-				ManifestURL:     routes.ExternalHLSManifest(ch.ID),
-				Enabled:         ch.Enabled,
-				AdaptiveBitrate: false,
-				NowPlaying:      nowPlaying,
-			})
-			continue
-		}
 		now, err := a.channelNowForRow(r.Context(), nowMs, ch, cacheByChannel[ch.ID])
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "db_error", err.Error())
@@ -88,7 +67,6 @@ func (a *App) handlePlayableSources(w http.ResponseWriter, r *http.Request) {
 			PackageProfile:        now.PackageProfile,
 			AdaptiveBitrate:       now.AdaptiveBitrate,
 			PrefillMode:           now.PrefillMode,
-			PlaybackMode:          string(ch.PlaybackMode),
 		})
 	}
 	writeJSON(w, playableSourcesResponse{

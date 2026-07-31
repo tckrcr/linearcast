@@ -81,6 +81,7 @@ type rawMeta struct {
 	Summary          string     `json:"summary"`
 	Thumb            string     `json:"thumb"`
 	ContentRating    string     `json:"contentRating"`
+	AudienceRating   float64    `json:"audienceRating"`
 	Genre            []rawTag   `json:"Genre"`
 	Media            []rawMedia `json:"Media"`
 }
@@ -355,6 +356,7 @@ func (c *Client) Items(ctx context.Context, libraryID string, opts mediasource.S
 			Description:   m.Summary,
 			ThumbnailPath: m.Thumb,
 			ContentRating: m.ContentRating,
+			Rating:        m.AudienceRating,
 			Genres:        plexTags(m.Genre),
 			Path:          path,
 			Resolution:    res,

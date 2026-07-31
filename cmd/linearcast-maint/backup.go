@@ -19,8 +19,8 @@ func defaultBackupDir(dbPath string) string {
 }
 
 // cmdBackup writes a verified, timestamped snapshot of the live database and
-// prunes older snapshots to the retention limit. It does not run ApplySchema:
-// a backup must never mutate the database it is protecting.
+// prunes older snapshots to the retention limit. It does not initialize or
+// migrate schema: a backup must never mutate the database it is protecting.
 func cmdBackup(dbPath string, args []string) {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
 	dir := fs.String("dir", "", "directory to write the snapshot into (default: <db-dir>/backups)")

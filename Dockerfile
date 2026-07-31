@@ -25,7 +25,6 @@ ARG TARGETOS
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast ./cmd/linearcast && \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-admin ./cmd/linearcast-admin && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-extender ./cmd/linearcast-extender && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-ingest ./cmd/linearcast-ingest && \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/linearcast-encoder ./cmd/linearcast-encoder && \
@@ -68,7 +67,6 @@ RUN apk add --no-cache bash ca-certificates ffmpeg gettext-envsubst nginx tzdata
     rm -f /etc/nginx/http.d/default.conf /etc/nginx/conf.d/default.conf
 
 COPY --from=build /out/linearcast /usr/local/bin/linearcast
-COPY --from=build /out/linearcast-admin /usr/local/bin/linearcast-admin
 COPY --from=build /out/linearcast-extender /usr/local/bin/linearcast-extender
 COPY --from=build /out/linearcast-ingest /usr/local/bin/linearcast-ingest
 COPY --from=build /out/linearcast-encoder /usr/local/bin/linearcast-encoder
@@ -82,8 +80,6 @@ RUN chmod +x /usr/local/bin/linearcast-entrypoint
 WORKDIR /app
 
 ENV LINEARCAST_ADDR=:8888 \
-    LINEARCAST_ADMIN_ADDR=:8890 \
-    LINEARCAST_UPSTREAM_URL=http://127.0.0.1:8888 \
     LINEARCAST_ENCODER_DIST_DIR=/opt/linearcast/encoder-dist
 
 EXPOSE 8080

@@ -32,9 +32,9 @@ func BackupFileName(t time.Time) string {
 // database file with no WAL sidecar. destPath must not already exist.
 //
 // The source is integrity-checked before the snapshot and the resulting
-// snapshot is verified afterward, so a successful return means the file on disk
-// is a restorable database at the current schema version. A snapshot that fails
-// verification is removed rather than left behind.
+// snapshot is verified afterward at the same schema version, so this also works
+// for the required pre-migration snapshot of a prior supported version. A
+// snapshot that fails verification is removed rather than left behind.
 func Backup(ctx context.Context, srcPath, destPath string) error {
 	if _, err := os.Stat(destPath); err == nil {
 		return fmt.Errorf("backup destination already exists: %s", destPath)
@@ -51,6 +51,10 @@ func Backup(ctx context.Context, srcPath, destPath string) error {
 	if err := quickCheck(ctx, src); err != nil {
 		return fmt.Errorf("source integrity check: %w", err)
 	}
+	sourceVersion, err := readSchemaVersion(ctx, src)
+	if err != nil {
+		return fmt.Errorf("source schema: %w", err)
+	}
 
 	// VACUUM INTO does not accept bound parameters for the target, so the path
 	// is embedded as a single-quoted SQL string literal with quotes escaped.
@@ -61,7 +65,7 @@ func Backup(ctx context.Context, srcPath, destPath string) error {
 		return fmt.Errorf("vacuum into %s: %w", destPath, err)
 	}
 
-	if err := VerifyBackup(ctx, destPath); err != nil {
+	if err := VerifyBackupVersion(ctx, destPath, sourceVersion); err != nil {
 		_ = os.Remove(destPath)
 		return fmt.Errorf("verify snapshot %s: %w", destPath, err)
 	}
@@ -72,6 +76,17 @@ func Backup(ctx context.Context, srcPath, destPath string) error {
 // check and carries the current schema version. It is the restorability gate:
 // if this returns nil the file is a database that the running code can open.
 func VerifyBackup(ctx context.Context, path string) error {
+	return VerifyBackupVersion(ctx, path, SchemaVersion)
+}
+
+// VerifyBackupVersion confirms that path is an internally consistent snapshot
+// at expectedVersion. Startup migration uses this to verify the old-version
+// snapshot before mutating the live database; operator restore uses
+// VerifyBackup, which requires the current version.
+func VerifyBackupVersion(ctx context.Context, path string, expectedVersion int) error {
+	if err := validateSchemaVersion(expectedVersion, SchemaVersion); err != nil {
+		return fmt.Errorf("unsupported snapshot: %w", err)
+	}
 	snap, err := openReadOnlyNoWAL(path)
 	if err != nil {
 		return fmt.Errorf("open snapshot: %w", err)
@@ -80,7 +95,17 @@ func VerifyBackup(ctx context.Context, path string) error {
 	if err := quickCheck(ctx, snap); err != nil {
 		return fmt.Errorf("snapshot integrity check: %w", err)
 	}
-	return VerifySchema(ctx, snap)
+	version, err := readSchemaVersion(ctx, snap)
+	if err != nil {
+		return err
+	}
+	if version != expectedVersion {
+		return fmt.Errorf("snapshot schema version mismatch: db=%d expected=%d", version, expectedVersion)
+	}
+	if err := verifySchemaShape(ctx, snap, expectedVersion); err != nil {
+		return err
+	}
+	return nil
 }
 
 // openReadOnlyNoWAL opens a database read-only without requesting

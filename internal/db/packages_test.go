@@ -147,11 +147,11 @@ func TestChannelPackageNeedSummariesCountsMissingAndInFlight(t *testing.T) {
 
 	if _, err := rw.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile, prefill_mode
+			required_package_profile, prefill_mode
 		)
-		VALUES ('ch1', 'Channel One', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 'eager'),
-		       ('ondemand', 'On Demand', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps', 'on_demand'),
-		       ('disabled', 'Disabled', '/tmp', 'alphabetical', 0, 0, 'packaged', 'h264-1080p-8mbps', 'eager')`); err != nil {
+		VALUES ('ch1', 'Channel One', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 'eager'),
+		       ('ondemand', 'On Demand', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 'on_demand'),
+		       ('disabled', 'Disabled', '/tmp', 'alphabetical', 0, 0, 'h264-1080p-8mbps', 'eager')`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
@@ -204,6 +204,51 @@ func TestChannelPackageNeedSummariesCountsMissingAndInFlight(t *testing.T) {
 	if got.NeededCount != 5 || got.ReadyCount != 1 || got.ProcessingCount != 1 ||
 		got.PendingCount != 1 || got.FailedCount != 1 || got.MissingCount != 1 {
 		t.Fatalf("unexpected summary counts: %+v", got)
+	}
+}
+
+func TestChannelProfileReadinessRequiresPackagedDuration(t *testing.T) {
+	path := newTestDB(t)
+	rw, err := OpenReadWrite(path)
+	if err != nil {
+		t.Fatalf("open rw: %v", err)
+	}
+	defer rw.Close()
+
+	if _, err := rw.Exec(`INSERT INTO channels (
+			id, display_name, source_directory, ordering, enabled, created_at_ms,
+			required_package_profile, prefill_mode
+		)
+		VALUES ('ch1', 'Channel One', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps', 'eager')`); err != nil {
+		t.Fatalf("insert channel: %v", err)
+	}
+	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
+			video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
+		VALUES ('complete', '/tmp/complete.mkv', '/tmp', 6000, 'mkv', 'h264', 1080, 'aac', 1, 0),
+		       ('incomplete', '/tmp/incomplete.mkv', '/tmp', 6000, 'mkv', 'h264', 1080, 'aac', 1, 0)`); err != nil {
+		t.Fatalf("insert media: %v", err)
+	}
+	if _, err := rw.Exec(`INSERT INTO channel_media (channel_id, media_id, anchor_media_id, added_at_ms)
+		VALUES ('ch1', 'complete', NULL, 0),
+		       ('ch1', 'incomplete', 'complete', 0)`); err != nil {
+		t.Fatalf("insert channel media: %v", err)
+	}
+	durationMs := int64(6000)
+	for _, pkg := range []MediaPackage{
+		{ID: "pkg-complete", MediaID: "complete", RenditionProfile: DefaultPackageProfile, Status: PackageStatusReady, PackagedDurationMs: &durationMs},
+		{ID: "pkg-incomplete", MediaID: "incomplete", RenditionProfile: DefaultPackageProfile, Status: PackageStatusReady},
+	} {
+		if err := UpsertMediaPackage(context.Background(), rw, pkg); err != nil {
+			t.Fatalf("upsert package %s: %v", pkg.ID, err)
+		}
+	}
+
+	got, err := ChannelProfileReadiness(context.Background(), rw, "ch1", DefaultPackageProfile)
+	if err != nil {
+		t.Fatalf("channel profile readiness: %v", err)
+	}
+	if got.Total != 2 || got.Ready != 1 {
+		t.Fatalf("readiness=%+v, want 1/2 ready", got)
 	}
 }
 
@@ -353,8 +398,8 @@ func TestCancelMediaPackagesMarksPendingAndProcessingFailed(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer rw.Close()
-	if err := ApplySchema(context.Background(), rw); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := Migrate(context.Background(), rw); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
@@ -398,8 +443,8 @@ func TestMarkPackageReadyRequiresProcessingState(t *testing.T) {
 		t.Fatalf("open db: %v", err)
 	}
 	defer rw.Close()
-	if err := ApplySchema(context.Background(), rw); err != nil {
-		t.Fatalf("apply schema: %v", err)
+	if err := Migrate(context.Background(), rw); err != nil {
+		t.Fatalf("migrate schema: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
 		video_codec, video_height, audio_codec, codec_check_passed, ingested_at_ms)
@@ -898,10 +943,10 @@ func TestPackageProfilesComesFromActiveRegistry(t *testing.T) {
 	defer rw.Close()
 	if _, err := rw.Exec(`INSERT INTO channels (
 			id, display_name, source_directory, ordering, enabled, created_at_ms,
-			playback_mode, required_package_profile
+			required_package_profile
 		)
-		VALUES ('default', 'Default', '/tmp', 'alphabetical', 1, 0, 'packaged', 'h264-1080p-8mbps'),
-		       ('alt', 'Alt', '/tmp', 'alphabetical', 1, 0, 'packaged', 'custom-main-720p')`); err != nil {
+		VALUES ('default', 'Default', '/tmp', 'alphabetical', 1, 0, 'h264-1080p-8mbps'),
+		       ('alt', 'Alt', '/tmp', 'alphabetical', 1, 0, 'custom-main-720p')`); err != nil {
 		t.Fatalf("insert channels: %v", err)
 	}
 	if _, err := rw.Exec(`INSERT INTO media (id, path, directory, duration_ms, container,
