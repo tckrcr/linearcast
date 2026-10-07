@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,10 +29,14 @@ type ingestJobStore struct {
 	mu      sync.Mutex
 	jobs    map[string]*ingestJob
 	logsDir string
+	logger  *slog.Logger
 }
 
-func newIngestJobStore(cacheDir string) *ingestJobStore {
-	s := &ingestJobStore{jobs: make(map[string]*ingestJob)}
+func newIngestJobStore(cacheDir string, logger *slog.Logger) *ingestJobStore {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	s := &ingestJobStore{jobs: make(map[string]*ingestJob), logger: logger}
 	if cacheDir = strings.TrimSpace(cacheDir); cacheDir != "" {
 		s.logsDir = filepath.Join(cacheDir, "logs")
 	}
@@ -43,9 +48,11 @@ func (s *ingestJobStore) create() (string, *ingestJob) {
 	id := fmt.Sprintf("%d", now.UnixNano())
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &ingestJob{
+		id:     id,
 		status: "running",
 		ctx:    ctx,
 		cancel: cancel,
+		logger: s.logger,
 	}
 	if s.logsDir != "" {
 		if err := os.MkdirAll(s.logsDir, 0o755); err == nil {
@@ -71,6 +78,7 @@ func (s *ingestJobStore) get(id string) (*ingestJob, bool) {
 
 type ingestJob struct {
 	mu           sync.Mutex
+	id           string
 	status       string // "running" | "done" | "failed" | "cancelled"
 	summary      *lcingest.Result
 	errMsg       string
@@ -81,6 +89,7 @@ type ingestJob struct {
 	cancel  context.CancelFunc
 	logFile *os.File
 	logPath string
+	logger  *slog.Logger
 }
 
 // Printf satisfies lcingest.Logger. Writes timestamped lines to the per-job
@@ -122,6 +131,24 @@ func (j *ingestJob) finalize(status, errMsg string, summary *lcingest.Result) {
 		fmt.Fprintf(j.logFile, "%s scan %s\n", time.Now().UTC().Format(time.RFC3339), status)
 		_ = j.logFile.Close()
 		j.logFile = nil
+	}
+	logger := j.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	attrs := []any{
+		"job", j.id,
+		"status", status,
+		"processed", int(j.processedCnt.Load()),
+		"total", int(atomic.LoadInt32(&j.totalCnt)),
+	}
+	if errMsg != "" {
+		attrs = append(attrs, "err", errMsg)
+	}
+	if status == "failed" {
+		logger.Error("media scan failed", attrs...)
+	} else {
+		logger.Info("media scan finished", attrs...)
 	}
 }
 

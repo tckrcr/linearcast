@@ -120,7 +120,7 @@ func New(cfg Config) *App {
 		jellyfinPathMap:    cfg.JellyfinPathMap,
 		logger:             logger,
 		schedule:           newScheduleService(cfg.DB, now),
-		ingestJobs:         newIngestJobStore(cfg.CacheDir),
+		ingestJobs:         newIngestJobStore(cfg.CacheDir, logger),
 		auth:               newAuthServiceFromHash(cfg.AdminPasswordHash, cfg.AdminPasswordMustChange, now, cfg.AdminCookieSecure),
 		encoderDistDir:     strings.TrimSpace(cfg.EncoderDistDir),
 		encoderBroadcaster: newEncoderBroadcaster(),
