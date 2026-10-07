@@ -125,6 +125,7 @@ func (a *App) runSubtitleScan(job *subtitleScanJob) {
 		job.status = "error"
 		job.errMsg = err.Error()
 		job.mu.Unlock()
+		a.logger.Error("subtitle scan failed", "err", err)
 		return
 	}
 
@@ -238,6 +239,7 @@ func (a *App) runSubtitleScan(job *subtitleScanJob) {
 	job.status = "done"
 	job.shows = shows
 	job.mu.Unlock()
+	a.logger.Info("subtitle scan finished", "shows", len(shows))
 
 	if blob, err := json.Marshal(shows); err == nil {
 		_ = db.SaveSubtitleScanCache(context.Background(), a.dbConn, time.Now().UTC().UnixMilli(), "done", blob)

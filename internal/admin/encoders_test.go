@@ -106,6 +106,35 @@ func (e *encoderHandlerEnv) claim(t *testing.T, key string) encoderClaimResponse
 	return claim
 }
 
+// TestEncoderJobLifecycle_LogsOutcomes verifies that the remote encoder API
+// records the job claim and failure outcomes in the structured log. The request
+// log alone only records the HTTP status, so without these events an operator
+// cannot see which encoder took a package or why the encode failed.
+func TestEncoderJobLifecycle_LogsOutcomes(t *testing.T) {
+	env := newEncoderHandlerEnv(t)
+	var logBuf bytes.Buffer
+	env.app.logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	_, key := env.registerEncoder(t, "test")
+	claim := env.claim(t, key)
+
+	failRR := env.authedPost(t, "/api/encoder/jobs/"+claim.PackageID+"/fail", key,
+		`{"kind":"terminal","reason":"bad source"}`)
+	if failRR.Code != http.StatusOK {
+		t.Fatalf("fail status=%d body=%s", failRR.Code, failRR.Body.String())
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, `"msg":"encoder job claimed"`) {
+		t.Fatalf("claim outcome not logged:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"msg":"encoder job failed"`) ||
+		!strings.Contains(logs, `"package_id":"`+claim.PackageID+`"`) ||
+		!strings.Contains(logs, `"err":"bad source"`) {
+		t.Fatalf("fail outcome not logged:\n%s", logs)
+	}
+}
+
 func TestEncoderAdmin_RegisterReturnsRawKeyOnce(t *testing.T) {
 	env := newEncoderHandlerEnv(t)
 	id, key := env.registerEncoder(t, "test")

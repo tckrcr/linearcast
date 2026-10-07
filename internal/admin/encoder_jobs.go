@@ -137,6 +137,13 @@ func (a *App) handleEncoderClaim(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		a.logger.Info("encoder job claimed",
+			"package_id", packageID,
+			"media_id", c.MediaID,
+			"profile", c.Profile,
+			"encoder", enc.ID,
+			"lease_expires_ms", nowMs+leaseTTL.Milliseconds(),
+		)
 		writeJSON(w, encoderClaimResponse{
 			PackageID:        packageID,
 			MediaID:          c.MediaID,
@@ -323,6 +330,14 @@ func (a *App) handleEncoderComplete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, classifyJobOpError(err), "complete_failed", err.Error())
 		return
 	}
+	a.logger.Info("encoder job complete",
+		"package_id", packageID,
+		"media_id", res.MediaID,
+		"profile", res.RenditionProfile,
+		"encoder", enc.ID,
+		"segments", res.SegmentCount,
+		"duration_ms", res.DurationMs,
+	)
 	writeJSON(w, encoderCompleteResponse{
 		OK:               true,
 		PackageID:        res.PackageID,
@@ -530,6 +545,13 @@ func (a *App) handleEncoderFail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, "fail_failed", err.Error())
 		return
 	}
+	a.logger.Info("encoder job failed",
+		"package_id", packageID,
+		"encoder", enc.ID,
+		"kind", req.Kind,
+		"err", req.Reason,
+		"new_status", string(newStatus),
+	)
 	writeJSON(w, encoderFailResponse{NewStatus: string(newStatus)})
 }
 
