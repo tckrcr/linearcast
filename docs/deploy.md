@@ -69,3 +69,76 @@ The container runtime paths are fixed:
 
 For admin UI media-server integrations, set or clear Plex tokens and Jellyfin
 API keys from the Tools panel; credentials are stored in the database.
+
+## Backup and restore
+
+All durable state lives in one SQLite database on the mounted data volume at
+`/data/linearcast/linearcast.db`. It holds channel configuration, schedules,
+the media index, package state, the encoder registry, the admin password hash,
+and the admin write log. Take verified snapshots and keep a copy off the data
+volume.
+
+### Back up the database
+
+`linearcast-maint backup` writes a verified snapshot with `VACUUM INTO` and
+prunes older snapshots:
+
+```sh
+docker compose run --rm linearcast linearcast-maint backup
+```
+
+The default snapshot directory is `/data/linearcast/backups` and the default
+retention is 14 snapshots. Pass `--dir` to write elsewhere and `--keep` to
+change retention:
+
+```sh
+docker compose run --rm linearcast \
+  linearcast-maint backup --dir /data/linearcast/backups --keep 14
+```
+
+`backup` opens the live database read-only and never mutates it, so it is safe
+to run while the stack serves. Schedule it from host cron or another scheduler,
+and copy each snapshot off the data volume. A snapshot contains the admin
+password hash and the admin write log, so protect the copy like the live
+database.
+
+### Restore the current schema
+
+`restore` replaces the live database, so stop every linearcast service first
+and start them again afterward.
+
+1. Stop the stack:
+
+   ```sh
+   docker compose down
+   ```
+
+2. Verify and restore a snapshot:
+
+   ```sh
+   docker compose run --rm linearcast \
+     linearcast-maint restore --confirm /data/linearcast/backups/linearcast-YYYYMMDD-HHMMSS.db
+   ```
+
+   The command verifies the snapshot's integrity and schema version, moves the
+   current database and its `-wal`/`-shm` sidecars aside with a
+   `.pre-restore-<timestamp>` suffix, copies the snapshot into place, and
+   verifies the result. It refuses to run without `--confirm`.
+
+3. Start the stack again:
+
+   ```sh
+   docker compose up -d
+   ```
+
+4. Check health and schedule integrity:
+
+   ```sh
+   docker compose run --rm linearcast linearcast-maint check --all
+   curl -fsS http://localhost:8080/status
+   ```
+
+To reverse a restore, stop the stack and move the `.pre-restore-<timestamp>`
+files back over the database. A pre-migration snapshot (an older schema
+version) must be restored with the matching older image: image rollback and
+database restore are separate operations.
