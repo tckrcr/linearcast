@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/tckrcr/linearcast/internal/db"
+	"github.com/tckrcr/linearcast/internal/linearcastlog"
 	"github.com/tckrcr/linearcast/internal/scheduler"
 )
 
@@ -40,7 +41,7 @@ type config struct {
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	linearcastlog.SetupJSON()
 
 	dbPath := os.Getenv("LINEARCAST_DB")
 	if dbPath == "" {

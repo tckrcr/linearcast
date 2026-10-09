@@ -21,10 +21,11 @@ import (
 
 	"github.com/tckrcr/linearcast/internal/db"
 	"github.com/tckrcr/linearcast/internal/lcingest"
+	"github.com/tckrcr/linearcast/internal/linearcastlog"
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	linearcastlog.SetupJSON()
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: linearcast-ingest [-dir <path>] [-music] [-retitle]")
