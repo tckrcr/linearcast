@@ -1,12 +1,14 @@
 package admin
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -577,5 +579,93 @@ func TestAdminPasswordChangeRevokesOtherSessions(t *testing.T) {
 	handler.ServeHTTP(authedBRR, authedB)
 	if authedBRR.Code != http.StatusUnauthorized {
 		t.Fatalf("session B (other) status=%d, want %d (should be revoked)", authedBRR.Code, http.StatusUnauthorized)
+	}
+}
+
+// The login throttle keys its failure records on clientID, a value the client
+// supplies through X-Forwarded-For, so an unauthenticated caller can present a
+// new key on every attempt. loginFailures must stay bounded instead of holding
+// one record per request for the life of the process.
+func TestAdminAuthLoginFailuresStayBoundedUnderRotatedKeys(t *testing.T) {
+	app, _ := testAdminApp(t)
+	app.auth = newAuthService("secret", app.now)
+
+	attempts := maxTrackedLoginClients * 3
+	for i := 0; i < attempts; i++ {
+		app.auth.recordFailure(fmt.Sprintf("198.51.100.%d", i))
+	}
+
+	app.auth.mu.Lock()
+	got := len(app.auth.loginFailures)
+	app.auth.mu.Unlock()
+	if got > maxTrackedLoginClients {
+		t.Fatalf("loginFailures holds %d records after %d failed attempts, want at most %d",
+			got, attempts, maxTrackedLoginClients)
+	}
+}
+
+// Expired records must be released, so a burst of failures from keys that never
+// return does not pin memory for the life of the process.
+func TestAdminAuthLoginFailuresPrunedAfterWindow(t *testing.T) {
+	app, _ := testAdminApp(t)
+	now := time.Date(2026, 10, 15, 2, 0, 0, 0, time.UTC)
+	app.auth = newAuthService("secret", func() time.Time { return now })
+	handler := app.Handler()
+
+	const failures = 50
+	for i := 0; i < failures; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"wrong"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i))
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status=%d, want %d", i+1, rr.Code, http.StatusUnauthorized)
+		}
+	}
+
+	now = now.Add(loginFailureWindow + time.Minute)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"wrong"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", "203.0.113.9")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+
+	app.auth.mu.Lock()
+	got := len(app.auth.loginFailures)
+	app.auth.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("loginFailures holds %d records after the window elapsed, want 1", got)
+	}
+}
+
+// One client must not be able to make a single failure record arbitrarily large.
+func TestAdminAuthLoginFailureKeyIsLengthBounded(t *testing.T) {
+	app, _ := testAdminApp(t)
+	app.auth = newAuthService("secret", app.now)
+	handler := app.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"wrong"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", strings.Repeat("a", 4096))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+
+	app.auth.mu.Lock()
+	defer app.auth.mu.Unlock()
+	if len(app.auth.loginFailures) == 0 {
+		t.Fatal("no failure record was stored")
+	}
+	for key := range app.auth.loginFailures {
+		if len(key) > maxLoginClientKeyLen {
+			t.Fatalf("stored throttle key length=%d, want at most %d", len(key), maxLoginClientKeyLen)
+		}
 	}
 }

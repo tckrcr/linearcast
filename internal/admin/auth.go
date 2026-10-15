@@ -26,6 +26,21 @@ const (
 	adminSessionTTL    = 30 * 24 * time.Hour
 	loginFailureWindow = 5 * time.Minute
 	maxLoginFailures   = 5
+
+	// loginFailurePruneInterval is how often expired failure records are swept.
+	// The sweep is amortized into recordFailure instead of running on its own
+	// goroutine, so it needs no lifecycle and cannot leak on shutdown.
+	loginFailurePruneInterval = time.Minute
+	// maxTrackedLoginClients bounds loginFailures. The throttle key is a value
+	// the client supplies, so an unauthenticated caller that presents a new key
+	// on every attempt would otherwise add one permanent record per request.
+	// Past the bound the record closest to expiry is dropped, so the map cannot
+	// grow further.
+	maxTrackedLoginClients = 1024
+	// maxLoginClientKeyLen bounds the length of one throttle key so a client
+	// cannot make a single failure record arbitrarily large. IPv6 addresses fit
+	// comfortably.
+	maxLoginClientKeyLen = 64
 )
 
 type authService struct {
@@ -36,6 +51,8 @@ type authService struct {
 	mu            sync.Mutex
 	sessions      map[string]time.Time
 	loginFailures map[string]loginFailure
+	// lastPrune is the time of the last loginFailures sweep. Guarded by mu.
+	lastPrune time.Time
 }
 
 type loginFailure struct {
@@ -150,6 +167,10 @@ func (s *authService) tooManyFailures(client string) bool {
 	return f.Count >= maxLoginFailures
 }
 
+// recordFailure records one failed login attempt for client. The key comes from
+// clientID, which returns a value the caller controls, so the map is swept and
+// capped: an unauthenticated caller that presents a new key on every attempt
+// would otherwise add one record per request that is never released.
 func (s *authService) recordFailure(client string) {
 	if client == "" {
 		return
@@ -158,12 +179,37 @@ func (s *authService) recordFailure(client string) {
 	defer s.mu.Unlock()
 	now := s.now()
 	f := s.loginFailures[client]
-	if f.Count == 0 || !now.Before(f.FirstSeenAt.Add(loginFailureWindow)) {
-		s.loginFailures[client] = loginFailure{Count: 1, FirstSeenAt: now}
+	if f.Count != 0 && now.Before(f.FirstSeenAt.Add(loginFailureWindow)) {
+		f.Count++
+		s.loginFailures[client] = f
 		return
 	}
-	f.Count++
-	s.loginFailures[client] = f
+	if len(s.loginFailures) >= maxTrackedLoginClients || now.Sub(s.lastPrune) >= loginFailurePruneInterval {
+		s.pruneLoginFailuresLocked(now)
+	}
+	s.loginFailures[client] = loginFailure{Count: 1, FirstSeenAt: now}
+}
+
+// pruneLoginFailuresLocked drops every record whose window elapsed and, when the
+// map is still at maxTrackedLoginClients, the record closest to expiry, so the
+// caller can add one more key without pushing the map past its bound. Callers
+// must hold s.mu.
+func (s *authService) pruneLoginFailuresLocked(now time.Time) {
+	s.lastPrune = now
+	oldestKey := ""
+	var oldestFirstSeen time.Time
+	for key, f := range s.loginFailures {
+		if !now.Before(f.FirstSeenAt.Add(loginFailureWindow)) {
+			delete(s.loginFailures, key)
+			continue
+		}
+		if oldestKey == "" || f.FirstSeenAt.Before(oldestFirstSeen) {
+			oldestKey, oldestFirstSeen = key, f.FirstSeenAt
+		}
+	}
+	if oldestKey != "" && len(s.loginFailures) >= maxTrackedLoginClients {
+		delete(s.loginFailures, oldestKey)
+	}
 }
 
 func (s *authService) logout(r *http.Request) {
@@ -255,13 +301,22 @@ func (a *App) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 func clientID(r *http.Request) string {
 	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
 		first, _, _ := strings.Cut(forwarded, ",")
-		return strings.TrimSpace(first)
+		return clampLoginClientKey(strings.TrimSpace(first))
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {
-		return host
+		return clampLoginClientKey(host)
 	}
-	return r.RemoteAddr
+	return clampLoginClientKey(r.RemoteAddr)
+}
+
+// clampLoginClientKey bounds the length of a throttle key so one client cannot
+// make a single loginFailures record arbitrarily large.
+func clampLoginClientKey(key string) string {
+	if len(key) <= maxLoginClientKeyLen {
+		return key
+	}
+	return key[:maxLoginClientKeyLen]
 }
 
 func sessionToken(r *http.Request) string {
